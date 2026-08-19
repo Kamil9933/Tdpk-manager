@@ -984,7 +984,12 @@ async function loadPostex() {
     const orders = d.orders||[];
     const topCities = d.top_cities||[];
 
+    const pxError = d.error || '';
     document.getElementById('postex-wrap').innerHTML = `
+      ${pxError ? `<div style="background:rgba(255,79,79,0.1);border:1px solid rgba(255,79,79,0.3);border-radius:10px;padding:12px 14px;margin-bottom:14px;font-size:12px;color:#ff8080">
+        <b>PostEx API did not return data:</b> ${pxError}${d.api_code?` (code ${d.api_code})`:''}<br>
+        <span style="color:var(--muted)">Check that POSTEX_TOKEN is set correctly in your host's environment variables and the service has been redeployed since.</span>
+      </div>` : ''}
       <div class="metric-grid">
         <div class="metric-card"><div class="m-label">Total orders</div><div class="m-value">${d.total_orders||0}</div></div>
         <div class="metric-card green"><div class="m-label">Delivered</div><div class="m-value">${d.delivered||0}</div><div class="m-sub">${d.delivery_rate||0}% rate</div></div>
@@ -1020,7 +1025,7 @@ async function loadPostex() {
       }).join('')}
     `;
   } catch(e) {
-    document.getElementById('postex-wrap').innerHTML = `<div style="text-align:center;padding:3rem;color:var(--muted)">Could not load PostEx data. Check your POSTEX_TOKEN in Railway.<br><small>${e.message}</small></div>`;
+    document.getElementById('postex-wrap').innerHTML = `<div style="text-align:center;padding:3rem;color:var(--muted)">Could not load PostEx data — request failed.<br><small>${e.message}</small></div>`;
   }
 }
 

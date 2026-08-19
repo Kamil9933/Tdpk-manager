@@ -75,6 +75,16 @@ class PostexClient:
         except Exception as e:
             return {"dist": [], "error": str(e)}
 
+    async def get_orders(self, status_id=None, from_date=None, to_date=None, page=1):
+        # Alias used by the /api/postex/orders endpoint. PostEx's API has no
+        # pagination param for get-all-order, so `page` is accepted for
+        # forward-compat but currently ignored.
+        try:
+            sid = int(status_id) if status_id not in (None, "", "0") else 0
+        except (TypeError, ValueError):
+            sid = 0
+        return await self.get_all_orders(status_id=sid, from_date=from_date, to_date=to_date)
+
     async def get_unbooked_orders(self, from_date=None, to_date=None):
         if not from_date:
             from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
