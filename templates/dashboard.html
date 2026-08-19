@@ -294,6 +294,8 @@ textarea.field-input{min-height:80px;resize:vertical}
     <div class="sbi" onclick="showView('abandoned')" id="nav-abandoned"><span class="ic">⚠️</span>Abandoned</div>
     <div class="sb-sec">Logistics</div>
     <div class="sbi" onclick="showView('postex')" id="nav-postex"><span class="ic">🚚</span>PostEx COD</div>
+    <div class="sb-sec">Finance</div>
+    <div class="sbi" onclick="showView('accounts')" id="nav-accounts"><span class="ic">💰</span>Accounts</div>
     <div class="sb-sec">Colour Ops</div>
     <div class="sbi" onclick="openOp('remove_color')"><span class="ic">🗑</span>Remove colour</div>
     <div class="sbi" onclick="openOp('add_color')"><span class="ic">➕</span>Add colour</div>
@@ -482,6 +484,22 @@ textarea.field-input{min-height:80px;resize:vertical}
   <!-- HISTORY -->
   <div class="view" id="view-history">
     <div class="scroll-wrap" id="history-list"></div>
+  </div>
+
+  <!-- ACCOUNTS -->
+  <div class="view" id="view-accounts">
+    <div class="scroll-wrap">
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px" id="acc-tabs">
+        <button class="btn sm primary" data-tab="overview" onclick="showAccTab('overview')">Overview / P&amp;L</button>
+        <button class="btn sm" data-tab="vendors" onclick="showAccTab('vendors')">Vendors &amp; Purchases</button>
+        <button class="btn sm" data-tab="printers" onclick="showAccTab('printers')">Printers &amp; Maintenance</button>
+        <button class="btn sm" data-tab="custom" onclick="showAccTab('custom')">Custom Orders</button>
+        <button class="btn sm" data-tab="outsourced" onclick="showAccTab('outsourced')">Outsourced Production</button>
+        <button class="btn sm" data-tab="expenses" onclick="showAccTab('expenses')">Expenses &amp; Employees</button>
+        <button class="btn sm" data-tab="cash" onclick="showAccTab('cash')">Cash Accounts</button>
+      </div>
+      <div id="acc-content"></div>
+    </div>
   </div>
 </div>
 </div>
@@ -1060,6 +1078,464 @@ async function loadHistory(){
 }
 async function doRollback(id){if(!confirm('Restore products?'))return;showProg('Rolling back...');try{const r=await fetch(`/api/history/${id}/rollback`,{method:'POST'});const d=await r.json();completeProg({result:{changed:d.restored,errors:d.errors}});loadProducts(S.page);}catch(e){failProg(e.message);}}
 
+// ── Accounts ──────────────────────────────────────────────────────────────────
+let ACC_TAB='overview';
+function fmtMoney(n){return 'PKR '+Math.round(n||0).toLocaleString();}
+function showAccTab(tab){
+  ACC_TAB=tab;
+  document.querySelectorAll('#acc-tabs .btn').forEach(b=>b.classList.toggle('primary',b.dataset.tab===tab));
+  const map={overview:loadAccOverview,vendors:loadAccVendors,printers:loadAccPrinters,custom:loadAccCustom,outsourced:loadAccOutsourced,expenses:loadAccExpenses,cash:loadAccCash};
+  (map[tab]||loadAccOverview)();
+}
+
+async function loadAccOverview(){
+  const c=document.getElementById('acc-content');
+  c.innerHTML='<div style="text-align:center;padding:3rem;color:var(--muted)">Loading…</div>';
+  const today=new Date().toISOString().slice(0,10);
+  const from30=new Date(Date.now()-29*86400000).toISOString().slice(0,10);
+  const from=document.getElementById('acc-from')?.value||from30;
+  const to=document.getElementById('acc-to')?.value||today;
+  let pnl,rec;
+  try{
+    const [pnlR,recR]=await Promise.all([
+      fetch(`/api/accounting/pnl?from_date=${from}&to_date=${to}`),
+      fetch(`/api/accounting/postex-reconcile?days=30`)
+    ]);
+    pnl=await pnlR.json(); rec=await recR.json();
+  }catch(e){ c.innerHTML=`<div style="text-align:center;padding:3rem;color:var(--muted)">Could not load P&amp;L.<br><small>${e.message}</small></div>`; return; }
+  c.innerHTML=`
+    <div class="form-box">
+      <div class="form-row">
+        <div class="op-field"><label>From</label><input type="date" id="acc-from" value="${from}" onchange="loadAccOverview()"></div>
+        <div class="op-field"><label>To</label><input type="date" id="acc-to" value="${to}" onchange="loadAccOverview()"></div>
+      </div>
+      <button class="btn" onclick="window.open('/api/accounting/export?from_date='+document.getElementById('acc-from').value+'&to_date='+document.getElementById('acc-to').value)">⬇ Export CSV</button>
+    </div>
+    <div class="metric-grid">
+      <div class="metric-card blue"><div class="m-label">Revenue</div><div class="m-value" style="font-size:16px">${fmtMoney(pnl.revenue.total)}</div><div class="m-sub">incl. PKR ${Math.round(pnl.revenue.tax_included).toLocaleString()} tax</div></div>
+      <div class="metric-card red"><div class="m-label">Total costs</div><div class="m-value" style="font-size:16px">${fmtMoney(pnl.total_costs)}</div></div>
+      <div class="metric-card ${pnl.net_profit>=0?'green':'red'}"><div class="m-label">Net profit</div><div class="m-value" style="font-size:16px">${fmtMoney(pnl.net_profit)}</div><div class="m-sub">${pnl.margin_pct}% margin</div></div>
+      <div class="metric-card"><div class="m-label">Cash collected (est.)</div><div class="m-value" style="font-size:16px">${fmtMoney(pnl.cash_collected_estimate)}</div></div>
+    </div>
+    <div class="chart-container">
+      <div class="chart-title">Cost breakdown</div>
+      <div style="font-size:12px;line-height:2.1">
+        Materials &amp; packaging: <b>${fmtMoney(pnl.cogs.materials_packaging)}</b><br>
+        Outsourced production: <b>${fmtMoney(pnl.cogs.outsourced_production)}</b><br>
+        Printer maintenance: <b>${fmtMoney(pnl.cogs.printer_maintenance)}</b><br>
+        Printer depreciation: <b>${fmtMoney(pnl.cogs.printer_depreciation)}</b><br>
+        <span style="color:var(--muted)">— Total COGS: ${fmtMoney(pnl.cogs.total)}</span><br><br>
+        ${Object.entries(pnl.opex.by_category).map(([k,v])=>`${k.replace('_',' ')}: <b>${fmtMoney(v)}</b><br>`).join('')||'<span style="color:var(--muted)">No operating expenses logged for this range</span><br>'}
+        <span style="color:var(--muted)">— Total operating expenses: ${fmtMoney(pnl.opex.total)}</span><br><br>
+        Courier fees: <b>${fmtMoney(pnl.courier_fees)}</b><br>
+        Labor: <b>${fmtMoney(pnl.labor_cost)}</b>
+      </div>
+    </div>
+    <div class="chart-container">
+      <div class="chart-title">PostEx COD reconciliation (last 30 days)</div>
+      <div style="font-size:12px;line-height:2.1">
+        PostEx shows delivered COD collected from customers: <b>${fmtMoney(rec.expected_collected)}</b><br>
+        Net amount you've logged as received (after courier fees): <b>${fmtMoney(rec.actually_received)}</b><br>
+        Courier fees logged: <b>${fmtMoney(rec.total_courier_fees)}</b><br>
+        <span style="color:${Math.abs(rec.unreconciled_gap)>1?'var(--yellow)':'var(--green)'}">Unreconciled gap: <b>${fmtMoney(rec.unreconciled_gap)}</b></span>
+        <div style="color:var(--muted);margin-top:6px;font-size:11px">${rec.note||''}</div>
+      </div>
+    </div>
+  `;
+}
+
+async function loadAccVendors(){
+  const c=document.getElementById('acc-content');
+  c.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Loading…</div>';
+  const [vR,pR]=await Promise.all([fetch('/api/accounting/vendors'),fetch('/api/accounting/purchases')]);
+  const vendors=(await vR.json()).vendors||[]; const purchases=(await pR.json()).purchases||[];
+  c.innerHTML=`
+    <div class="form-box">
+      <h4>➕ Add vendor</h4>
+      <div class="form-row">
+        <div class="op-field"><label>Name</label><input type="text" id="v-name" placeholder="e.g. Karachi Filament Hub"></div>
+        <div class="op-field"><label>Type</label><select id="v-type"><option value="filament_supplier">Filament supplier</option><option value="printer_supplier">Printer supplier</option><option value="print_farm">Print farm (outsource)</option><option value="service">Service</option><option value="other">Other</option></select></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Contact</label><input type="text" id="v-contact" placeholder="Phone / WhatsApp / email"></div>
+        <div class="op-field"><label>Notes</label><input type="text" id="v-notes"></div>
+      </div>
+      <button class="btn primary" onclick="createVendor()">Add vendor</button>
+    </div>
+    <div id="vendors-list">${!vendors.length?'<div style="text-align:center;padding:1rem;color:var(--muted)">No vendors yet</div>':vendors.map(v=>`
+      <div class="row-card" style="cursor:default">
+        <div style="flex:1"><div style="font-size:13px;font-weight:500">${v.name}</div><div style="font-size:11px;color:var(--muted)">${(v.type||'').replace('_',' ')}${v.contact?' · '+v.contact:''}</div></div>
+        <button class="btn danger sm" onclick="delVendor('${v.id}')">Delete</button>
+      </div>`).join('')}</div>
+
+    <div class="form-box" style="margin-top:16px">
+      <h4>➕ Log a purchase</h4>
+      <div class="form-row">
+        <div class="op-field"><label>Vendor</label><select id="p-vendor"><option value="">—</option>${vendors.map(v=>`<option value="${v.id}">${v.name}</option>`).join('')}</select></div>
+        <div class="op-field"><label>Category</label><select id="p-category"><option value="filament">Filament</option><option value="printer">Printer</option><option value="packaging">Packaging</option><option value="parts">Parts</option><option value="other">Other</option></select></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Description</label><input type="text" id="p-desc" placeholder="e.g. 5x PLA 1kg black"></div>
+        <div class="op-field"><label>Purchase date</label><input type="date" id="p-date" value="${new Date().toISOString().slice(0,10)}"></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Quantity</label><input type="number" id="p-qty" step="0.01"></div>
+        <div class="op-field"><label>Unit cost (PKR)</label><input type="number" id="p-unitcost" step="0.01"></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Total cost (PKR, auto if blank)</label><input type="number" id="p-total" step="0.01"></div>
+        <div class="op-field"><label>Payment status</label><select id="p-pstatus"><option value="paid">Paid</option><option value="partial">Partial</option><option value="credit">Credit (unpaid)</option></select></div>
+      </div>
+      <button class="btn primary" onclick="createPurchase()">Log purchase</button>
+    </div>
+    <div id="purchases-list">${!purchases.length?'<div style="text-align:center;padding:1rem;color:var(--muted)">No purchases logged yet</div>':purchases.map(p=>`
+      <div class="row-card" style="cursor:default">
+        <div style="flex:1"><div style="font-size:12px;font-weight:500">${p.description||p.category}</div><div style="font-size:11px;color:var(--muted)">${p.purchase_date} · ${p.category} · ${p.payment_status}${p.amount_due>0?` · PKR ${Math.round(p.amount_due).toLocaleString()} due`:''}</div></div>
+        <div style="font-weight:600;font-size:12px">${fmtMoney(p.total_cost)}</div>
+        <button class="btn danger sm" onclick="delPurchase('${p.id}')">Delete</button>
+      </div>`).join('')}</div>
+  `;
+}
+async function createVendor(){
+  const name=document.getElementById('v-name').value.trim(); if(!name){alert('Enter a vendor name');return;}
+  await fetch('/api/accounting/vendors',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,type:document.getElementById('v-type').value,contact:document.getElementById('v-contact').value,notes:document.getElementById('v-notes').value})});
+  loadAccVendors();
+}
+async function delVendor(id){if(!confirm('Delete vendor?'))return;await fetch(`/api/accounting/vendors/${id}`,{method:'DELETE'});loadAccVendors();}
+async function createPurchase(){
+  const body={vendor_id:document.getElementById('p-vendor').value||null,category:document.getElementById('p-category').value,description:document.getElementById('p-desc').value,purchase_date:document.getElementById('p-date').value,quantity:document.getElementById('p-qty').value||null,unit_cost:document.getElementById('p-unitcost').value||null,total_cost:document.getElementById('p-total').value||null,payment_status:document.getElementById('p-pstatus').value};
+  await fetch('/api/accounting/purchases',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  loadAccVendors();
+}
+async function delPurchase(id){if(!confirm('Delete purchase?'))return;await fetch(`/api/accounting/purchases/${id}`,{method:'DELETE'});loadAccVendors();}
+
+async function loadAccPrinters(){
+  const c=document.getElementById('acc-content');
+  c.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Loading…</div>';
+  const [prR,mR]=await Promise.all([fetch('/api/accounting/printers'),fetch('/api/accounting/maintenance')]);
+  const printers=(await prR.json()).printers||[]; const logs=(await mR.json()).logs||[];
+  c.innerHTML=`
+    <div class="form-box">
+      <h4>➕ Add printer</h4>
+      <div class="form-row">
+        <div class="op-field"><label>Name</label><input type="text" id="pr-name" placeholder="e.g. Bambu X1C #1"></div>
+        <div class="op-field"><label>Model</label><input type="text" id="pr-model"></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Purchase cost (PKR)</label><input type="number" id="pr-cost" step="0.01"></div>
+        <div class="op-field"><label>Purchase date</label><input type="date" id="pr-date"></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Useful life (years)</label><input type="number" id="pr-life" value="3" step="0.5"></div>
+        <div class="op-field"><label>Salvage value (PKR)</label><input type="number" id="pr-salvage" value="0" step="0.01"></div>
+      </div>
+      <button class="btn primary" onclick="createPrinter()">Add printer</button>
+    </div>
+    <div id="printers-list">${!printers.length?'<div style="text-align:center;padding:1rem;color:var(--muted)">No printers logged yet</div>':printers.map(p=>{const d=p._depreciation||{};return `
+      <div class="row-card" style="cursor:default;flex-wrap:wrap">
+        <div style="flex:1;min-width:180px"><div style="font-size:13px;font-weight:500">${p.name}${p.model?' — '+p.model:''}</div><div style="font-size:11px;color:var(--muted)">${(p.total_hours||0).toLocaleString()} hrs run · ${d.age_months||0} months old${d.fully_depreciated?' · fully depreciated':''}</div></div>
+        <div style="font-size:11px;text-align:right"><div>Book value: <b>${fmtMoney(d.book_value)}</b></div><div style="color:var(--muted)">${fmtMoney(d.monthly_depreciation)}/mo dep.</div></div>
+        <button class="btn danger sm" onclick="delPrinter('${p.id}')">Delete</button>
+      </div>`;}).join('')}</div>
+
+    <div class="form-box" style="margin-top:16px">
+      <h4>🕐 Log running hours</h4>
+      <div class="form-row">
+        <div class="op-field"><label>Printer</label><select id="u-printer">${printers.map(p=>`<option value="${p.id}">${p.name}</option>`).join('')}</select></div>
+        <div class="op-field"><label>Hours run</label><input type="number" id="u-hours" step="0.1"></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Date</label><input type="date" id="u-date" value="${new Date().toISOString().slice(0,10)}"></div>
+        <div class="op-field"><label>Notes</label><input type="text" id="u-notes"></div>
+      </div>
+      <button class="btn primary" onclick="logUsage()">Log hours</button>
+    </div>
+
+    <div class="form-box" style="margin-top:16px">
+      <h4>🔧 Log maintenance</h4>
+      <div class="form-row">
+        <div class="op-field"><label>Printer</label><select id="m-printer">${printers.map(p=>`<option value="${p.id}">${p.name}</option>`).join('')}</select></div>
+        <div class="op-field"><label>Type</label><select id="m-type"><option value="routine">Routine</option><option value="repair">Repair</option><option value="part_replacement">Part replacement</option></select></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Description</label><input type="text" id="m-desc"></div>
+        <div class="op-field"><label>Cost (PKR)</label><input type="number" id="m-cost" step="0.01" value="0"></div>
+      </div>
+      <div class="op-field"><label>Date</label><input type="date" id="m-date" value="${new Date().toISOString().slice(0,10)}"></div>
+      <button class="btn primary" onclick="logMaintenance()">Log maintenance</button>
+    </div>
+    <div id="maint-list">${!logs.length?'<div style="text-align:center;padding:1rem;color:var(--muted)">No maintenance logged yet</div>':logs.map(l=>{const pr=printers.find(p=>p.id===l.printer_id);return `
+      <div class="row-card" style="cursor:default">
+        <div style="flex:1"><div style="font-size:12px;font-weight:500">${pr?pr.name:'—'} · ${l.type}</div><div style="font-size:11px;color:var(--muted)">${l.log_date}${l.description?' · '+l.description:''}</div></div>
+        <div style="font-weight:600;font-size:12px">${fmtMoney(l.cost)}</div>
+        <button class="btn danger sm" onclick="delMaintenance('${l.id}')">Delete</button>
+      </div>`;}).join('')}</div>
+  `;
+}
+async function createPrinter(){
+  const name=document.getElementById('pr-name').value.trim(); if(!name){alert('Enter a printer name');return;}
+  await fetch('/api/accounting/printers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,model:document.getElementById('pr-model').value,purchase_cost:document.getElementById('pr-cost').value,purchase_date:document.getElementById('pr-date').value||null,useful_life_years:document.getElementById('pr-life').value,salvage_value:document.getElementById('pr-salvage').value})});
+  loadAccPrinters();
+}
+async function delPrinter(id){if(!confirm('Delete printer?'))return;await fetch(`/api/accounting/printers/${id}`,{method:'DELETE'});loadAccPrinters();}
+async function logUsage(){
+  const id=document.getElementById('u-printer').value; if(!id){alert('Add a printer first');return;}
+  await fetch(`/api/accounting/printers/${id}/usage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hours:document.getElementById('u-hours').value,log_date:document.getElementById('u-date').value,notes:document.getElementById('u-notes').value})});
+  loadAccPrinters();
+}
+async function logMaintenance(){
+  const id=document.getElementById('m-printer').value; if(!id){alert('Add a printer first');return;}
+  await fetch('/api/accounting/maintenance',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({printer_id:id,type:document.getElementById('m-type').value,description:document.getElementById('m-desc').value,cost:document.getElementById('m-cost').value,log_date:document.getElementById('m-date').value})});
+  loadAccPrinters();
+}
+async function delMaintenance(id){if(!confirm('Delete log?'))return;await fetch(`/api/accounting/maintenance/${id}`,{method:'DELETE'});loadAccPrinters();}
+
+async function loadAccCustom(){
+  const c=document.getElementById('acc-content');
+  c.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Loading…</div>';
+  const r=await fetch('/api/accounting/custom-orders'); const orders=(await r.json()).orders||[];
+  c.innerHTML=`
+    <div class="form-box">
+      <h4>➕ New custom order</h4>
+      <div class="form-row">
+        <div class="op-field"><label>Customer name</label><input type="text" id="co-name"></div>
+        <div class="op-field"><label>Contact</label><input type="text" id="co-contact"></div>
+      </div>
+      <div class="op-field"><label>Description</label><input type="text" id="co-desc" placeholder="What are you printing?"></div>
+      <div class="form-row">
+        <div class="op-field"><label>Sale price (PKR)</label><input type="number" id="co-price" step="0.01"></div>
+        <div class="op-field"><label>Tax amount (PKR)</label><input type="number" id="co-tax" step="0.01" value="0"></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Cost estimate (PKR)</label><input type="number" id="co-cost" step="0.01" value="0"></div>
+        <div class="op-field"><label>Amount paid so far (PKR)</label><input type="number" id="co-paid" step="0.01" value="0"></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Payment status</label><select id="co-pstatus"><option value="unpaid">Unpaid</option><option value="deposit">Deposit</option><option value="paid">Paid in full</option></select></div>
+        <div class="op-field"><label>Production</label><select id="co-prod"><option value="in_house">In-house</option><option value="outsourced">Outsourced</option></select></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Order date</label><input type="date" id="co-odate" value="${new Date().toISOString().slice(0,10)}"></div>
+        <div class="op-field"><label>Delivery date</label><input type="date" id="co-ddate"></div>
+      </div>
+      <button class="btn primary" onclick="createCustomOrder()">Add custom order</button>
+    </div>
+    <div id="custom-list">${!orders.length?'<div style="text-align:center;padding:1rem;color:var(--muted)">No custom orders yet</div>':orders.map(o=>`
+      <div class="row-card" style="cursor:default;flex-wrap:wrap">
+        <div style="flex:1;min-width:160px"><div style="font-size:13px;font-weight:500">${o.customer_name}</div><div style="font-size:11px;color:var(--muted)">${o.description||''} · ${o.order_date}</div></div>
+        <select onchange="updateCustomStatus('${o.id}',this.value)" style="font-size:11px">
+          ${['quoted','confirmed','printing','shipped','completed','cancelled'].map(s=>`<option value="${s}" ${o.status===s?'selected':''}>${s}</option>`).join('')}
+        </select>
+        <span style="font-size:10px;background:var(--surface3);padding:2px 7px;border-radius:20px;color:var(--muted)">${o.payment_status}</span>
+        <div style="font-weight:600;font-size:12px">${fmtMoney(o.sale_price)}</div>
+        <button class="btn danger sm" onclick="delCustomOrder('${o.id}')">Delete</button>
+      </div>`).join('')}</div>
+  `;
+}
+async function createCustomOrder(){
+  const name=document.getElementById('co-name').value.trim(); if(!name){alert('Enter customer name');return;}
+  const body={customer_name:name,contact:document.getElementById('co-contact').value,description:document.getElementById('co-desc').value,sale_price:document.getElementById('co-price').value,tax_amount:document.getElementById('co-tax').value,cost_estimate:document.getElementById('co-cost').value,amount_paid:document.getElementById('co-paid').value,payment_status:document.getElementById('co-pstatus').value,production_type:document.getElementById('co-prod').value,order_date:document.getElementById('co-odate').value,delivery_date:document.getElementById('co-ddate').value||null};
+  await fetch('/api/accounting/custom-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  loadAccCustom();
+}
+async function updateCustomStatus(id,status){await fetch(`/api/accounting/custom-orders/${id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})});}
+async function delCustomOrder(id){if(!confirm('Delete custom order?'))return;await fetch(`/api/accounting/custom-orders/${id}`,{method:'DELETE'});loadAccCustom();}
+
+async function loadAccOutsourced(){
+  const c=document.getElementById('acc-content');
+  c.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Loading…</div>';
+  const [jR,vR]=await Promise.all([fetch('/api/accounting/outsourced'),fetch('/api/accounting/vendors')]);
+  const jobs=(await jR.json()).jobs||[]; const vendors=(await vR.json()).vendors||[];
+  c.innerHTML=`
+    <div class="form-box">
+      <h4>➕ Send job to a print farm</h4>
+      <div class="form-row">
+        <div class="op-field"><label>Print farm / vendor</label><select id="o-vendor"><option value="">—</option>${vendors.map(v=>`<option value="${v.id}">${v.name}</option>`).join('')}</select></div>
+        <div class="op-field"><label>Order reference</label><input type="text" id="o-ref" placeholder="Shopify order # or custom order"></div>
+      </div>
+      <div class="op-field"><label>Description</label><input type="text" id="o-desc"></div>
+      <div class="form-row">
+        <div class="op-field"><label>Quantity</label><input type="number" id="o-qty" value="1"></div>
+        <div class="op-field"><label>Cost charged (PKR)</label><input type="number" id="o-cost" step="0.01"></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Date sent</label><input type="date" id="o-sent" value="${new Date().toISOString().slice(0,10)}"></div>
+        <div class="op-field"><label>Expected return</label><input type="date" id="o-expret"></div>
+      </div>
+      <button class="btn primary" onclick="createOutsourced()">Log job</button>
+    </div>
+    <div id="outsourced-list">${!jobs.length?'<div style="text-align:center;padding:1rem;color:var(--muted)">No outsourced jobs yet</div>':jobs.map(j=>{const v=vendors.find(x=>x.id===j.vendor_id);return `
+      <div class="row-card" style="cursor:default;flex-wrap:wrap">
+        <div style="flex:1;min-width:160px"><div style="font-size:13px;font-weight:500">${v?v.name:'—'}${j.order_ref?' · '+j.order_ref:''}</div><div style="font-size:11px;color:var(--muted)">${j.description||''} · sent ${j.date_sent}</div></div>
+        <select onchange="updateOutsourcedStatus('${j.id}',this.value)" style="font-size:11px">
+          ${['sent','in_progress','received','issue'].map(s=>`<option value="${s}" ${j.status===s?'selected':''}>${s}</option>`).join('')}
+        </select>
+        <div style="font-weight:600;font-size:12px">${fmtMoney(j.cost_charged)}</div>
+        <button class="btn danger sm" onclick="delOutsourced('${j.id}')">Delete</button>
+      </div>`;}).join('')}</div>
+  `;
+}
+async function createOutsourced(){
+  const body={vendor_id:document.getElementById('o-vendor').value||null,order_ref:document.getElementById('o-ref').value,description:document.getElementById('o-desc').value,quantity:document.getElementById('o-qty').value,cost_charged:document.getElementById('o-cost').value,date_sent:document.getElementById('o-sent').value,expected_return_date:document.getElementById('o-expret').value||null};
+  await fetch('/api/accounting/outsourced',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  loadAccOutsourced();
+}
+async function updateOutsourcedStatus(id,status){const body={status}; if(status==='received')body.actual_return_date=new Date().toISOString().slice(0,10); await fetch(`/api/accounting/outsourced/${id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}
+async function delOutsourced(id){if(!confirm('Delete job?'))return;await fetch(`/api/accounting/outsourced/${id}`,{method:'DELETE'});loadAccOutsourced();}
+
+async function loadAccExpenses(){
+  const c=document.getElementById('acc-content');
+  c.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Loading…</div>';
+  const [eR,emR,payR]=await Promise.all([fetch('/api/accounting/expenses'),fetch('/api/accounting/employees'),fetch('/api/accounting/employees/payments')]);
+  const expenses=(await eR.json()).expenses||[]; const employees=(await emR.json()).employees||[]; const payments=(await payR.json()).payments||[];
+  c.innerHTML=`
+    <div class="form-box">
+      <h4>➕ Log an expense</h4>
+      <div class="form-row">
+        <div class="op-field"><label>Category</label><select id="e-cat"><option value="ads">Ad spend</option><option value="rent">Rent</option><option value="utilities">Utilities</option><option value="subscriptions">Subscriptions</option><option value="shipping_supplies">Shipping supplies</option><option value="courier_fees">Courier fees</option><option value="other">Other</option></select></div>
+        <div class="op-field"><label>Amount (PKR)</label><input type="number" id="e-amount" step="0.01"></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Description</label><input type="text" id="e-desc"></div>
+        <div class="op-field"><label>Date</label><input type="date" id="e-date" value="${new Date().toISOString().slice(0,10)}"></div>
+      </div>
+      <div class="op-field"><label><input type="checkbox" id="e-recurring" style="width:auto;margin-right:6px">Recurring (label only — log each occurrence separately)</label></div>
+      <button class="btn primary" onclick="createExpense()">Log expense</button>
+    </div>
+    <div id="expenses-list">${!expenses.length?'<div style="text-align:center;padding:1rem;color:var(--muted)">No expenses logged yet</div>':expenses.map(e=>`
+      <div class="row-card" style="cursor:default">
+        <div style="flex:1"><div style="font-size:12px;font-weight:500">${e.description||e.category}</div><div style="font-size:11px;color:var(--muted)">${e.expense_date} · ${e.category}${e.recurring?' · recurring':''}</div></div>
+        <div style="font-weight:600;font-size:12px">${fmtMoney(e.amount)}</div>
+        <button class="btn danger sm" onclick="delExpense('${e.id}')">Delete</button>
+      </div>`).join('')}</div>
+
+    <div class="form-box" style="margin-top:16px">
+      <h4>➕ Add employee</h4>
+      <div class="form-row">
+        <div class="op-field"><label>Name</label><input type="text" id="em-name"></div>
+        <div class="op-field"><label>Role</label><input type="text" id="em-role"></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Payment type</label><select id="em-ptype"><option value="fixed_salary">Fixed salary</option><option value="hourly">Hourly</option><option value="per_job">Per job</option></select></div>
+        <div class="op-field"><label>Rate (PKR)</label><input type="number" id="em-rate" step="0.01"></div>
+      </div>
+      <button class="btn primary" onclick="createEmployee()">Add employee</button>
+    </div>
+    <div id="employees-list">${!employees.length?'<div style="text-align:center;padding:1rem;color:var(--muted)">No employees added yet</div>':employees.map(em=>`
+      <div class="row-card" style="cursor:default"><div style="flex:1"><div style="font-size:12px;font-weight:500">${em.name}</div><div style="font-size:11px;color:var(--muted)">${em.role||''} · ${em.payment_type} · PKR ${Math.round(em.rate||0).toLocaleString()}</div></div>
+      <button class="btn danger sm" onclick="delEmployee('${em.id}')">Delete</button></div>`).join('')}</div>
+
+    <div class="form-box" style="margin-top:16px">
+      <h4>💵 Log employee payment</h4>
+      <div class="form-row">
+        <div class="op-field"><label>Employee</label><select id="ep-emp">${employees.map(em=>`<option value="${em.id}">${em.name}</option>`).join('')}</select></div>
+        <div class="op-field"><label>Amount (PKR)</label><input type="number" id="ep-amount" step="0.01"></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Date</label><input type="date" id="ep-date" value="${new Date().toISOString().slice(0,10)}"></div>
+        <div class="op-field"><label>Period covered</label><input type="text" id="ep-period" placeholder="e.g. Aug 2026"></div>
+      </div>
+      <button class="btn primary" onclick="createEmployeePayment()">Log payment</button>
+    </div>
+    <div id="payments-list">${!payments.length?'<div style="text-align:center;padding:1rem;color:var(--muted)">No payments logged yet</div>':payments.map(p=>{const em=employees.find(x=>x.id===p.employee_id);return `
+      <div class="row-card" style="cursor:default"><div style="flex:1"><div style="font-size:12px;font-weight:500">${em?em.name:'—'}</div><div style="font-size:11px;color:var(--muted)">${p.payment_date}${p.period_covered?' · '+p.period_covered:''}</div></div>
+      <div style="font-weight:600;font-size:12px">${fmtMoney(p.amount)}</div>
+      <button class="btn danger sm" onclick="delEmployeePayment('${p.id}')">Delete</button></div>`;}).join('')}</div>
+  `;
+}
+async function createExpense(){
+  const amount=document.getElementById('e-amount').value; if(!amount){alert('Enter an amount');return;}
+  const body={category:document.getElementById('e-cat').value,description:document.getElementById('e-desc').value,amount,expense_date:document.getElementById('e-date').value,recurring:document.getElementById('e-recurring').checked};
+  await fetch('/api/accounting/expenses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  loadAccExpenses();
+}
+async function delExpense(id){if(!confirm('Delete expense?'))return;await fetch(`/api/accounting/expenses/${id}`,{method:'DELETE'});loadAccExpenses();}
+async function createEmployee(){
+  const name=document.getElementById('em-name').value.trim(); if(!name){alert('Enter a name');return;}
+  await fetch('/api/accounting/employees',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,role:document.getElementById('em-role').value,payment_type:document.getElementById('em-ptype').value,rate:document.getElementById('em-rate').value})});
+  loadAccExpenses();
+}
+async function delEmployee(id){if(!confirm('Delete employee?'))return;await fetch(`/api/accounting/employees/${id}`,{method:'DELETE'});loadAccExpenses();}
+async function createEmployeePayment(){
+  const id=document.getElementById('ep-emp').value; if(!id){alert('Add an employee first');return;}
+  await fetch('/api/accounting/employees/payments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({employee_id:id,amount:document.getElementById('ep-amount').value,payment_date:document.getElementById('ep-date').value,period_covered:document.getElementById('ep-period').value})});
+  loadAccExpenses();
+}
+async function delEmployeePayment(id){if(!confirm('Delete payment?'))return;await fetch(`/api/accounting/employees/payments/${id}`,{method:'DELETE'});loadAccExpenses();}
+
+async function loadAccCash(){
+  const c=document.getElementById('acc-content');
+  c.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Loading…</div>';
+  const [aR,tR]=await Promise.all([fetch('/api/accounting/cash-accounts'),fetch('/api/accounting/cash-transactions')]);
+  const accounts=(await aR.json()).accounts||[]; const txns=(await tR.json()).transactions||[];
+  c.innerHTML=`
+    <div class="metric-grid">${accounts.map(a=>`<div class="metric-card ${a._balance>=0?'green':'red'}"><div class="m-label">${a.name}</div><div class="m-value" style="font-size:16px">${fmtMoney(a._balance)}</div><div class="m-sub">${(a.account_type||'').replace('_',' ')}</div></div>`).join('')}</div>
+    <div class="form-box">
+      <h4>➕ Add cash/payment account</h4>
+      <div class="form-row">
+        <div class="op-field"><label>Name</label><input type="text" id="ca-name" placeholder="e.g. Meezan Bank, JazzCash, Cash in hand"></div>
+        <div class="op-field"><label>Type</label><select id="ca-type"><option value="bank">Bank</option><option value="mobile_wallet">Mobile wallet</option><option value="cash">Cash in hand</option><option value="courier_pending">Courier pending</option></select></div>
+      </div>
+      <div class="op-field"><label>Opening balance (PKR)</label><input type="number" id="ca-opening" step="0.01" value="0"></div>
+      <button class="btn primary" onclick="createCashAccount()">Add account</button>
+    </div>
+
+    <div class="form-box">
+      <h4>➕ Log a transaction</h4>
+      <div class="form-row">
+        <div class="op-field"><label>Account</label><select id="ct-account">${accounts.map(a=>`<option value="${a.id}">${a.name}</option>`).join('')}</select></div>
+        <div class="op-field"><label>Direction</label><select id="ct-dir"><option value="in">Money in</option><option value="out">Money out</option></select></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Amount (PKR)</label><input type="number" id="ct-amount" step="0.01"></div>
+        <div class="op-field"><label>Category</label><select id="ct-cat"><option value="sale">Sale</option><option value="expense">Expense</option><option value="vendor_purchase">Vendor purchase</option><option value="payout">Courier payout</option><option value="employee_payment">Employee payment</option><option value="transfer">Transfer</option><option value="other">Other</option></select></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Date</label><input type="date" id="ct-date" value="${new Date().toISOString().slice(0,10)}"></div>
+        <div class="op-field"><label>Reference / notes</label><input type="text" id="ct-ref"></div>
+      </div>
+      <button class="btn primary" onclick="createCashTxn()">Log transaction</button>
+    </div>
+    <div id="txn-list">${!txns.length?'<div style="text-align:center;padding:1rem;color:var(--muted)">No transactions logged yet</div>':txns.map(t=>{const a=accounts.find(x=>x.id===t.account_id);return `
+      <div class="row-card" style="cursor:default">
+        <div style="flex:1"><div style="font-size:12px;font-weight:500">${a?a.name:'—'} · ${t.category}</div><div style="font-size:11px;color:var(--muted)">${t.txn_date}${t.reference?' · '+t.reference:''}</div></div>
+        <div style="font-weight:600;font-size:12px;color:${t.direction==='in'?'var(--green)':'var(--red)'}">${t.direction==='in'?'+':'-'}${fmtMoney(t.amount)}</div>
+        <button class="btn danger sm" onclick="delCashTxn('${t.id}')">Delete</button>
+      </div>`;}).join('')}</div>
+
+    <div class="form-box" style="margin-top:16px">
+      <h4>🚚 Log a PostEx settlement payout</h4>
+      <div class="form-row">
+        <div class="op-field"><label>Payout date</label><input type="date" id="pp-date" value="${new Date().toISOString().slice(0,10)}"></div>
+        <div class="op-field"><label>Order count</label><input type="number" id="pp-count"></div>
+      </div>
+      <div class="form-row">
+        <div class="op-field"><label>Gross amount (PKR)</label><input type="number" id="pp-gross" step="0.01"></div>
+        <div class="op-field"><label>Fee deducted (PKR)</label><input type="number" id="pp-fee" step="0.01" value="0"></div>
+      </div>
+      <button class="btn primary" onclick="createPostexPayout()">Log payout</button>
+      <div style="font-size:11px;color:var(--muted);margin-top:8px">Log each PostEx settlement batch here as they pay you out — this is what powers the reconciliation card on the Overview tab.</div>
+    </div>
+  `;
+}
+async function createCashAccount(){
+  const name=document.getElementById('ca-name').value.trim(); if(!name){alert('Enter an account name');return;}
+  await fetch('/api/accounting/cash-accounts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,account_type:document.getElementById('ca-type').value,opening_balance:document.getElementById('ca-opening').value})});
+  loadAccCash();
+}
+async function delCashAccount(id){if(!confirm('Delete account?'))return;await fetch(`/api/accounting/cash-accounts/${id}`,{method:'DELETE'});loadAccCash();}
+async function createCashTxn(){
+  const id=document.getElementById('ct-account').value; if(!id){alert('Add a cash account first');return;}
+  await fetch('/api/accounting/cash-transactions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_id:id,direction:document.getElementById('ct-dir').value,amount:document.getElementById('ct-amount').value,category:document.getElementById('ct-cat').value,reference:document.getElementById('ct-ref').value,txn_date:document.getElementById('ct-date').value})});
+  loadAccCash();
+}
+async function delCashTxn(id){if(!confirm('Delete transaction?'))return;await fetch(`/api/accounting/cash-transactions/${id}`,{method:'DELETE'});loadAccCash();}
+async function createPostexPayout(){
+  const gross=document.getElementById('pp-gross').value; if(!gross){alert('Enter a gross amount');return;}
+  await fetch('/api/accounting/postex-payouts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({payout_date:document.getElementById('pp-date').value,gross_amount:gross,fee_deducted:document.getElementById('pp-fee').value,order_count:document.getElementById('pp-count').value})});
+  loadAccCash();
+}
+
 // ── Notifications ─────────────────────────────────────────────────────────────
 async function loadNotifications(){
   try{
@@ -1180,6 +1656,7 @@ const CMDS=[
   {ic:'👥',l:'Customers',s:'View',a:()=>showView('customers')},
   {ic:'⚠️',l:'Abandoned Carts',s:'View',a:()=>showView('abandoned')},
   {ic:'🚚',l:'PostEx COD',s:'View',a:()=>showView('postex')},
+  {ic:'💰',l:'Accounts',s:'View',a:()=>showView('accounts')},
   {ic:'⚙️',l:'Automation',s:'View',a:()=>showView('automation')},
   {ic:'🕒',l:'History',s:'View',a:()=>showView('history')},
   ...Object.entries(OPS).map(([op,cfg])=>({ic:'⚡',l:cfg.t,s:'Operation',a:()=>openOp(op)})),
@@ -1196,7 +1673,7 @@ function showView(v){
   document.querySelectorAll('.sbi').forEach(el=>el.classList.remove('active'));
   document.getElementById(`view-${v}`)?.classList.add('active');
   document.getElementById(`nav-${v}`)?.classList.add('active');
-  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',automation:'Automation',history:'Operation History'};
+  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',automation:'Automation',history:'Operation History',accounts:'Accounts'};
   document.getElementById('view-title').textContent=titles[v]||v;
   if(v==='orders')loadOrders();
   if(v==='analytics')loadAnalytics();
@@ -1205,6 +1682,7 @@ function showView(v){
   if(v==='postex')loadPostex();
   if(v==='automation')loadRules();
   if(v==='history')loadHistory();
+  if(v==='accounts')showAccTab(ACC_TAB);
   if(window.innerWidth<768)document.getElementById('sb').classList.remove('open');
 }
 

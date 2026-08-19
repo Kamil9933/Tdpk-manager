@@ -1,7 +1,7 @@
-import os, json, asyncio, hashlib
+import os, json, asyncio, hashlib, csv, io
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from dotenv import load_dotenv
@@ -14,6 +14,7 @@ from core.supabase_client import db
 from core.operations import run_operation
 from core.intelligence import generate_briefing
 from core.postex import PostexClient
+from core.accounting import generate_pnl, straight_line_depreciation, calc_cash_balance, reconcile_postex
 
 app = FastAPI(title="TD Shopify Manager v3")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -413,6 +414,445 @@ async def update_cost_settings(request: Request, session=Depends(verify_session)
     data = await request.json()
     await db.update_cost_settings(data)
     return {"ok": True}
+
+# ── Accounting: Vendors ──────────────────────────────────────────────────────
+@app.get("/api/accounting/vendors")
+async def list_vendors(session=Depends(verify_session)):
+    return {"vendors": await db.list_vendors()}
+
+@app.post("/api/accounting/vendors")
+async def create_vendor(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    row = await db.create_vendor({
+        "name": data.get("name", "Unnamed vendor"),
+        "type": data.get("type", "other"),
+        "contact": data.get("contact", ""),
+        "notes": data.get("notes", ""),
+    })
+    return {"ok": True, "vendor": row}
+
+@app.put("/api/accounting/vendors/{vendor_id}")
+async def update_vendor(vendor_id: str, request: Request, session=Depends(verify_session)):
+    await db.update_vendor(vendor_id, await request.json())
+    return {"ok": True}
+
+@app.delete("/api/accounting/vendors/{vendor_id}")
+async def delete_vendor(vendor_id: str, session=Depends(verify_session)):
+    await db.delete_vendor(vendor_id)
+    return {"ok": True}
+
+# ── Accounting: Vendor purchases ─────────────────────────────────────────────
+@app.get("/api/accounting/purchases")
+async def list_purchases(from_date: str = None, to_date: str = None, session=Depends(verify_session)):
+    return {"purchases": await db.list_vendor_purchases(from_date, to_date)}
+
+@app.post("/api/accounting/purchases")
+async def create_purchase(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    qty = float(data.get("quantity") or 0)
+    unit_cost = float(data.get("unit_cost") or 0)
+    total_cost = float(data.get("total_cost") or (qty * unit_cost) or 0)
+    paid = float(data.get("amount_paid") or (total_cost if data.get("payment_status", "paid") == "paid" else 0))
+    row = await db.create_vendor_purchase({
+        "vendor_id": data.get("vendor_id"),
+        "category": data.get("category", "other"),
+        "description": data.get("description", ""),
+        "quantity": qty or None,
+        "unit": data.get("unit", ""),
+        "unit_cost": unit_cost or None,
+        "total_cost": total_cost,
+        "purchase_date": data.get("purchase_date") or datetime.utcnow().date().isoformat(),
+        "payment_status": data.get("payment_status", "paid"),
+        "amount_paid": paid,
+        "amount_due": round(total_cost - paid, 2),
+        "receipt_note": data.get("receipt_note", ""),
+    })
+    return {"ok": True, "purchase": row}
+
+@app.delete("/api/accounting/purchases/{purchase_id}")
+async def delete_purchase(purchase_id: str, session=Depends(verify_session)):
+    await db.delete_vendor_purchase(purchase_id)
+    return {"ok": True}
+
+# ── Accounting: Printers ─────────────────────────────────────────────────────
+@app.get("/api/accounting/printers")
+async def list_printers(session=Depends(verify_session)):
+    printers = await db.list_printers()
+    for p in printers:
+        p["_depreciation"] = straight_line_depreciation(p)
+    return {"printers": printers}
+
+@app.post("/api/accounting/printers")
+async def create_printer(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    row = await db.create_printer({
+        "name": data.get("name", "Unnamed printer"),
+        "model": data.get("model", ""),
+        "vendor_id": data.get("vendor_id"),
+        "purchase_cost": float(data.get("purchase_cost") or 0),
+        "purchase_date": data.get("purchase_date"),
+        "useful_life_years": float(data.get("useful_life_years") or 3),
+        "salvage_value": float(data.get("salvage_value") or 0),
+        "status": data.get("status", "active"),
+    })
+    return {"ok": True, "printer": row}
+
+@app.put("/api/accounting/printers/{printer_id}")
+async def update_printer(printer_id: str, request: Request, session=Depends(verify_session)):
+    await db.update_printer(printer_id, await request.json())
+    return {"ok": True}
+
+@app.delete("/api/accounting/printers/{printer_id}")
+async def delete_printer(printer_id: str, session=Depends(verify_session)):
+    await db.delete_printer(printer_id)
+    return {"ok": True}
+
+@app.post("/api/accounting/printers/{printer_id}/usage")
+async def add_printer_usage(printer_id: str, request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    total = await db.log_printer_usage(
+        printer_id, float(data.get("hours") or 0),
+        data.get("log_date"), data.get("notes", "")
+    )
+    return {"ok": True, "total_hours": total}
+
+@app.get("/api/accounting/printers/{printer_id}/usage")
+async def get_printer_usage(printer_id: str, session=Depends(verify_session)):
+    return {"logs": await db.list_printer_usage(printer_id)}
+
+@app.get("/api/accounting/maintenance")
+async def list_maintenance(printer_id: str = None, from_date: str = None, to_date: str = None, session=Depends(verify_session)):
+    return {"logs": await db.list_printer_maintenance(printer_id, from_date, to_date)}
+
+@app.post("/api/accounting/maintenance")
+async def add_maintenance(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    row = await db.log_printer_maintenance({
+        "printer_id": data.get("printer_id"),
+        "log_date": data.get("log_date") or datetime.utcnow().date().isoformat(),
+        "type": data.get("type", "routine"),
+        "description": data.get("description", ""),
+        "cost": float(data.get("cost") or 0),
+    })
+    return {"ok": True, "log": row}
+
+@app.delete("/api/accounting/maintenance/{log_id}")
+async def delete_maintenance(log_id: str, session=Depends(verify_session)):
+    await db.delete_printer_maintenance(log_id)
+    return {"ok": True}
+
+# ── Accounting: Custom orders ────────────────────────────────────────────────
+@app.get("/api/accounting/custom-orders")
+async def list_custom_orders(from_date: str = None, to_date: str = None, session=Depends(verify_session)):
+    return {"orders": await db.list_custom_orders(from_date, to_date)}
+
+@app.post("/api/accounting/custom-orders")
+async def create_custom_order(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    row = await db.create_custom_order({
+        "customer_name": data.get("customer_name", "Unnamed customer"),
+        "contact": data.get("contact", ""),
+        "description": data.get("description", ""),
+        "sale_price": float(data.get("sale_price") or 0),
+        "tax_amount": float(data.get("tax_amount") or 0),
+        "cost_estimate": float(data.get("cost_estimate") or 0),
+        "payment_status": data.get("payment_status", "unpaid"),
+        "amount_paid": float(data.get("amount_paid") or 0),
+        "production_type": data.get("production_type", "in_house"),
+        "status": data.get("status", "quoted"),
+        "order_date": data.get("order_date") or datetime.utcnow().date().isoformat(),
+        "delivery_date": data.get("delivery_date"),
+        "notes": data.get("notes", ""),
+    })
+    return {"ok": True, "order": row}
+
+@app.put("/api/accounting/custom-orders/{order_id}")
+async def update_custom_order(order_id: str, request: Request, session=Depends(verify_session)):
+    await db.update_custom_order(order_id, await request.json())
+    return {"ok": True}
+
+@app.delete("/api/accounting/custom-orders/{order_id}")
+async def delete_custom_order(order_id: str, session=Depends(verify_session)):
+    await db.delete_custom_order(order_id)
+    return {"ok": True}
+
+# ── Accounting: Outsourced production ────────────────────────────────────────
+@app.get("/api/accounting/outsourced")
+async def list_outsourced(from_date: str = None, to_date: str = None, session=Depends(verify_session)):
+    return {"jobs": await db.list_outsourced_jobs(from_date, to_date)}
+
+@app.post("/api/accounting/outsourced")
+async def create_outsourced(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    row = await db.create_outsourced_job({
+        "vendor_id": data.get("vendor_id"),
+        "order_ref": data.get("order_ref", ""),
+        "description": data.get("description", ""),
+        "quantity": int(data.get("quantity") or 1),
+        "cost_charged": float(data.get("cost_charged") or 0),
+        "date_sent": data.get("date_sent") or datetime.utcnow().date().isoformat(),
+        "expected_return_date": data.get("expected_return_date"),
+        "actual_return_date": data.get("actual_return_date"),
+        "status": data.get("status", "sent"),
+        "notes": data.get("notes", ""),
+    })
+    return {"ok": True, "job": row}
+
+@app.put("/api/accounting/outsourced/{job_id}")
+async def update_outsourced(job_id: str, request: Request, session=Depends(verify_session)):
+    await db.update_outsourced_job(job_id, await request.json())
+    return {"ok": True}
+
+@app.delete("/api/accounting/outsourced/{job_id}")
+async def delete_outsourced(job_id: str, session=Depends(verify_session)):
+    await db.delete_outsourced_job(job_id)
+    return {"ok": True}
+
+# ── Accounting: Expenses ─────────────────────────────────────────────────────
+@app.get("/api/accounting/expenses")
+async def list_expenses_route(from_date: str = None, to_date: str = None, session=Depends(verify_session)):
+    return {"expenses": await db.list_expenses(from_date, to_date)}
+
+@app.post("/api/accounting/expenses")
+async def create_expense(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    row = await db.create_expense({
+        "category": data.get("category", "other"),
+        "description": data.get("description", ""),
+        "amount": float(data.get("amount") or 0),
+        "expense_date": data.get("expense_date") or datetime.utcnow().date().isoformat(),
+        "recurring": bool(data.get("recurring", False)),
+        "recurrence_period": data.get("recurrence_period"),
+        "vendor_id": data.get("vendor_id"),
+    })
+    return {"ok": True, "expense": row}
+
+@app.delete("/api/accounting/expenses/{expense_id}")
+async def delete_expense(expense_id: str, session=Depends(verify_session)):
+    await db.delete_expense(expense_id)
+    return {"ok": True}
+
+# ── Accounting: Employees & payments ─────────────────────────────────────────
+@app.get("/api/accounting/employees")
+async def list_employees_route(session=Depends(verify_session)):
+    return {"employees": await db.list_employees()}
+
+@app.post("/api/accounting/employees")
+async def create_employee(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    row = await db.create_employee({
+        "name": data.get("name", "Unnamed"),
+        "role": data.get("role", ""),
+        "payment_type": data.get("payment_type", "fixed_salary"),
+        "rate": float(data.get("rate") or 0),
+        "contact": data.get("contact", ""),
+        "active": bool(data.get("active", True)),
+        "start_date": data.get("start_date"),
+    })
+    return {"ok": True, "employee": row}
+
+@app.put("/api/accounting/employees/{employee_id}")
+async def update_employee(employee_id: str, request: Request, session=Depends(verify_session)):
+    await db.update_employee(employee_id, await request.json())
+    return {"ok": True}
+
+@app.delete("/api/accounting/employees/{employee_id}")
+async def delete_employee(employee_id: str, session=Depends(verify_session)):
+    await db.delete_employee(employee_id)
+    return {"ok": True}
+
+@app.get("/api/accounting/employees/payments")
+async def list_employee_payments_route(employee_id: str = None, from_date: str = None, to_date: str = None, session=Depends(verify_session)):
+    return {"payments": await db.list_employee_payments(employee_id, from_date, to_date)}
+
+@app.post("/api/accounting/employees/payments")
+async def create_employee_payment(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    row = await db.create_employee_payment({
+        "employee_id": data.get("employee_id"),
+        "amount": float(data.get("amount") or 0),
+        "payment_date": data.get("payment_date") or datetime.utcnow().date().isoformat(),
+        "period_covered": data.get("period_covered", ""),
+        "notes": data.get("notes", ""),
+    })
+    return {"ok": True, "payment": row}
+
+@app.delete("/api/accounting/employees/payments/{payment_id}")
+async def delete_employee_payment(payment_id: str, session=Depends(verify_session)):
+    await db.delete_employee_payment(payment_id)
+    return {"ok": True}
+
+# ── Accounting: Cash accounts ────────────────────────────────────────────────
+@app.get("/api/accounting/cash-accounts")
+async def list_cash_accounts_route(session=Depends(verify_session)):
+    accounts = await db.list_cash_accounts()
+    for a in accounts:
+        txns = await db.list_cash_transactions(a["id"])
+        a["_balance"] = calc_cash_balance(a, txns)
+    return {"accounts": accounts}
+
+@app.post("/api/accounting/cash-accounts")
+async def create_cash_account(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    row = await db.create_cash_account({
+        "name": data.get("name", "Unnamed account"),
+        "account_type": data.get("account_type", "bank"),
+        "opening_balance": float(data.get("opening_balance") or 0),
+    })
+    return {"ok": True, "account": row}
+
+@app.delete("/api/accounting/cash-accounts/{account_id}")
+async def delete_cash_account(account_id: str, session=Depends(verify_session)):
+    await db.delete_cash_account(account_id)
+    return {"ok": True}
+
+@app.get("/api/accounting/cash-transactions")
+async def list_cash_transactions_route(account_id: str = None, from_date: str = None, to_date: str = None, session=Depends(verify_session)):
+    return {"transactions": await db.list_cash_transactions(account_id, from_date, to_date)}
+
+@app.post("/api/accounting/cash-transactions")
+async def create_cash_transaction(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    row = await db.create_cash_transaction({
+        "account_id": data.get("account_id"),
+        "direction": data.get("direction", "in"),
+        "amount": float(data.get("amount") or 0),
+        "category": data.get("category", "other"),
+        "reference": data.get("reference", ""),
+        "txn_date": data.get("txn_date") or datetime.utcnow().date().isoformat(),
+        "notes": data.get("notes", ""),
+    })
+    return {"ok": True, "transaction": row}
+
+@app.delete("/api/accounting/cash-transactions/{txn_id}")
+async def delete_cash_transaction(txn_id: str, session=Depends(verify_session)):
+    await db.delete_cash_transaction(txn_id)
+    return {"ok": True}
+
+# ── Accounting: PostEx payouts & reconciliation ──────────────────────────────
+@app.get("/api/accounting/postex-payouts")
+async def list_postex_payouts_route(from_date: str = None, to_date: str = None, session=Depends(verify_session)):
+    return {"payouts": await db.list_postex_payouts(from_date, to_date)}
+
+@app.post("/api/accounting/postex-payouts")
+async def create_postex_payout(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    gross = float(data.get("gross_amount") or 0)
+    fee = float(data.get("fee_deducted") or 0)
+    net = float(data.get("net_amount") or (gross - fee))
+    row = await db.create_postex_payout({
+        "payout_date": data.get("payout_date") or datetime.utcnow().date().isoformat(),
+        "gross_amount": gross,
+        "fee_deducted": fee,
+        "net_amount": net,
+        "order_count": int(data.get("order_count") or 0),
+        "notes": data.get("notes", ""),
+    })
+    return {"ok": True, "payout": row}
+
+@app.delete("/api/accounting/postex-payouts/{payout_id}")
+async def delete_postex_payout(payout_id: str, session=Depends(verify_session)):
+    await db.delete_postex_payout(payout_id)
+    return {"ok": True}
+
+@app.get("/api/accounting/postex-reconcile")
+async def postex_reconcile(days: int = 30, session=Depends(verify_session)):
+    summary = await postex.get_dashboard_summary(days=days)
+    from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    to_date = datetime.now().strftime("%Y-%m-%d")
+    payouts = await db.list_postex_payouts(from_date, to_date)
+    return reconcile_postex(summary, payouts)
+
+# ── Accounting: P&L ───────────────────────────────────────────────────────────
+@app.get("/api/accounting/pnl")
+async def accounting_pnl(from_date: str = None, to_date: str = None, session=Depends(verify_session)):
+    if not to_date:
+        to_date = datetime.utcnow().date().isoformat()
+    if not from_date:
+        from_date = (datetime.utcnow() - timedelta(days=30)).date().isoformat()
+
+    shopify_orders = await shopify.get_all_orders_range(from_date, to_date)
+    custom_orders = await db.list_custom_orders(from_date, to_date)
+    vendor_purchases = await db.list_vendor_purchases(from_date, to_date)
+    outsourced_jobs = await db.list_outsourced_jobs(from_date, to_date)
+    expenses = await db.list_expenses(from_date, to_date)
+    employee_payments = await db.list_employee_payments(None, from_date, to_date)
+    printer_maintenance = await db.list_printer_maintenance(None, from_date, to_date)
+    printers = await db.list_printers()
+    postex_payouts = await db.list_postex_payouts(from_date, to_date)
+
+    return generate_pnl(
+        from_date, to_date,
+        shopify_orders=shopify_orders, custom_orders=custom_orders,
+        vendor_purchases=vendor_purchases, outsourced_jobs=outsourced_jobs,
+        expenses=expenses, employee_payments=employee_payments,
+        printer_maintenance=printer_maintenance, printers=printers,
+        postex_payouts=postex_payouts,
+    )
+
+@app.get("/api/accounting/export")
+async def accounting_export(from_date: str = None, to_date: str = None, session=Depends(verify_session)):
+    if not to_date:
+        to_date = datetime.utcnow().date().isoformat()
+    if not from_date:
+        from_date = (datetime.utcnow() - timedelta(days=30)).date().isoformat()
+
+    pnl = await accounting_pnl(from_date, to_date, session)
+    purchases = await db.list_vendor_purchases(from_date, to_date)
+    expenses = await db.list_expenses(from_date, to_date)
+    custom_orders = await db.list_custom_orders(from_date, to_date)
+    payments = await db.list_employee_payments(None, from_date, to_date)
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([f"TD Shopify Manager -- P&L export {from_date} to {to_date}"])
+    w.writerow([])
+    w.writerow(["Revenue (Shopify)", pnl["revenue"]["shopify"]])
+    w.writerow(["Revenue (Custom orders)", pnl["revenue"]["custom_orders"]])
+    w.writerow(["Total revenue", pnl["revenue"]["total"]])
+    w.writerow(["Tax included in revenue", pnl["revenue"]["tax_included"]])
+    w.writerow([])
+    w.writerow(["Materials & packaging", pnl["cogs"]["materials_packaging"]])
+    w.writerow(["Outsourced production", pnl["cogs"]["outsourced_production"]])
+    w.writerow(["Printer maintenance", pnl["cogs"]["printer_maintenance"]])
+    w.writerow(["Printer depreciation", pnl["cogs"]["printer_depreciation"]])
+    w.writerow(["Total COGS", pnl["cogs"]["total"]])
+    w.writerow([])
+    for cat, amt in pnl["opex"]["by_category"].items():
+        w.writerow([f"Expense: {cat}", amt])
+    w.writerow(["Total operating expenses", pnl["opex"]["total"]])
+    w.writerow(["Courier fees", pnl["courier_fees"]])
+    w.writerow(["Labor cost", pnl["labor_cost"]])
+    w.writerow([])
+    w.writerow(["Total costs", pnl["total_costs"]])
+    w.writerow(["Net profit", pnl["net_profit"]])
+    w.writerow(["Margin %", pnl["margin_pct"]])
+    w.writerow(["Estimated cash collected", pnl["cash_collected_estimate"]])
+    w.writerow([])
+    w.writerow(["-- Vendor purchases --"])
+    w.writerow(["Date", "Category", "Description", "Total cost", "Payment status"])
+    for p in purchases:
+        w.writerow([p.get("purchase_date"), p.get("category"), p.get("description"), p.get("total_cost"), p.get("payment_status")])
+    w.writerow([])
+    w.writerow(["-- Expenses --"])
+    w.writerow(["Date", "Category", "Description", "Amount"])
+    for e in expenses:
+        w.writerow([e.get("expense_date"), e.get("category"), e.get("description"), e.get("amount")])
+    w.writerow([])
+    w.writerow(["-- Custom orders --"])
+    w.writerow(["Date", "Customer", "Sale price", "Payment status"])
+    for c in custom_orders:
+        w.writerow([c.get("order_date"), c.get("customer_name"), c.get("sale_price"), c.get("payment_status")])
+    w.writerow([])
+    w.writerow(["-- Employee payments --"])
+    w.writerow(["Date", "Amount", "Period covered", "Notes"])
+    for pay in payments:
+        w.writerow([pay.get("payment_date"), pay.get("amount"), pay.get("period_covered"), pay.get("notes")])
+
+    return Response(
+        content=buf.getvalue(), media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="tdpk_accounts_{from_date}_to_{to_date}.csv"'}
+    )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 async def _resolve_scope(scope):
