@@ -3,25 +3,33 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#100f1a">
+<link rel="manifest" href="/static/manifest.json">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <title>TD Manager — Login</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
-    --bg: #0a0a0f;
-    --surface: #13131a;
-    --border: rgba(255,255,255,0.08);
-    --accent: #6c63ff;
-    --accent-dim: rgba(108,99,255,0.15);
-    --text: #f0f0f5;
-    --muted: #6b6b80;
-    --danger: #ff4f4f;
-    --success: #3ecf8e;
-    --radius: 12px;
+    --bg: #0c0c11;
+    --surface: #191921;
+    --border: rgba(255,255,255,0.09);
+    --accent: #8f7ff5;
+    --accent-dim: rgba(143,127,245,0.15);
+    --text: #ffffff;
+    --muted: #a3a1ad;
+    --danger: #e66767;
+    --success: #1fbf6c;
+    --radius: 16px;
   }
   body {
     background: var(--bg);
+    background-image: radial-gradient(ellipse 900px 600px at 50% -10%, rgba(143,127,245,0.12), transparent);
     color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    -webkit-font-smoothing: antialiased;
     min-height: 100vh;
     display: flex;
     align-items: center;
@@ -31,27 +39,28 @@
   .card {
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 20px;
+    border-radius: 22px;
     padding: 2.5rem 2rem;
     width: 100%;
     max-width: 380px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
   }
   .logo {
     text-align: center;
     margin-bottom: 2rem;
   }
   .logo-mark {
-    width: 52px; height: 52px;
-    background: var(--accent-dim);
-    border: 1px solid var(--accent);
-    border-radius: 14px;
+    width: 54px; height: 54px;
+    background: linear-gradient(135deg, var(--accent), #6a5ce0);
+    border-radius: 16px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 22px;
-    margin-bottom: 0.75rem;
+    font-size: 24px;
+    margin-bottom: 0.85rem;
+    box-shadow: 0 8px 24px rgba(143,127,245,0.4);
   }
-  .logo h1 { font-size: 18px; font-weight: 600; letter-spacing: -0.3px; }
+  .logo h1 { font-size: 19px; font-weight: 800; letter-spacing: -0.02em; }
   .logo p { font-size: 12px; color: var(--muted); margin-top: 3px; }
   label {
     display: block;
@@ -63,18 +72,19 @@
   }
   input {
     width: 100%;
-    background: rgba(255,255,255,0.04);
+    background: rgba(255,255,255,0.045);
     border: 1px solid var(--border);
-    border-radius: 10px;
+    border-radius: 12px;
     color: var(--text);
     font-size: 15px;
     padding: 12px 14px;
     outline: none;
-    transition: border-color 0.2s;
+    transition: border-color 0.2s, box-shadow 0.2s;
     margin-bottom: 1rem;
     letter-spacing: 0.1em;
+    font-family: inherit;
   }
-  input:focus { border-color: var(--accent); }
+  input:focus { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-dim); }
   .pin-wrap {
     display: flex;
     gap: 8px;
@@ -100,12 +110,14 @@
     background: var(--accent);
     color: #fff;
     border: none;
-    border-radius: 10px;
+    border-radius: 12px;
     padding: 13px;
     font-size: 15px;
-    font-weight: 600;
+    font-weight: 700;
+    font-family: inherit;
     cursor: pointer;
     margin-top: 0.5rem;
+    box-shadow: 0 4px 16px rgba(143,127,245,0.35);
     transition: opacity 0.2s, transform 0.1s;
   }
   button[type=submit]:hover { opacity: 0.9; }
@@ -179,6 +191,7 @@
 </div>
 
 <script>
+  if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('/static/sw.js').catch(()=>{}));}
   const pinField = document.getElementById('pin');
   pinField.addEventListener('input', () => {
     pinField.value = pinField.value.replace(/\D/g, '').slice(0, 6);
