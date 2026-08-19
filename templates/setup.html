@@ -22,11 +22,14 @@
   button:disabled { opacity: 0.5; }
   .result { background: rgba(62,207,142,0.1); border: 1px solid rgba(62,207,142,0.3); border-radius: 10px; padding: 1rem 1.25rem; margin-top: 1.5rem; display: none; }
   .result h3 { color: var(--success); font-size: 14px; margin-bottom: 0.75rem; }
-  .result code { display: block; background: rgba(0,0,0,0.3); border-radius: 6px; padding: 8px 10px; font-size: 12px; word-break: break-all; margin-bottom: 0.5rem; color: #aaa; }
+  .result code { display: block; background: rgba(0,0,0,0.3); border-radius: 6px; padding: 8px 10px; font-size: 12px; word-break: break-all; color: #aaa; flex: 1; }
   .qr-wrap { text-align: center; margin: 1rem 0; }
   .qr-wrap img { border-radius: 10px; border: 4px solid white; }
   .step-num { display: inline-block; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: white; font-size: 11px; font-weight: 700; text-align: center; line-height: 22px; margin-right: 6px; }
   .instruction { font-size: 13px; color: var(--muted); margin: 0.5rem 0; }
+  .copy-row { display: flex; gap: 8px; align-items: stretch; margin-bottom: 1rem; }
+  .copy-btn { width: auto; flex-shrink: 0; margin-top: 0; padding: 8px 14px; font-size: 12px; }
+  .copy-btn.copied { background: var(--success); }
 </style>
 </head>
 <body>
@@ -46,11 +49,17 @@
     <p class="instruction"><span class="step-num">1</span> Scan this QR code in Google Authenticator:</p>
     <div class="qr-wrap"><img id="qr-img" src="" alt="QR Code" width="200" height="200"></div>
 
-    <p class="instruction"><span class="step-num">2</span> Add these two environment variables to your hosting provider:</p>
-    <label>PIN_HASH (copy exactly)</label>
-    <code id="pin-hash-out"></code>
-    <label>TOTP_SECRET (copy exactly)</label>
-    <code id="totp-secret-out"></code>
+    <p class="instruction"><span class="step-num">2</span> Add these two environment variables to your hosting provider (use the Copy button — don't select/copy the text by hand, it's easy to miss a character):</p>
+    <label>PIN_HASH</label>
+    <div class="copy-row">
+      <code id="pin-hash-out"></code>
+      <button type="button" class="copy-btn" onclick="copyValue('pin-hash-out', this)">Copy</button>
+    </div>
+    <label>TOTP_SECRET</label>
+    <div class="copy-row">
+      <code id="totp-secret-out"></code>
+      <button type="button" class="copy-btn" onclick="copyValue('totp-secret-out', this)">Copy</button>
+    </div>
 
     <p class="instruction"><span class="step-num">3</span> In your host's dashboard → this service → Environment → add both above, then redeploy/restart.</p>
     <p class="instruction"><span class="step-num">4</span> Once redeployed, go back to your app's URL and log in.</p>
@@ -75,8 +84,8 @@ async function doSetup() {
   });
   const data = await res.json();
 
-  document.getElementById('pin-hash-out').textContent = data.pin_hash;
-  document.getElementById('totp-secret-out').textContent = data.totp_secret;
+  document.getElementById('pin-hash-out').textContent = data.pin_hash.trim();
+  document.getElementById('totp-secret-out').textContent = data.totp_secret.trim();
 
   // Generate QR code via Google Charts API (no external JS needed)
   const uri = encodeURIComponent(`otpauth://totp/TD%20Shopify%20Manager:admin?secret=${data.totp_secret}&issuer=TD%20Shopify%20Manager`);
@@ -84,6 +93,26 @@ async function doSetup() {
 
   document.getElementById('result').style.display = 'block';
   btn.textContent = 'Done — see instructions below';
+}
+
+async function copyValue(elId, btn) {
+  const text = document.getElementById(elId).textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    // Clipboard API blocked (e.g. non-HTTPS or permissions) -- fall back to a manual selection
+    const range = document.createRange();
+    range.selectNodeContents(document.getElementById(elId));
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    document.execCommand('copy');
+    sel.removeAllRanges();
+  }
+  const original = btn.textContent;
+  btn.textContent = 'Copied!';
+  btn.classList.add('copied');
+  setTimeout(() => { btn.textContent = original; btn.classList.remove('copied'); }, 1500);
 }
 </script>
 </body>
