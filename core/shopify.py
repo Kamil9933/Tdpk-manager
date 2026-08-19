@@ -1,35 +1,80 @@
 import asyncio
+import time
 import httpx
 
 API_VERSION = "2024-04"
 
 class ShopifyClient:
-    def __init__(self, store: str, token: str):
+    """
+    Talks to the Shopify Admin REST API.
+
+    Supports two auth modes:
+      1. A static long-lived token (the classic "custom app" model) -- pass `token`.
+      2. Dev Dashboard client credentials -- pass `client_id` + `client_secret`, and
+         a fresh token is fetched automatically and refreshed before it expires
+         (Shopify's client_credentials tokens are valid ~24h). This is the simplest
+         option for a single-store custom app created via the new Dev Dashboard,
+         since it needs no interactive OAuth/redirect step at all.
+    """
+    def __init__(self, store: str, token: str = "", client_id: str = "", client_secret: str = ""):
+        self.store = store
         self.base = f"https://{store}/admin/api/{API_VERSION}"
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self._token = token
+        self._token_expires_at = float("inf") if token else 0  # static token never "expires" here
+        self._refresh_lock = asyncio.Lock()
         self.headers = {
             "X-Shopify-Access-Token": token,
             "Content-Type": "application/json"
         }
 
+    async def _ensure_token(self):
+        if not self.client_id:
+            return  # static token mode, nothing to refresh
+        if time.time() < self._token_expires_at - 60:
+            return  # current token still valid for at least another minute
+        async with self._refresh_lock:
+            if time.time() < self._token_expires_at - 60:
+                return  # another request already refreshed it while we waited
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    f"https://{self.store}/admin/oauth/access_token",
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": self.client_id,
+                        "client_secret": self.client_secret,
+                    },
+                )
+                r.raise_for_status()
+                data = r.json()
+            self._token = data["access_token"]
+            self._token_expires_at = time.time() + data.get("expires_in", 86400)
+            self.headers["X-Shopify-Access-Token"] = self._token
+
     async def _get(self, path, params=None):
+        await self._ensure_token()
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.get(f"{self.base}{path}", headers=self.headers, params=params)
             r.raise_for_status()
             return r.json()
 
     async def _put(self, path, data):
+        await self._ensure_token()
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.put(f"{self.base}{path}", headers=self.headers, json=data)
             r.raise_for_status()
             return r.json()
 
     async def _post(self, path, data):
+        await self._ensure_token()
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(f"{self.base}{path}", headers=self.headers, json=data)
             r.raise_for_status()
             return r.json()
 
     async def _delete(self, path):
+        await self._ensure_token()
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.delete(f"{self.base}{path}", headers=self.headers)
             return r.status_code

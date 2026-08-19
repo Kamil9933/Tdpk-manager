@@ -70,6 +70,16 @@ create table if not exists cost_settings (
 );
 
 -- The app connects with the Supabase *service_role* key (server-side only, never exposed
--- to a browser), which bypasses Row Level Security entirely. RLS is left off here since
--- these tables are never queried with the anon/public key. If you ever add a table that
--- IS queried from a browser with the anon key, enable RLS and add policies for it.
+-- to a browser), which bypasses Row Level Security entirely -- so enabling RLS below
+-- changes nothing about how the app behaves. It does close off the anon/public key:
+-- with RLS on and no policies, that key is denied on every table by default. This is
+-- a safety net in case the anon key is ever exposed or used by mistake, and it silences
+-- Supabase's "RLS disabled" dashboard warning.
+
+alter table sessions           enable row level security;
+alter table operation_log      enable row level security;
+alter table product_snapshots  enable row level security;
+alter table automation_rules   enable row level security;
+alter table notifications      enable row level security;
+alter table saved_views        enable row level security;
+alter table cost_settings      enable row level security;

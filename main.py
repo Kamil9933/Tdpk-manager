@@ -21,7 +21,9 @@ templates = Jinja2Templates(directory="templates")
 
 shopify = ShopifyClient(
     store=os.getenv("SHOPIFY_STORE", "1gdih3-zv.myshopify.com"),
-    token=os.getenv("SHOPIFY_TOKEN", "")
+    token=os.getenv("SHOPIFY_TOKEN", ""),
+    client_id=os.getenv("SHOPIFY_CLIENT_ID", ""),
+    client_secret=os.getenv("SHOPIFY_CLIENT_SECRET", "")
 )
 postex = PostexClient(token=os.getenv("POSTEX_TOKEN", ""))
 
