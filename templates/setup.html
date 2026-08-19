@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TD Manager — Setup</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0a0a0f; --surface: #13131a; --border: rgba(255,255,255,0.08);
+    --accent: #6c63ff; --text: #f0f0f5; --muted: #6b6b80;
+    --success: #3ecf8e; --danger: #ff4f4f;
+  }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1rem; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 2.5rem 2rem; width: 100%; max-width: 440px; }
+  h1 { font-size: 20px; margin-bottom: 0.5rem; }
+  p { color: var(--muted); font-size: 14px; line-height: 1.6; margin-bottom: 1.5rem; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
+  input { width: 100%; background: rgba(255,255,255,0.04); border: 1px solid var(--border); border-radius: 10px; color: var(--text); font-size: 15px; padding: 12px 14px; outline: none; margin-bottom: 1rem; }
+  input:focus { border-color: var(--accent); }
+  button { width: 100%; background: var(--accent); color: #fff; border: none; border-radius: 10px; padding: 13px; font-size: 15px; font-weight: 600; cursor: pointer; margin-top: 0.5rem; }
+  button:disabled { opacity: 0.5; }
+  .result { background: rgba(62,207,142,0.1); border: 1px solid rgba(62,207,142,0.3); border-radius: 10px; padding: 1rem 1.25rem; margin-top: 1.5rem; display: none; }
+  .result h3 { color: var(--success); font-size: 14px; margin-bottom: 0.75rem; }
+  .result code { display: block; background: rgba(0,0,0,0.3); border-radius: 6px; padding: 8px 10px; font-size: 12px; word-break: break-all; margin-bottom: 0.5rem; color: #aaa; }
+  .qr-wrap { text-align: center; margin: 1rem 0; }
+  .qr-wrap img { border-radius: 10px; border: 4px solid white; }
+  .step-num { display: inline-block; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: white; font-size: 11px; font-weight: 700; text-align: center; line-height: 22px; margin-right: 6px; }
+  .instruction { font-size: 13px; color: var(--muted); margin: 0.5rem 0; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>⚡ First-time Setup</h1>
+  <p>Choose a 4–6 digit PIN. You'll also set up Google Authenticator 2FA, which is required on every login alongside the PIN.</p>
+
+  <label>PIN (4–6 digits)</label>
+  <input type="password" id="pin" placeholder="Choose a PIN" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" />
+  <label>Confirm PIN</label>
+  <input type="password" id="pin2" placeholder="Repeat PIN" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" />
+  <button onclick="doSetup()" id="btn">Generate credentials →</button>
+
+  <div class="result" id="result">
+    <h3>✓ Credentials generated — follow these steps:</h3>
+
+    <p class="instruction"><span class="step-num">1</span> Scan this QR code in Google Authenticator:</p>
+    <div class="qr-wrap"><img id="qr-img" src="" alt="QR Code" width="200" height="200"></div>
+
+    <p class="instruction"><span class="step-num">2</span> Add these two environment variables to your hosting provider:</p>
+    <label>PIN_HASH (copy exactly)</label>
+    <code id="pin-hash-out"></code>
+    <label>TOTP_SECRET (copy exactly)</label>
+    <code id="totp-secret-out"></code>
+
+    <p class="instruction"><span class="step-num">3</span> In your host's dashboard → this service → Environment → add both above, then redeploy/restart.</p>
+    <p class="instruction"><span class="step-num">4</span> Once redeployed, go back to your app's URL and log in.</p>
+    <p style="margin-top:1rem; color: #ff4f4f; font-size:13px;">⚠ This page will no longer be accessible after you set the variables.</p>
+  </div>
+</div>
+
+<script>
+async function doSetup() {
+  const pin = document.getElementById('pin').value;
+  const pin2 = document.getElementById('pin2').value;
+  if (pin !== pin2) { alert('PINs do not match'); return; }
+  if (!/^\d{4,6}$/.test(pin)) { alert('PIN must be 4 to 6 digits'); return; }
+
+  const btn = document.getElementById('btn');
+  btn.disabled = true; btn.textContent = 'Generating...';
+
+  const res = await fetch('/api/setup', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({pin})
+  });
+  const data = await res.json();
+
+  document.getElementById('pin-hash-out').textContent = data.pin_hash;
+  document.getElementById('totp-secret-out').textContent = data.totp_secret;
+
+  // Generate QR code via Google Charts API (no external JS needed)
+  const uri = encodeURIComponent(`otpauth://totp/TD%20Shopify%20Manager:admin?secret=${data.totp_secret}&issuer=TD%20Shopify%20Manager`);
+  document.getElementById('qr-img').src = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${uri}`;
+
+  document.getElementById('result').style.display = 'block';
+  btn.textContent = 'Done — see instructions below';
+}
+</script>
+</body>
+</html>
