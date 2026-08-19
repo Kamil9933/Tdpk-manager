@@ -15,6 +15,16 @@ class PostexClient:
             r.raise_for_status()
             return r.json()
 
+    async def _get_with_body(self, path, data=None):
+        # PostEx's own docs specify a JSON request body on several GET endpoints
+        # (get-all-order, get-unbooked-orders, track-bulk-order) -- non-standard,
+        # but that's what their API expects. httpx.get() has no `json=` kwarg, so
+        # this goes through `.request()` directly to attach a body to a GET.
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.request("GET", f"{POSTEX_BASE}{path}", headers=self.headers, json=data or {})
+            r.raise_for_status()
+            return r.json()
+
     async def _post(self, path, data=None):
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(f"{POSTEX_BASE}{path}", headers=self.headers, json=data or {})
@@ -33,7 +43,7 @@ class PostexClient:
         if not to_date:
             to_date = datetime.now().strftime("%Y-%m-%d")
         try:
-            return await self._get("/v1/get-all-order", {
+            return await self._get_with_body("/v1/get-all-order", {
                 "orderStatusID": status_id,
                 "fromDate": from_date,
                 "toDate": to_date
@@ -49,7 +59,7 @@ class PostexClient:
 
     async def track_bulk(self, tracking_numbers: list):
         try:
-            return await self._post("/v1/track-bulk-order", {"trackingNumber": tracking_numbers})
+            return await self._get_with_body("/v1/track-bulk-order", {"trackingNumber": tracking_numbers})
         except Exception as e:
             return {"error": str(e)}
 
@@ -71,7 +81,7 @@ class PostexClient:
         if not to_date:
             to_date = datetime.now().strftime("%Y-%m-%d")
         try:
-            return await self._get("/v2/get-unbooked-orders", {"startDate": from_date, "endDate": to_date})
+            return await self._get_with_body("/v2/get-unbooked-orders", {"startDate": from_date, "endDate": to_date})
         except Exception as e:
             return {"dist": [], "error": str(e)}
 
@@ -95,14 +105,29 @@ class PostexClient:
                 tr = item.get("trackingResponse", item)
                 orders.append(tr)
 
+        # Exact status strings per PostEx's documented orderStatusID enum (Order Status /
+        # List Orders APIs). Matching on these exactly -- rather than loose substrings like
+        # "deliver" -- matters because "Out For Delivery" and "Out For Return" would
+        # otherwise get miscounted as "Delivered" / "Returned".
+        DELIVERED_STATUSES = {"delivered"}
+        RETURNED_STATUSES = {"returned"}
+        IN_TRANSIT_STATUSES = {
+            "booked", "postex warehouse", "out for delivery", "picked by postex",
+            "en-route to postex warehouse", "out for return",
+        }
+        UNBOOKED_STATUSES = {"unbooked"}
+
+        def _status(o):
+            return str(o.get("transactionStatus", "")).strip().lower()
+
         total = len(orders)
-        delivered = sum(1 for o in orders if "deliver" in str(o.get("transactionStatus","")).lower())
-        returned = sum(1 for o in orders if "return" in str(o.get("transactionStatus","")).lower())
-        in_transit = sum(1 for o in orders if any(k in str(o.get("transactionStatus","")).lower() for k in ["transit","warehouse","picked","route","attempted","delivery"]))
-        unbooked = sum(1 for o in orders if "unbook" in str(o.get("transactionStatus","")).lower())
+        delivered = sum(1 for o in orders if _status(o) in DELIVERED_STATUSES)
+        returned = sum(1 for o in orders if _status(o) in RETURNED_STATUSES)
+        in_transit = sum(1 for o in orders if _status(o) in IN_TRANSIT_STATUSES)
+        unbooked = sum(1 for o in orders if _status(o) in UNBOOKED_STATUSES)
 
         total_cod = sum(float(o.get("invoicePayment", 0) or 0) for o in orders)
-        delivered_cod = sum(float(o.get("invoicePayment", 0) or 0) for o in orders if "deliver" in str(o.get("transactionStatus","")).lower())
+        delivered_cod = sum(float(o.get("invoicePayment", 0) or 0) for o in orders if _status(o) in DELIVERED_STATUSES)
 
         city_counts = {}
         for o in orders:
