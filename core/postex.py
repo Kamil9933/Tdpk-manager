@@ -9,9 +9,10 @@ class PostexClient:
         self.token = token or os.getenv("POSTEX_TOKEN", "")
         self.headers = {"token": self.token, "Content-Type": "application/json"}
 
-    async def _get(self, path, params=None):
+    async def _get(self, path, params=None, extra_headers=None):
+        headers = {**self.headers, **(extra_headers or {})}
         async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(f"{POSTEX_BASE}{path}", headers=self.headers, params=params)
+            r = await client.get(f"{POSTEX_BASE}{path}", headers=headers, params=params)
             r.raise_for_status()
             return r.json()
 
@@ -42,11 +43,17 @@ class PostexClient:
             from_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
         if not to_date:
             to_date = datetime.now().strftime("%Y-%m-%d")
+        # NOTE: the official PDF docs describe this as a GET-with-JSON-body request
+        # using orderStatusID/fromDate/toDate, but that returned a live 400 Bad
+        # Request from PostEx's actual server. A working real-world integration
+        # (github.com/faizan45640/PostEx-MCP-Server) calls this as a plain GET with
+        # orderStatusId/startDate/endDate as query params (also duplicated as
+        # headers, which PostEx's server appears to tolerate/expect) -- switched to
+        # match that confirmed-working shape.
+        params = {"orderStatusId": status_id, "startDate": from_date, "endDate": to_date}
         try:
-            return await self._get_with_body("/v1/get-all-order", {
-                "orderStatusID": status_id,
-                "fromDate": from_date,
-                "toDate": to_date
+            return await self._get("/v1/get-all-order", params=params, extra_headers={
+                "orderStatusId": str(status_id), "startDate": from_date, "endDate": to_date
             })
         except Exception as e:
             return {"dist": [], "error": str(e)}
@@ -91,7 +98,7 @@ class PostexClient:
         if not to_date:
             to_date = datetime.now().strftime("%Y-%m-%d")
         try:
-            return await self._get_with_body("/v2/get-unbooked-orders", {"startDate": from_date, "endDate": to_date})
+            return await self._get("/v2/get-unbooked-orders", params={"startDate": from_date, "endDate": to_date})
         except Exception as e:
             return {"dist": [], "error": str(e)}
 
