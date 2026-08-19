@@ -108,6 +108,11 @@ class PostexClient:
         orders_data = await self.get_all_orders(status_id=0, from_date=from_date, to_date=to_date)
         raw = orders_data.get("dist", [])
 
+        # TEMP DEBUG: log the raw PostEx response shape to Render logs so we can see
+        # exactly what came back (or didn't) when the dashboard shows unexpected data.
+        # Safe to remove once the integration is confirmed working end-to-end.
+        print(f"[postex] raw response keys={list(orders_data.keys())} body_snippet={str(orders_data)[:800]}")
+
         # Extract order objects - API wraps in trackingResponse
         orders = []
         for item in raw:
@@ -160,4 +165,5 @@ class PostexClient:
             "orders": orders[:50],
             "api_status": orders_data.get("statusMessage", ""),
             "api_code": orders_data.get("statusCode", ""),
+            "error": orders_data.get("error", ""),
         }
