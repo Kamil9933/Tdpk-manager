@@ -1,4 +1,5 @@
 import os, json, asyncio, hashlib, csv, io
+from contextlib import asynccontextmanager, AsyncExitStack
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -15,10 +16,7 @@ from core.operations import run_operation
 from core.intelligence import generate_briefing
 from core.postex import PostexClient
 from core.accounting import generate_pnl, straight_line_depreciation, calc_cash_balance, reconcile_postex
-
-app = FastAPI(title="TD Shopify Manager v3")
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+from core.mcp_server import build_mcp_server, MCPAuthMiddleware
 
 shopify = ShopifyClient(
     store=os.getenv("SHOPIFY_STORE", "1gdih3-zv.myshopify.com"),
@@ -27,6 +25,23 @@ shopify = ShopifyClient(
     client_secret=os.getenv("SHOPIFY_CLIENT_SECRET", "")
 )
 postex = PostexClient(token=os.getenv("POSTEX_TOKEN", ""))
+
+# The MCP connector is built here (before the FastAPI app itself) because its
+# ASGI app's own lifespan (mcp_server.session_manager.run()) has to be combined
+# into the main app's lifespan below -- Starlette doesn't automatically run a
+# mounted sub-app's lifespan, only the top-level app's.
+mcp_server = build_mcp_server(shopify, postex, db)
+mcp_asgi_app = mcp_server.streamable_http_app()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(mcp_server.session_manager.run())
+        yield
+
+app = FastAPI(title="TD Shopify Manager v3", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
 
 COST_CONFIG = {
     "avg_filament_per_order": 400,
@@ -853,6 +868,14 @@ async def accounting_export(from_date: str = None, to_date: str = None, session=
         content=buf.getvalue(), media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="tdpk_accounts_{from_date}_to_{to_date}.csv"'}
     )
+
+# ── MCP connector ─────────────────────────────────────────────────────────────
+# Mounted last (and at root "/") so it never shadows any of the specific routes
+# above -- Starlette checks routes in registration order and a Route with an
+# exact path match always wins before this catch-all Mount is even considered.
+# The MCP app's own internal route is "/mcp", so the net effect is a single
+# clean endpoint at /mcp with no other path affected.
+app.mount("/", MCPAuthMiddleware(mcp_asgi_app))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 async def _resolve_scope(scope):

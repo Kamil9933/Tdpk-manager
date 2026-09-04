@@ -4,6 +4,54 @@ from datetime import datetime, timedelta
 
 POSTEX_BASE = "https://api.postex.pk/services/integration/api/order"
 
+# Exact status strings per PostEx's documented orderStatusID enum (Order Status /
+# List Orders APIs). Matching on these exactly -- rather than loose substrings like
+# "deliver" -- matters because "Out For Delivery" and "Out For Return" would
+# otherwise get miscounted as "Delivered" / "Returned".
+#
+# "return"-containing statuses are bucketed as returned UNLESS it's the transient
+# "out for return" (still in transit) -- broadened from a narrow exact-match set
+# after real accounts were seen sending status labels ("Return Booked", "Delivery
+# Returned", "RTO", etc.) that a strict match silently missed, which is exactly why
+# returns showed as 0 despite PostEx's own portal showing real return activity.
+#
+# These live at module level (not nested inside a single function) so every
+# feature that needs to know "was this order returned/delivered/etc." -- the
+# dashboard, the MCP connector's city/customer/value breakdowns -- shares one
+# definition instead of drifting out of sync with each other.
+DELIVERED_STATUSES = {"delivered"}
+IN_TRANSIT_STATUSES = {
+    "booked", "postex warehouse", "out for delivery", "picked by postex",
+    "en-route to postex warehouse", "out for return",
+}
+UNBOOKED_STATUSES = {"unbooked"}
+
+
+def _status(o):
+    return str(o.get("transactionStatus", "")).strip().lower()
+
+
+def _is_returned(status):
+    return "return" in status and status not in IN_TRANSIT_STATUSES
+
+
+def classify_status(o) -> str:
+    """Bucket a raw PostEx order dict into one of: delivered, returned,
+    in_transit, unbooked, unclassified. `unclassified` means PostEx sent a
+    transactionStatus value none of the known buckets recognize -- it should
+    show up in status_breakdown so it's never silently invisible."""
+    s = _status(o)
+    if s in DELIVERED_STATUSES:
+        return "delivered"
+    if _is_returned(s):
+        return "returned"
+    if s in IN_TRANSIT_STATUSES:
+        return "in_transit"
+    if s in UNBOOKED_STATUSES:
+        return "unbooked"
+    return "unclassified"
+
+
 class PostexClient:
     def __init__(self, token: str = None):
         self.token = token or os.getenv("POSTEX_TOKEN", "")
@@ -108,68 +156,71 @@ class PostexClient:
         except Exception as e:
             return {"error": str(e)}
 
-    async def get_dashboard_summary(self, days=30):
-        to_date = datetime.now().strftime("%Y-%m-%d")
-        from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    async def get_orders_classified(self, status_id=0, from_date=None, to_date=None):
+        """Fetch orders for a window and return them as a flat list of raw PostEx
+        order dicts -- every field PostEx actually sent, untouched -- each
+        augmented with `_status_raw` (lowercased transactionStatus) and `_bucket`
+        (delivered/returned/in_transit/unbooked/unclassified).
 
-        orders_data = await self.get_all_orders(status_id=0, from_date=from_date, to_date=to_date)
+        This is the single source of truth get_dashboard_summary and the MCP
+        connector's breakdown tools both build on, specifically so status
+        classification can't drift out of sync between features the way it did
+        before (returns silently showing as 0). Returns (orders, raw_api_response)
+        -- the raw response is included so callers can still see api error/status
+        fields.
+        """
+        if not from_date:
+            from_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        if not to_date:
+            to_date = datetime.now().strftime("%Y-%m-%d")
+
+        orders_data = await self.get_all_orders(status_id=status_id, from_date=from_date, to_date=to_date)
         raw = orders_data.get("dist", [])
 
-        # TEMP DEBUG: log the raw PostEx response shape to Render logs so we can see
-        # exactly what came back (or didn't) when the dashboard shows unexpected data.
-        # Safe to remove once the integration is confirmed working end-to-end.
-        print(f"[postex] raw response keys={list(orders_data.keys())} body_snippet={str(orders_data)[:800]}")
-
-        # Extract order objects - API wraps in trackingResponse
         orders = []
         for item in raw:
             if isinstance(item, dict):
-                tr = item.get("trackingResponse", item)
+                tr = dict(item.get("trackingResponse", item))
+                tr["_status_raw"] = _status(tr)
+                tr["_bucket"] = classify_status(tr)
                 orders.append(tr)
+        return orders, orders_data
 
-        # Exact status strings per PostEx's documented orderStatusID enum (Order Status /
-        # List Orders APIs). Matching on these exactly -- rather than loose substrings like
-        # "deliver" -- matters because "Out For Delivery" and "Out For Return" would
-        # otherwise get miscounted as "Delivered" / "Returned".
-        #
-        # RETURNED_STATUSES is broadened beyond the single "returned" string documented
-        # in the PDF because real PostEx accounts have been seen returning several
-        # different return-related status labels ("Return Booked", "Delivery Returned",
-        # "Returned by Customer", "Return In-Transit", "RTO" etc.) that never matched the
-        # narrow set here -- which is exactly why returns showed as 0 despite PostEx's own
-        # portal showing real return activity. Anything containing "return" is now bucketed
-        # as returned UNLESS it's the transient "out for return" (still in transit).
-        DELIVERED_STATUSES = {"delivered"}
-        IN_TRANSIT_STATUSES = {
-            "booked", "postex warehouse", "out for delivery", "picked by postex",
-            "en-route to postex warehouse", "out for return",
-        }
-        UNBOOKED_STATUSES = {"unbooked"}
+    async def get_dashboard_summary(self, days=30, from_date=None, to_date=None):
+        # Accepts either a `days` shorthand (default) or an explicit from_date/
+        # to_date range -- the explicit range takes priority. Arbitrary ranges
+        # matter for lining PostEx data up against a full year of Shopify data,
+        # not just the 7/30/60-day presets the dashboard UI offers today.
+        if not to_date:
+            to_date = datetime.now().strftime("%Y-%m-%d")
+        if not from_date:
+            from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-        def _status(o):
-            return str(o.get("transactionStatus", "")).strip().lower()
+        orders, orders_data = await self.get_orders_classified(status_id=0, from_date=from_date, to_date=to_date)
 
-        def _is_returned(status):
-            return "return" in status and status not in IN_TRANSIT_STATUSES
+        # TEMP DEBUG: log to Render logs so we can see exactly what came back (or
+        # didn't) when the dashboard shows unexpected data. Safe to remove once
+        # the integration is confirmed working end-to-end across a few windows.
+        print(f"[postex] window={from_date}..{to_date} order_count={len(orders)} api_error={orders_data.get('error','')}")
 
         total = len(orders)
-        delivered = sum(1 for o in orders if _status(o) in DELIVERED_STATUSES)
-        returned = sum(1 for o in orders if _is_returned(_status(o)))
-        in_transit = sum(1 for o in orders if _status(o) in IN_TRANSIT_STATUSES)
-        unbooked = sum(1 for o in orders if _status(o) in UNBOOKED_STATUSES)
+        delivered = sum(1 for o in orders if o["_bucket"] == "delivered")
+        returned = sum(1 for o in orders if o["_bucket"] == "returned")
+        in_transit = sum(1 for o in orders if o["_bucket"] == "in_transit")
+        unbooked = sum(1 for o in orders if o["_bucket"] == "unbooked")
 
         # Full breakdown of every raw status PostEx actually sent back, with counts --
         # so anything not caught by the buckets above (a status we haven't seen/named yet)
         # is still visible on the dashboard instead of silently vanishing.
         status_breakdown = {}
         for o in orders:
-            s = _status(o) or "(blank)"
+            s = o["_status_raw"] or "(blank)"
             status_breakdown[s] = status_breakdown.get(s, 0) + 1
         status_breakdown = dict(sorted(status_breakdown.items(), key=lambda x: x[1], reverse=True))
 
         total_cod = sum(float(o.get("invoicePayment", 0) or 0) for o in orders)
-        delivered_cod = sum(float(o.get("invoicePayment", 0) or 0) for o in orders if _status(o) in DELIVERED_STATUSES)
-        returned_cod = sum(float(o.get("invoicePayment", 0) or 0) for o in orders if _is_returned(_status(o)))
+        delivered_cod = sum(float(o.get("invoicePayment", 0) or 0) for o in orders if o["_bucket"] == "delivered")
+        returned_cod = sum(float(o.get("invoicePayment", 0) or 0) for o in orders if o["_bucket"] == "returned")
 
         city_counts = {}
         for o in orders:
@@ -192,6 +243,8 @@ class PostexClient:
             "top_cities": [{"city": c, "count": n} for c, n in top_cities],
             "status_breakdown": status_breakdown,
             "orders": orders[:50],
+            "from_date": from_date,
+            "to_date": to_date,
             "api_status": orders_data.get("statusMessage", ""),
             "api_code": orders_data.get("statusCode", ""),
             "error": orders_data.get("error", ""),

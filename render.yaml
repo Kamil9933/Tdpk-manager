@@ -25,3 +25,7 @@ services:
         sync: false
       - key: TOTP_SECRET
         sync: false
+      - key: MCP_API_KEY
+        sync: false
+      - key: MCP_ALLOWED_HOSTS
+        sync: false
