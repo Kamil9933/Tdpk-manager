@@ -1038,13 +1038,27 @@ async function loadPostex() {
         <div class="metric-card red"><div class="m-label">Returned</div><div class="m-value">${d.returned||0}</div><div class="m-sub">${d.return_rate||0}% rate</div></div>
         <div class="metric-card blue"><div class="m-label">In transit</div><div class="m-value">${d.in_transit||0}</div></div>
         <div class="metric-card yellow"><div class="m-label">Unbooked</div><div class="m-value">${d.unbooked||0}</div></div>
+        ${(()=>{const unc=(d.total_orders||0)-(d.delivered||0)-(d.returned||0)-(d.in_transit||0)-(d.unbooked||0);return unc>0?`<div class="metric-card yellow"><div class="m-label">Unclassified</div><div class="m-value">${unc}</div><div class="m-sub">See status breakdown below</div></div>`:'';})()}
         <div class="metric-card blue"><div class="m-label">COD value</div><div class="m-value" style="font-size:14px">PKR ${(d.total_cod_value||0).toLocaleString()}</div></div>
         <div class="metric-card green"><div class="m-label">Delivered COD</div><div class="m-value" style="font-size:14px">PKR ${(d.delivered_cod||0).toLocaleString()}</div></div>
         <div class="metric-card red"><div class="m-label">Pending COD</div><div class="m-value" style="font-size:14px">PKR ${(d.pending_cod||0).toLocaleString()}</div><div class="m-sub">To collect</div></div>
+        ${d.returned_cod_value ? `<div class="metric-card red"><div class="m-label">Returned COD value</div><div class="m-value" style="font-size:14px">PKR ${d.returned_cod_value.toLocaleString()}</div></div>` : ''}
       </div>
 
+      ${d.status_breakdown && Object.keys(d.status_breakdown).length ? `<div class="chart-container">
+        <div class="chart-title">Status breakdown (raw, straight from PostEx)</div>
+        ${Object.entries(d.status_breakdown).map(([status,count])=>`
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+            <div style="font-size:12px;min-width:140px;text-transform:capitalize">${status}</div>
+            <div style="flex:1;height:6px;background:var(--surface3);border-radius:4px;overflow:hidden"><div style="height:100%;background:var(--accent);border-radius:4px;width:${Math.round(count/d.total_orders*100)}%"></div></div>
+            <div style="font-size:11px;font-weight:600;min-width:30px;text-align:right">${count}</div>
+          </div>
+        `).join('')}
+        <div style="font-size:10.5px;color:var(--muted);margin-top:6px">Every status PostEx actually returned for this window, unfiltered — if a status here isn't showing up correctly in Delivered/Returned/In transit above, tell me the exact label and I'll fix the classification.</div>
+      </div>` : ''}
+
       ${topCities.length ? `<div class="chart-container">
-        <div class="chart-title">Orders by city</div>
+        <div class="chart-title">Orders by city${topCities.reduce((s,c)=>s+c.count,0)<(d.total_orders||0)?` <span style="font-weight:400;color:var(--muted);font-size:10px">(top ${topCities.length} shown — ${(d.total_orders||0)-topCities.reduce((s,c)=>s+c.count,0)} more in other/unknown cities)</span>`:''}</div>
         ${topCities.map(({city,count})=>`
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
             <div style="font-size:12px;min-width:80px">${city}</div>
@@ -1061,7 +1075,7 @@ async function loadPostex() {
         return `<div class="row-card" style="cursor:default">
           <div style="font-size:11px;color:var(--muted);min-width:130px">${o.trackingNumber||o.orderRefNumber||'—'}</div>
           <div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${o.customerName||'—'}</div><div style="font-size:11px;color:var(--muted)">${o.destinationCity||o.deliveryCity||''}</div></div>
-          <span class="px-status ${statusClass}">${o.orderStatus||o.status||'—'}</span>
+          <span class="px-status ${statusClass}">${o.orderStatus||o.transactionStatus||o.status||'—'}</span>
           <div style="font-weight:600;font-size:12px">PKR ${parseFloat(o.invoicePayment||0).toLocaleString()}</div>
         </div>`;
       }).join('')}

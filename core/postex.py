@@ -131,8 +131,15 @@ class PostexClient:
         # List Orders APIs). Matching on these exactly -- rather than loose substrings like
         # "deliver" -- matters because "Out For Delivery" and "Out For Return" would
         # otherwise get miscounted as "Delivered" / "Returned".
+        #
+        # RETURNED_STATUSES is broadened beyond the single "returned" string documented
+        # in the PDF because real PostEx accounts have been seen returning several
+        # different return-related status labels ("Return Booked", "Delivery Returned",
+        # "Returned by Customer", "Return In-Transit", "RTO" etc.) that never matched the
+        # narrow set here -- which is exactly why returns showed as 0 despite PostEx's own
+        # portal showing real return activity. Anything containing "return" is now bucketed
+        # as returned UNLESS it's the transient "out for return" (still in transit).
         DELIVERED_STATUSES = {"delivered"}
-        RETURNED_STATUSES = {"returned"}
         IN_TRANSIT_STATUSES = {
             "booked", "postex warehouse", "out for delivery", "picked by postex",
             "en-route to postex warehouse", "out for return",
@@ -142,14 +149,27 @@ class PostexClient:
         def _status(o):
             return str(o.get("transactionStatus", "")).strip().lower()
 
+        def _is_returned(status):
+            return "return" in status and status not in IN_TRANSIT_STATUSES
+
         total = len(orders)
         delivered = sum(1 for o in orders if _status(o) in DELIVERED_STATUSES)
-        returned = sum(1 for o in orders if _status(o) in RETURNED_STATUSES)
+        returned = sum(1 for o in orders if _is_returned(_status(o)))
         in_transit = sum(1 for o in orders if _status(o) in IN_TRANSIT_STATUSES)
         unbooked = sum(1 for o in orders if _status(o) in UNBOOKED_STATUSES)
 
+        # Full breakdown of every raw status PostEx actually sent back, with counts --
+        # so anything not caught by the buckets above (a status we haven't seen/named yet)
+        # is still visible on the dashboard instead of silently vanishing.
+        status_breakdown = {}
+        for o in orders:
+            s = _status(o) or "(blank)"
+            status_breakdown[s] = status_breakdown.get(s, 0) + 1
+        status_breakdown = dict(sorted(status_breakdown.items(), key=lambda x: x[1], reverse=True))
+
         total_cod = sum(float(o.get("invoicePayment", 0) or 0) for o in orders)
         delivered_cod = sum(float(o.get("invoicePayment", 0) or 0) for o in orders if _status(o) in DELIVERED_STATUSES)
+        returned_cod = sum(float(o.get("invoicePayment", 0) or 0) for o in orders if _is_returned(_status(o)))
 
         city_counts = {}
         for o in orders:
@@ -167,8 +187,10 @@ class PostexClient:
             "return_rate": round((returned / total * 100) if total else 0, 1),
             "total_cod_value": round(total_cod, 0),
             "delivered_cod": round(delivered_cod, 0),
+            "returned_cod_value": round(returned_cod, 0),
             "pending_cod": round(total_cod - delivered_cod, 0),
             "top_cities": [{"city": c, "count": n} for c, n in top_cities],
+            "status_breakdown": status_breakdown,
             "orders": orders[:50],
             "api_status": orders_data.get("statusMessage", ""),
             "api_code": orders_data.get("statusCode", ""),
