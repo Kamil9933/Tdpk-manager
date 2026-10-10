@@ -301,7 +301,7 @@ textarea.field-input{min-height:80px;resize:vertical}
 .conv-item.active{background:var(--accent-dim);color:#c4bcfa}
 .agent-main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
 .agent-msgs{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:12px}
-.msg-row{display:flex;max-width:78%}
+.msg-row{display:flex;flex-direction:column;max-width:78%}
 .msg-row.user{align-self:flex-end;justify-content:flex-end}
 .msg-row.assistant{align-self:flex-start}
 .msg-bubble{padding:10px 13px;border-radius:var(--r-md);font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
@@ -312,6 +312,27 @@ textarea.field-input{min-height:80px;resize:vertical}
 .agent-input-wrap textarea{flex:1;min-height:40px;max-height:140px;resize:vertical}
 .agent-cost{font-size:10.5px;color:var(--muted);padding:0 18px 8px;flex-shrink:0}
 .agent-typing{font-size:11.5px;color:var(--muted);padding:2px 4px}
+.msg-bubble h3,.msg-bubble h4{font-size:13px;font-weight:700;margin:8px 0 4px}
+.msg-bubble h3:first-child,.msg-bubble h4:first-child{margin-top:0}
+.msg-bubble p{margin:0 0 8px}
+.msg-bubble p:last-child{margin-bottom:0}
+.msg-bubble ul,.msg-bubble ol{margin:4px 0 8px;padding-left:20px}
+.msg-bubble li{margin-bottom:2px}
+.msg-bubble code{background:rgba(255,255,255,0.08);border-radius:4px;padding:1px 5px;font-size:11.5px;font-family:monospace}
+.msg-bubble strong{font-weight:700}
+
+/* Floating manager chat bubble */
+.mgr-fab{position:fixed;bottom:24px;right:24px;width:52px;height:52px;border-radius:50%;background:var(--accent);color:white;border:none;font-size:22px;cursor:pointer;box-shadow:var(--shadow-lg);z-index:280;display:flex;align-items:center;justify-content:center;transition:transform 0.15s var(--ease)}
+.mgr-fab:hover{transform:scale(1.06)}
+.mgr-panel{position:fixed;bottom:88px;right:24px;width:380px;height:520px;max-height:70vh;background:var(--surface);border:1px solid var(--border2);border-radius:var(--r-lg);box-shadow:var(--shadow-lg);z-index:280;display:none;flex-direction:column;overflow:hidden}
+.mgr-panel.open{display:flex}
+.mgr-panel-head{padding:12px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;flex-shrink:0}
+.mgr-panel-head b{font-size:12.5px;flex:1}
+.mgr-panel-msgs{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
+.mgr-panel-msgs .msg-row{max-width:92%}
+.mgr-panel-msgs .msg-bubble{font-size:12.5px;padding:8px 11px}
+.mgr-panel-input{border-top:1px solid var(--border);padding:8px;display:flex;gap:6px;flex-shrink:0}
+.mgr-panel-input textarea{flex:1;min-height:34px;max-height:90px;font-size:12px;padding:7px 9px}
 
 /* Form box */
 .form-box{background:var(--surface2);border:1px solid var(--border2);border-radius:var(--r-md);padding:15px;margin-bottom:14px;box-shadow:var(--shadow-sm)}
@@ -347,6 +368,8 @@ textarea.field-input{min-height:80px;resize:vertical}
     <div class="sb-sec">Overview</div>
     <div class="sbi active" onclick="showView('briefing')" id="nav-briefing"><span class="ic">🌅</span>Briefing</div>
     <div class="sbi" onclick="showView('analytics')" id="nav-analytics"><span class="ic">📊</span>Analytics</div>
+    <div class="sb-sec">Manager</div>
+    <div class="sbi" onclick="showView('agent')" id="nav-agent"><span class="ic">🤖</span>Manager Chat</div>
     <div class="sb-sec">Store</div>
     <div class="sbi" onclick="showView('products')" id="nav-products"><span class="ic">📦</span>Products</div>
     <div class="sbi" onclick="showView('orders')" id="nav-orders"><span class="ic">🛒</span>Orders</div>
@@ -358,7 +381,6 @@ textarea.field-input{min-height:80px;resize:vertical}
     <div class="sbi" onclick="showView('accounts')" id="nav-accounts"><span class="ic">💰</span>Accounts</div>
     <div class="sb-sec">Marketing</div>
     <div class="sbi" onclick="showView('marketing')" id="nav-marketing"><span class="ic">📣</span>Ads &amp; Social</div>
-    <div class="sbi" onclick="showView('agent')" id="nav-agent"><span class="ic">🤖</span>AI Agent</div>
     <div class="sb-sec">Colour Ops</div>
     <div class="sbi" onclick="openOp('remove_color')"><span class="ic">🗑</span>Remove colour</div>
     <div class="sbi" onclick="openOp('add_color')"><span class="ic">➕</span>Add colour</div>
@@ -587,12 +609,12 @@ textarea.field-input{min-height:80px;resize:vertical}
         <div class="agent-convs-list" id="agent-conv-list"></div>
       </div>
       <div class="agent-main">
-        <div class="guard-box" style="margin:14px 18px 0">New ad campaigns always need your explicit "yes" in this chat before anything is created. Existing-ad actions follow your Automation toggles — off means it asks first here too, same as the dashboard.</div>
+        <div class="guard-box" style="margin:14px 18px 0">This is the whole store's manager, not just ads — it can see and act on Shopify, PostEx, accounting, and Meta ads/social. New ad campaigns, bulk catalog changes (colour/price/tags/etc. across many products), and order cancel/refund ALWAYS need your explicit "yes" in this chat first, no exceptions. Existing-ad actions follow your Automation toggles — off means it asks first here too, same as the dashboard.</div>
         <div class="agent-msgs" id="agent-msgs"><div style="text-align:center;padding:3rem;color:var(--muted)">Start a new chat or pick one from the left.</div></div>
         <div class="agent-typing" id="agent-typing" style="display:none;padding:0 18px">Thinking…</div>
         <div class="agent-cost" id="agent-cost"></div>
         <div class="agent-input-wrap">
-          <textarea class="field-input" id="agent-input" placeholder="Ask about your ads, orders, accounting... (Shift+Enter for a new line)" onkeydown="agentKey(event)"></textarea>
+          <textarea class="field-input" id="agent-input" placeholder="Ask about your products, orders, PostEx, accounting, or ads... (Shift+Enter for a new line)" onkeydown="agentKey(event)"></textarea>
           <button class="run-btn" style="flex:0 0 auto;padding:11px 18px" onclick="sendAgentMessage()">Send</button>
         </div>
       </div>
@@ -674,6 +696,17 @@ textarea.field-input{min-height:80px;resize:vertical}
   <div class="notif-head">Notifications <button class="btn sm" onclick="markAllRead()">Mark all read</button></div>
   <div class="notif-list" id="notif-list"></div>
 </div>
+
+<!-- Floating Manager chat bubble -- visible from every view, not just the Manager tab -->
+<div class="mgr-panel" id="mgr-panel">
+  <div class="mgr-panel-head"><b>🤖 TDPK Manager</b><button class="btn sm" onclick="showView('agent');toggleManagerBubble()">Open full view</button><button class="close-btn" onclick="toggleManagerBubble()">×</button></div>
+  <div class="mgr-panel-msgs" id="mgr-msgs"></div>
+  <div class="mgr-panel-input">
+    <textarea class="field-input" id="mgr-input" placeholder="Ask about anything in the store..." onkeydown="mgrKey(event)"></textarea>
+    <button class="btn primary sm" onclick="sendManagerBubbleMessage()">Send</button>
+  </div>
+</div>
+<button class="mgr-fab" onclick="toggleManagerBubble()" title="TDPK Manager">🤖</button>
 
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -2013,11 +2046,37 @@ async function selectAgentConversation(id){
   await loadAgentConversations();
   await loadAgentMessages();
 }
+// Small, dependency-free markdown-ish renderer -- just enough for Claude's
+// typical chat formatting (headers, bold/italic, inline code, lists,
+// paragraphs). Escapes HTML first so nothing in a tool result or user text
+// can inject markup.
+function mdToHtml(text){
+  const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const lines=esc(text).split('\n');
+  let html='', inList=null, para=[];
+  const flushPara=()=>{if(para.length){html+=`<p>${para.join(' ')}</p>`;para=[];}};
+  const closeList=()=>{if(inList){html+=`</${inList}>`;inList=null;}};
+  const inline=s=>s.replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/(?<!\*)\*([^*]+)\*(?!\*)/g,'<em>$1</em>');
+  for(let raw of lines){
+    const line=raw.trim();
+    if(!line){flushPara();closeList();continue;}
+    const h=line.match(/^(#{1,4})\s+(.*)/);
+    if(h){flushPara();closeList();html+=`<h${Math.min(parseInt(h[1].length)+2,4)}>${inline(h[2])}</h${Math.min(parseInt(h[1].length)+2,4)}>`;continue;}
+    const ul=line.match(/^[-*]\s+(.*)/);
+    const ol=line.match(/^\d+\.\s+(.*)/);
+    if(ul){flushPara();if(inList!=='ul'){closeList();html+='<ul>';inList='ul';}html+=`<li>${inline(ul[1])}</li>`;continue;}
+    if(ol){flushPara();if(inList!=='ol'){closeList();html+='<ol>';inList='ol';}html+=`<li>${inline(ol[1])}</li>`;continue;}
+    closeList();
+    para.push(inline(line));
+  }
+  flushPara();closeList();
+  return html||esc(text);
+}
 function agentMsgBlocksToHtml(content,role){
-  if(typeof content==='string')return `<div class="msg-bubble">${content.replace(/</g,'&lt;')}</div>`;
+  if(typeof content==='string')return `<div class="msg-bubble">${mdToHtml(content)}</div>`;
   let html='';
   const texts=(content||[]).filter(b=>b.type==='text').map(b=>b.text).join('\n').trim();
-  if(texts)html+=`<div class="msg-bubble">${texts.replace(/</g,'&lt;')}</div>`;
+  if(texts)html+=`<div class="msg-bubble">${mdToHtml(texts)}</div>`;
   (content||[]).filter(b=>b.type==='tool_use').forEach(b=>{
     html+=`<div class="msg-tool">🔧 ${b.name}(${JSON.stringify(b.input||{})})</div>`;
   });
@@ -2042,6 +2101,29 @@ async function loadAgentMessages(){
   }catch(e){box.innerHTML=`<div style="text-align:center;padding:2rem;color:var(--red)">${e.message}</div>`;}
 }
 function agentKey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendAgentMessage();}}
+// Shared by both the full-page Manager chat and the floating bubble widget --
+// one POST + one render path, so the two surfaces never drift apart.
+function appendUserBubble(box,text){
+  if(box.querySelector('div[style*="text-align:center"]'))box.innerHTML='';
+  box.insertAdjacentHTML('beforeend',`<div class="msg-row user"><div class="msg-bubble">${text.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</div></div>`);
+  box.scrollTop=box.scrollHeight;
+}
+function appendAssistantBubble(box,d,isError){
+  if(isError){
+    box.insertAdjacentHTML('beforeend',`<div class="msg-row assistant"><div class="msg-bubble" style="color:var(--red)">Error: ${(d||'something went wrong').replace(/&/g,'&amp;').replace(/</g,'&lt;')}</div></div>`);
+  }else{
+    let toolHtml='';
+    (d.tool_calls||[]).forEach(t=>{toolHtml+=`<div class="msg-tool">🔧 ${t.name}(${JSON.stringify(t.input||{})})</div>`;});
+    box.insertAdjacentHTML('beforeend',`<div class="msg-row assistant">${toolHtml}<div class="msg-bubble">${mdToHtml(d.text||'(no reply)')}</div></div>`);
+  }
+  box.scrollTop=box.scrollHeight;
+}
+async function postAgentTurn(convId,text){
+  const r=await fetch(`/api/agent/conversations/${convId}/messages`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+  const d=await r.json();
+  return {ok:r.ok,data:d};
+}
+
 async function sendAgentMessage(){
   if(AGENT_SENDING)return;
   const input=document.getElementById('agent-input');
@@ -2050,29 +2132,76 @@ async function sendAgentMessage(){
   if(!AGENT_CONV){await newAgentConversation();}
   input.value='';
   const box=document.getElementById('agent-msgs');
-  if(box.querySelector('div[style*="text-align:center"]'))box.innerHTML='';
-  box.insertAdjacentHTML('beforeend',`<div class="msg-row user"><div class="msg-bubble">${text.replace(/</g,'&lt;')}</div></div>`);
-  box.scrollTop=box.scrollHeight;
+  appendUserBubble(box,text);
   AGENT_SENDING=true;
   document.getElementById('agent-typing').style.display='block';
   try{
-    const r=await fetch(`/api/agent/conversations/${AGENT_CONV}/messages`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
-    const d=await r.json();
-    if(!r.ok){
-      box.insertAdjacentHTML('beforeend',`<div class="msg-row assistant"><div class="msg-bubble" style="color:var(--red)">Error: ${(d.detail||'something went wrong').replace(/</g,'&lt;')}</div></div>`);
-    }else{
-      let toolHtml='';
-      (d.tool_calls||[]).forEach(t=>{toolHtml+=`<div class="msg-tool">🔧 ${t.name}(${JSON.stringify(t.input||{})})</div>`;});
-      box.insertAdjacentHTML('beforeend',`<div class="msg-row assistant">${toolHtml}<div class="msg-bubble">${(d.text||'(no reply)').replace(/</g,'&lt;')}</div></div>`);
-      document.getElementById('agent-cost').textContent=`This turn: ${d.tokens_in}+${d.tokens_out} tokens · ~$${d.est_cost_usd} · (rough estimate, not a billing source of truth)`;
+    const {ok,data}=await postAgentTurn(AGENT_CONV,text);
+    if(!ok){appendAssistantBubble(box,data.detail,true);}
+    else{
+      appendAssistantBubble(box,data,false);
+      document.getElementById('agent-cost').textContent=`This turn: ${data.tokens_in}+${data.tokens_out} tokens · ~$${data.est_cost_usd} · (rough estimate, not a billing source of truth)`;
       loadAgentConversations();
+      syncManagerBubble();
     }
   }catch(e){
-    box.insertAdjacentHTML('beforeend',`<div class="msg-row assistant"><div class="msg-bubble" style="color:var(--red)">${e.message}</div></div>`);
+    appendAssistantBubble(box,e.message,true);
   }
   AGENT_SENDING=false;
   document.getElementById('agent-typing').style.display='none';
-  box.scrollTop=box.scrollHeight;
+}
+
+// ── Floating Manager chat bubble (visible from every view) ──────────────────────
+let MGR_OPEN=false, MGR_SENDING=false;
+function toggleManagerBubble(){
+  MGR_OPEN=!MGR_OPEN;
+  document.getElementById('mgr-panel').classList.toggle('open',MGR_OPEN);
+  if(MGR_OPEN)syncManagerBubble();
+}
+async function syncManagerBubble(){
+  // Mirrors whichever conversation the full Manager tab is on, so the two
+  // surfaces are always showing the same thread rather than forking state.
+  if(!MGR_OPEN)return;
+  const box=document.getElementById('mgr-msgs');
+  if(!AGENT_CONV){
+    const r=await fetch('/api/agent/conversations');
+    const d=await r.json();
+    const convs=d.conversations||[];
+    if(convs.length)AGENT_CONV=convs[0].id;
+  }
+  if(!AGENT_CONV){box.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted);font-size:12px">Send a message to start.</div>';return;}
+  try{
+    const r=await fetch(`/api/agent/conversations/${AGENT_CONV}/messages`);
+    const d=await r.json();
+    const msgs=(d.messages||[]).filter(m=>!(m.role==='user'&&Array.isArray(m.content)&&m.content.length&&m.content[0].type==='tool_result'));
+    box.innerHTML=!msgs.length?'<div style="text-align:center;padding:2rem;color:var(--muted);font-size:12px">Send a message to start.</div>':
+      msgs.map(m=>`<div class="msg-row ${m.role}">${agentMsgBlocksToHtml(m.content,m.role)}</div>`).join('');
+    box.scrollTop=box.scrollHeight;
+  }catch(e){box.innerHTML=`<div style="color:var(--red);font-size:12px;padding:8px">${e.message}</div>`;}
+}
+function mgrKey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendManagerBubbleMessage();}}
+async function sendManagerBubbleMessage(){
+  if(MGR_SENDING)return;
+  const input=document.getElementById('mgr-input');
+  const text=input.value.trim();
+  if(!text)return;
+  if(!AGENT_CONV){
+    const r=await fetch('/api/agent/conversations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+    AGENT_CONV=(await r.json()).id;
+  }
+  input.value='';
+  const box=document.getElementById('mgr-msgs');
+  appendUserBubble(box,text);
+  MGR_SENDING=true;
+  try{
+    const {ok,data}=await postAgentTurn(AGENT_CONV,text);
+    if(!ok){appendAssistantBubble(box,data.detail,true);}
+    else{
+      appendAssistantBubble(box,data,false);
+      if(document.getElementById('view-agent').classList.contains('active'))loadAgentMessages();
+    }
+  }catch(e){appendAssistantBubble(box,e.message,true);}
+  MGR_SENDING=false;
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────
@@ -2198,7 +2327,7 @@ const CMDS=[
   {ic:'💰',l:'Accounts',s:'View',a:()=>showView('accounts')},
   {ic:'⚙️',l:'Automation',s:'View',a:()=>showView('automation')},
   {ic:'📣',l:'Ads & Social',s:'View',a:()=>showView('marketing')},
-  {ic:'🤖',l:'AI Agent',s:'View',a:()=>showView('agent')},
+  {ic:'🤖',l:'Manager Chat',s:'View',a:()=>showView('agent')},
   {ic:'🕒',l:'History',s:'View',a:()=>showView('history')},
   ...Object.entries(OPS).map(([op,cfg])=>({ic:'⚡',l:cfg.t,s:'Operation',a:()=>openOp(op)})),
 ];
@@ -2214,7 +2343,7 @@ function showView(v){
   document.querySelectorAll('.sbi').forEach(el=>el.classList.remove('active'));
   document.getElementById(`view-${v}`)?.classList.add('active');
   document.getElementById(`nav-${v}`)?.classList.add('active');
-  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',automation:'Automation',history:'Operation History',accounts:'Accounts',marketing:'Ads & Social',agent:'AI Agent'};
+  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',automation:'Automation',history:'Operation History',accounts:'Accounts',marketing:'Ads & Social',agent:'Manager Chat'};
   document.getElementById('view-title').textContent=titles[v]||v;
   if(v==='orders')loadOrders();
   if(v==='analytics')loadAnalytics();

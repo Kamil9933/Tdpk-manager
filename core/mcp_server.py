@@ -40,7 +40,7 @@ Design choices worth knowing about:
 
 import os
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -48,6 +48,7 @@ from starlette.responses import JSONResponse
 
 from core.accounting import generate_pnl, straight_line_depreciation, calc_cash_balance, reconcile_postex
 from core.meta import MetaError
+from core.operations import run_operation
 
 
 class MCPAuthMiddleware:
@@ -90,11 +91,15 @@ def _default_range(from_date, to_date, days=30):
     return from_date, to_date
 
 
-def build_mcp_server(shopify, postex, db, meta) -> FastMCP:
+def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
     """Construct the FastMCP server and register every tool. Takes the already-
     constructed shopify/postex clients and the db singleton so tools share the
     exact same clients (and therefore the exact same auth/token handling) the
-    rest of the app uses -- no separate credentials to configure."""
+    rest of the app uses -- no separate credentials to configure. `resolve_scope`
+    is main.py's own scope-resolution function (ids/collection/tag/status/
+    price_range -> product list), reused as-is by the bulk catalog-operation
+    tool so there's exactly one implementation of "which products does this
+    apply to", shared with the dashboard's own Operations panel."""
 
     # FastMCP's DNS-rebinding protection only allows localhost/127.0.0.1 Host
     # headers by default -- which would reject every real request once this is
@@ -270,6 +275,126 @@ def build_mcp_server(shopify, postex, db, meta) -> FastMCP:
         """Update a single Shopify product variant's price. WRITE action."""
         result = await shopify.update_variant(product_id, variant_id, {"price": price})
         return {"ok": True, "variant": result}
+
+    @mcp.tool()
+    async def run_bulk_catalog_operation(
+        operation: str, scope_type: str = "all", scope_value: Optional[Any] = None,
+        params: Optional[dict] = None, confirm: bool = False,
+    ) -> dict:
+        """Run a bulk catalog operation across a set of products -- the exact
+        same engine as the dashboard's Operations panel (colour ops, pricing
+        ops, inventory/tax toggles, tags, publish state, vendor/type/weight).
+
+        operation is one of: remove_color, add_color, rename_color,
+        price_percentage, price_fixed, price_compare_at, price_remove_sale,
+        set_stock, inventory_tracking, continue_selling, disable_tax,
+        enable_tax, add_tag, remove_tag, publish, unpublish, set_vendor,
+        set_product_type, set_weight.
+
+        scope_type picks which products are affected: "all" (every product in
+        the store -- use with real care), "ids" (scope_value = a list of
+        product ids), "collection" (scope_value = a collection id), "tag"
+        (scope_value = a tag string), "status" (scope_value = "active" or
+        "draft"), or "price_range" (scope_value = {"min":.., "max":..}).
+
+        params holds the operation's own arguments -- the same field names the
+        dashboard's operation panel uses, e.g. {"color": "Red"} for
+        remove_color, {"percentage": 10} for price_percentage (10 = +10%),
+        {"tag": "clearance"} for add_tag.
+
+        GUARDRAIL: ALWAYS requires confirm=true, with no automation toggle able
+        to skip it, no matter how many products are affected -- a bulk change
+        can touch hundreds of products at once. Call once without confirm to
+        see exactly how many products match and a 5-item sample, show that to
+        the human verbatim, and only call again with confirm=true after their
+        explicit approval of that exact preview. Every confirmed run is logged
+        and snapshotted, so it can be rolled back from the dashboard's History
+        tab within 30 days if something goes wrong."""
+        scope = {"type": scope_type, "value": scope_value}
+        products = await resolve_scope(scope)
+        if not confirm:
+            return {
+                "preview": True, "action": f"Bulk operation: {operation}",
+                "product_count": len(products),
+                "sample": [{"id": p["id"], "title": p["title"]} for p in products[:5]],
+                "params": params or {},
+                "warning": "This will affect ALL products in the store" if scope_type == "all" else None,
+                "note": "Nothing was changed. Call again with confirm=true to proceed.",
+            }
+        if not products:
+            return {"ok": False, "message": "No products matched this scope"}
+        log_id = await db.create_operation_log(operation, scope, params or {}, len(products))
+        await db.save_snapshot(log_id, products)
+        result = await run_operation(operation, products, params or {}, shopify)
+        await db.complete_operation_log(log_id, result)
+        return {"ok": True, "log_id": str(log_id), "product_count": len(products), "result": result}
+
+    @mcp.tool()
+    async def cancel_order(order_id: int, reason: str = "customer", restock: bool = True, confirm: bool = False) -> dict:
+        """Cancel a Shopify order. reason is one of: customer, inventory,
+        fraud, declined, other. restock=true returns the cancelled line items
+        to inventory. This does not touch PostEx -- if the order is already
+        booked with the courier, cancel it there separately too.
+
+        GUARDRAIL: ALWAYS requires confirm=true, no automation toggle can skip
+        this -- cancelling an order is a real, visible change for the
+        customer. Preview first, get explicit human approval in chat, then
+        confirm."""
+        if reason not in ("customer", "inventory", "fraud", "declined", "other"):
+            return {"error": "reason must be one of: customer, inventory, fraud, declined, other"}
+        if not confirm:
+            order = (await shopify._get(f"/orders/{order_id}.json")).get("order", {})
+            customer = order.get("customer") or {}
+            return {
+                "preview": True, "action": "Cancel order",
+                "details": {
+                    "order_id": order_id, "order_number": order.get("name"), "total": order.get("total_price"),
+                    "customer": f"{customer.get('first_name','')} {customer.get('last_name','')}".strip(),
+                    "reason": reason, "restock": restock,
+                },
+                "note": "Nothing was changed. Call again with confirm=true to proceed.",
+            }
+        result = await shopify._post(f"/orders/{order_id}/cancel.json", {"reason": reason, "restock": restock, "email": False})
+        return {"ok": True, "result": result}
+
+    @mcp.tool()
+    async def refund_order(order_id: int, line_item_ids: Optional[list] = None, restock: bool = True, note: str = "", confirm: bool = False) -> dict:
+        """Process a return/refund record on a Shopify order -- restocks the
+        given line items (or all of them if line_item_ids is omitted) and
+        creates a refund record on the order.
+
+        IMPORTANT: this store takes cash-on-delivery via PostEx, so Shopify
+        never actually captured a payment -- this tool does NOT move any money
+        automatically, it only records the return and restocks inventory. If
+        the customer is owed cash back, log that separately with
+        add_cash_transaction.
+
+        GUARDRAIL: ALWAYS requires confirm=true, no automation toggle can skip
+        this. Preview first, get explicit human approval in chat, then
+        confirm."""
+        order = (await shopify._get(f"/orders/{order_id}.json")).get("order", {})
+        items = order.get("line_items", [])
+        if line_item_ids:
+            items = [li for li in items if li["id"] in line_item_ids]
+        refund_line_items = [
+            {"line_item_id": li["id"], "quantity": li["quantity"], "restock_type": "return" if restock else "no_restock"}
+            for li in items
+        ]
+        if not confirm:
+            return {
+                "preview": True, "action": "Refund / return order (no money moved -- this is a COD store)",
+                "details": {
+                    "order_id": order_id, "order_number": order.get("name"),
+                    "items": [{"title": li.get("title"), "quantity": li.get("quantity")} for li in items],
+                    "restock": restock, "note": note,
+                },
+                "note": "Nothing was changed. Call again with confirm=true to proceed.",
+            }
+        if not items:
+            return {"ok": False, "message": "No matching line items found on this order"}
+        payload = {"refund": {"notify": False, "note": note, "refund_line_items": refund_line_items, "shipping": {"full_refund": False}}}
+        result = await shopify._post(f"/orders/{order_id}/refunds.json", payload)
+        return {"ok": True, "result": result}
 
     # ── PostEx ───────────────────────────────────────────────────────────────
     @mcp.tool()

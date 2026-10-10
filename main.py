@@ -33,7 +33,11 @@ meta = MetaClient()
 # ASGI app's own lifespan (mcp_server.session_manager.run()) has to be combined
 # into the main app's lifespan below -- Starlette doesn't automatically run a
 # mounted sub-app's lifespan, only the top-level app's.
-mcp_server = build_mcp_server(shopify, postex, db, meta)
+# resolve_scope is passed as a lazy lookup (not the function object directly)
+# because _resolve_scope itself is defined further down in this file, after
+# this line runs -- the lambda only resolves the name when actually called,
+# by which point the whole module has finished loading.
+mcp_server = build_mcp_server(shopify, postex, db, meta, resolve_scope=lambda scope: _resolve_scope(scope))
 mcp_asgi_app = mcp_server.streamable_http_app()
 
 @asynccontextmanager
