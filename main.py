@@ -18,6 +18,7 @@ from core.postex import PostexClient
 from core.accounting import generate_pnl, straight_line_depreciation, calc_cash_balance, reconcile_postex
 from core.meta import MetaClient, MetaError
 from core.mcp_server import build_mcp_server, MCPAuthMiddleware
+from core.agent import run_agent_turn
 
 shopify = ShopifyClient(
     store=os.getenv("SHOPIFY_STORE", "1gdih3-zv.myshopify.com"),
@@ -479,6 +480,58 @@ async def meta_ig_publish_reel(request: Request, session=Depends(verify_session)
     except MetaError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+# ── New ad campaigns (Phase 2) ───────────────────────────────────────────────
+@app.post("/api/meta/campaigns/create")
+async def meta_create_campaign(request: Request, session=Depends(verify_session)):
+    """Build a brand-new Campaign -> Ad Set -> Creative -> Ad chain. This NEVER
+    skips the confirm gate -- there is deliberately no automation toggle for
+    new-ad creation, unlike the Phase 1 actions below."""
+    data = await request.json()
+    confirm = bool(data.get("confirm"))
+    name = (data.get("name") or "").strip()
+    objective = data.get("objective")
+    daily_budget = data.get("daily_budget")
+    countries = data.get("countries") or ["PK"]
+    message = data.get("message") or ""
+    link = (data.get("link") or "").strip()
+    image_url = data.get("image_url") or None
+    cta = data.get("cta") or "SHOP_NOW"
+    age_min = int(data.get("age_min") or 18)
+    age_max = int(data.get("age_max") or 65)
+    genders = data.get("genders") or None
+    launch_active = bool(data.get("launch_active"))
+
+    if not name or not objective or not daily_budget or not message or not link:
+        raise HTTPException(status_code=400, detail="name, objective, daily_budget, message and link are all required")
+    try:
+        daily_budget_minor = int(round(float(daily_budget) * 100))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="daily_budget must be a number (PKR)")
+    if daily_budget_minor <= 0:
+        raise HTTPException(status_code=400, detail="daily_budget must be greater than 0")
+
+    if not confirm:
+        return _meta_preview("Create new ad campaign", {
+            "campaign_name": name, "objective": objective,
+            "daily_budget_pkr": daily_budget, "countries": countries,
+            "age_range": f"{age_min}-{age_max}", "genders": genders or "all",
+            "ad_message": message, "link": link,
+            "image_url": image_url or "(none -- text/link ad using the page's own preview)",
+            "call_to_action": cta,
+            "launch_status": "ACTIVE immediately -- will start spending as soon as you confirm" if launch_active
+                              else "Created PAUSED -- you turn it on from the Ads tab when you're ready",
+        })
+    try:
+        result = await meta.create_full_campaign(
+            name, objective, daily_budget_minor, countries, message, link,
+            image_url=image_url, cta=cta, age_min=age_min, age_max=age_max,
+            genders=genders, launch_active=launch_active,
+        )
+        await db.add_notification("meta", f"New campaign created: {name} ({result['status']})")
+        return {"ok": True, "result": result}
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 # ── Automation autonomy toggles ──────────────────────────────────────────────
 @app.get("/api/settings/automation")
 async def get_automation_settings(session=Depends(verify_session)):
@@ -491,6 +544,41 @@ async def update_automation_setting(key: str, request: Request, session=Depends(
         return await db.set_automation_setting(key, enabled=data.get("enabled"), config=data.get("config"))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+# ── In-app Claude agent (Phase 3) ────────────────────────────────────────────
+# Reuses the exact same tool implementations as the MCP connector (see
+# core/agent.py's module docstring) -- one set of functions, three ways in
+# (dashboard buttons, MCP connector, this chat).
+@app.get("/api/agent/conversations")
+async def agent_list_conversations(session=Depends(verify_session)):
+    return {"conversations": await db.list_agent_conversations()}
+
+@app.post("/api/agent/conversations")
+async def agent_new_conversation(request: Request, session=Depends(verify_session)):
+    data = await request.json() if await request.body() else {}
+    return await db.create_agent_conversation(title=data.get("title"))
+
+@app.delete("/api/agent/conversations/{conversation_id}")
+async def agent_delete_conversation(conversation_id: str, session=Depends(verify_session)):
+    await db.delete_agent_conversation(conversation_id)
+    return {"ok": True}
+
+@app.get("/api/agent/conversations/{conversation_id}/messages")
+async def agent_get_messages(conversation_id: str, session=Depends(verify_session)):
+    return {"messages": await db.list_agent_messages(conversation_id)}
+
+@app.post("/api/agent/conversations/{conversation_id}/messages")
+async def agent_send_message(conversation_id: str, request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    text = (data.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Message text is required")
+    try:
+        return await run_agent_turn(mcp_server, db, conversation_id, text)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent error: {e}")
 
 # ── Operations ────────────────────────────────────────────────────────────────
 @app.post("/api/operations/preview")

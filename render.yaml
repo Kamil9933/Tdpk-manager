@@ -41,3 +41,7 @@ services:
         sync: false
       - key: META_BUSINESS_ID
         sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: AGENT_MODEL
+        sync: false

@@ -291,6 +291,28 @@ textarea.field-input{min-height:80px;resize:vertical}
 .media-item:hover{border-color:var(--accent-b)}
 .guard-box{background:var(--yellow-d);border:1px solid rgba(242,172,46,0.3);border-radius:var(--r-sm);padding:9px 12px;font-size:11px;color:var(--yellow);margin-bottom:12px}
 
+/* Agent chat */
+.agent-layout{display:flex;flex:1;overflow:hidden}
+.agent-convs{width:220px;min-width:220px;border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.agent-convs-head{padding:12px;border-bottom:1px solid var(--border);flex-shrink:0}
+.agent-convs-list{flex:1;overflow-y:auto;padding:6px}
+.conv-item{padding:9px 10px;border-radius:var(--r-sm);cursor:pointer;font-size:12px;margin-bottom:3px;color:var(--muted);transition:all 0.15s var(--ease);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.conv-item:hover{background:rgba(255,255,255,0.045);color:var(--text)}
+.conv-item.active{background:var(--accent-dim);color:#c4bcfa}
+.agent-main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
+.agent-msgs{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:12px}
+.msg-row{display:flex;max-width:78%}
+.msg-row.user{align-self:flex-end;justify-content:flex-end}
+.msg-row.assistant{align-self:flex-start}
+.msg-bubble{padding:10px 13px;border-radius:var(--r-md);font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.msg-row.user .msg-bubble{background:var(--accent);color:white;border-bottom-right-radius:3px}
+.msg-row.assistant .msg-bubble{background:var(--surface2);border:1px solid var(--border);border-bottom-left-radius:3px}
+.msg-tool{font-size:10.5px;color:var(--muted);background:var(--surface3);border-radius:var(--r-sm);padding:5px 9px;margin-top:6px;font-family:monospace}
+.agent-input-wrap{border-top:1px solid var(--border);padding:12px 18px;flex-shrink:0;display:flex;gap:8px;align-items:flex-end}
+.agent-input-wrap textarea{flex:1;min-height:40px;max-height:140px;resize:vertical}
+.agent-cost{font-size:10.5px;color:var(--muted);padding:0 18px 8px;flex-shrink:0}
+.agent-typing{font-size:11.5px;color:var(--muted);padding:2px 4px}
+
 /* Form box */
 .form-box{background:var(--surface2);border:1px solid var(--border2);border-radius:var(--r-md);padding:15px;margin-bottom:14px;box-shadow:var(--shadow-sm)}
 .form-box h4{font-size:13px;font-weight:700;margin-bottom:12px}
@@ -336,6 +358,7 @@ textarea.field-input{min-height:80px;resize:vertical}
     <div class="sbi" onclick="showView('accounts')" id="nav-accounts"><span class="ic">💰</span>Accounts</div>
     <div class="sb-sec">Marketing</div>
     <div class="sbi" onclick="showView('marketing')" id="nav-marketing"><span class="ic">📣</span>Ads &amp; Social</div>
+    <div class="sbi" onclick="showView('agent')" id="nav-agent"><span class="ic">🤖</span>AI Agent</div>
     <div class="sb-sec">Colour Ops</div>
     <div class="sbi" onclick="openOp('remove_color')"><span class="ic">🗑</span>Remove colour</div>
     <div class="sbi" onclick="openOp('add_color')"><span class="ic">➕</span>Add colour</div>
@@ -553,6 +576,26 @@ textarea.field-input{min-height:80px;resize:vertical}
         <button class="btn sm" data-tab="automation" onclick="showMktTab('automation')">Automation</button>
       </div>
       <div id="mkt-content"></div>
+    </div>
+  </div>
+
+  <!-- AI AGENT -->
+  <div class="view" id="view-agent">
+    <div class="agent-layout">
+      <div class="agent-convs">
+        <div class="agent-convs-head"><button class="btn primary" style="width:100%" onclick="newAgentConversation()">+ New chat</button></div>
+        <div class="agent-convs-list" id="agent-conv-list"></div>
+      </div>
+      <div class="agent-main">
+        <div class="guard-box" style="margin:14px 18px 0">New ad campaigns always need your explicit "yes" in this chat before anything is created. Existing-ad actions follow your Automation toggles — off means it asks first here too, same as the dashboard.</div>
+        <div class="agent-msgs" id="agent-msgs"><div style="text-align:center;padding:3rem;color:var(--muted)">Start a new chat or pick one from the left.</div></div>
+        <div class="agent-typing" id="agent-typing" style="display:none;padding:0 18px">Thinking…</div>
+        <div class="agent-cost" id="agent-cost"></div>
+        <div class="agent-input-wrap">
+          <textarea class="field-input" id="agent-input" placeholder="Ask about your ads, orders, accounting... (Shift+Enter for a new line)" onkeydown="agentKey(event)"></textarea>
+          <button class="run-btn" style="flex:0 0 auto;padding:11px 18px" onclick="sendAgentMessage()">Send</button>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -1678,6 +1721,44 @@ async function loadMktAds(){
     const campaigns=d.data||[];
     c.innerHTML=`
       <div class="guard-box">Pausing/resuming and budget changes take effect immediately on live ad delivery and spend — you'll always see a confirmation of exactly what's about to change first.</div>
+      <div class="form-box">
+        <h4 style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="document.getElementById('new-camp-body').classList.toggle('active')">
+          <span>➕ New ad campaign</span><span class="btn sm">Expand ▾</span>
+        </h4>
+        <div class="ptab-content" id="new-camp-body" style="margin-top:12px">
+          <div class="guard-box">This always creates the campaign <b>PAUSED</b> by default and always shows you a full preview before anything is created — new campaigns never skip approval, no matter what the automation toggles say.</div>
+          <div class="form-row">
+            <div class="op-field"><label>Campaign name</label><input type="text" id="nc-name" placeholder="e.g. Eid Sale — Keychains"></div>
+            <div class="op-field"><label>Objective</label><select id="nc-objective">
+              <option value="OUTCOME_TRAFFIC">Traffic (clicks to site)</option>
+              <option value="OUTCOME_ENGAGEMENT">Engagement</option>
+              <option value="OUTCOME_SALES" selected>Sales / Conversions</option>
+              <option value="OUTCOME_AWARENESS">Awareness (reach)</option>
+              <option value="OUTCOME_LEADS">Leads</option>
+            </select></div>
+          </div>
+          <div class="form-row">
+            <div class="op-field"><label>Daily budget (PKR)</label><input type="number" id="nc-budget" placeholder="e.g. 1000"></div>
+            <div class="op-field"><label>Country</label><input type="text" id="nc-country" value="PK" placeholder="2-letter code, e.g. PK"></div>
+          </div>
+          <div class="form-row">
+            <div class="op-field"><label>Age range</label>
+              <div style="display:flex;gap:6px"><input type="number" id="nc-agemin" value="18" style="width:80px"><span style="align-self:center;color:var(--muted)">to</span><input type="number" id="nc-agemax" value="65" style="width:80px"></div>
+            </div>
+            <div class="op-field"><label>Gender</label><select id="nc-gender"><option value="">All</option><option value="1">Male</option><option value="2">Female</option></select></div>
+          </div>
+          <div class="op-field"><label>Ad text (primary message)</label><textarea class="field-input" id="nc-message" placeholder="What the ad says"></textarea></div>
+          <div class="form-row">
+            <div class="op-field"><label>Destination link</label><input type="text" id="nc-link" placeholder="https://thirddimension.pk/products/..."></div>
+            <div class="op-field"><label>Image URL (optional, public)</label><input type="text" id="nc-image" placeholder="https://..."></div>
+          </div>
+          <div class="form-row">
+            <div class="op-field"><label>Call to action</label><select id="nc-cta"><option value="SHOP_NOW">Shop now</option><option value="LEARN_MORE">Learn more</option><option value="SIGN_UP">Sign up</option><option value="CONTACT_US">Contact us</option></select></div>
+            <div class="op-field"><label>On approval</label><select id="nc-launch"><option value="paused" selected>Create paused (I'll turn it on)</option><option value="active">Launch live immediately</option></select></div>
+          </div>
+          <button class="btn primary" onclick="mktCreateCampaign()">Review &amp; create campaign</button>
+        </div>
+      </div>
       <div class="filters" style="padding:0 0 10px;border:none">
         <select id="mkt-preset" onchange="loadMktInsights()"><option value="today">Today</option><option value="yesterday" selected>Yesterday</option><option value="last_7d">Last 7 days</option><option value="last_30d">Last 30 days</option></select>
         <button class="btn" onclick="loadMktInsights()">📊 Load insights</button>
@@ -1729,6 +1810,24 @@ async function mktSetBudget(adsetId){
   if(!v){alert('Enter a new daily budget in PKR');return;}
   const amountMinor=Math.round(parseFloat(v)*100);
   await mktConfirmPost('/api/meta/ads/budget',{adset_id:adsetId,amount_minor:amountMinor},'Budget updated',loadMktAds);
+}
+async function mktCreateCampaign(){
+  const name=document.getElementById('nc-name').value.trim();
+  const budget=document.getElementById('nc-budget').value;
+  const message=document.getElementById('nc-message').value.trim();
+  const link=document.getElementById('nc-link').value.trim();
+  if(!name||!budget||!message||!link){alert('Campaign name, daily budget, ad text and destination link are all required');return;}
+  const gender=document.getElementById('nc-gender').value;
+  const body={
+    name, objective:document.getElementById('nc-objective').value,
+    daily_budget:parseFloat(budget), countries:[document.getElementById('nc-country').value.trim().toUpperCase()||'PK'],
+    age_min:parseInt(document.getElementById('nc-agemin').value)||18, age_max:parseInt(document.getElementById('nc-agemax').value)||65,
+    genders: gender?[parseInt(gender)]:null,
+    message, link, image_url:document.getElementById('nc-image').value.trim()||null,
+    cta:document.getElementById('nc-cta').value,
+    launch_active: document.getElementById('nc-launch').value==='active',
+  };
+  await mktConfirmPost('/api/meta/campaigns/create', body, 'Campaign created', loadMktAds);
 }
 async function loadMktInsights(){
   const box=document.getElementById('mkt-insights');
@@ -1887,6 +1986,95 @@ async function mktSetCeiling(value){
   await fetch('/api/settings/automation/ads_budget_change',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:{ceiling_minor}})});
 }
 
+// ── AI Agent (Phase 3) ────────────────────────────────────────────────────────
+let AGENT_CONV=null, AGENT_SENDING=false;
+async function loadAgentConversations(){
+  const list=document.getElementById('agent-conv-list');
+  try{
+    const r=await fetch('/api/agent/conversations');
+    const d=await r.json();
+    const convs=d.conversations||[];
+    list.innerHTML=!convs.length?'<div style="color:var(--muted);font-size:11px;padding:8px">No conversations yet — start one above.</div>':convs.map(c=>`
+      <div class="conv-item ${c.id===AGENT_CONV?'active':''}" onclick="selectAgentConversation('${c.id}')">${(c.title||'New conversation').replace(/</g,'&lt;')}</div>`).join('');
+    if(!AGENT_CONV && convs.length)selectAgentConversation(convs[0].id);
+  }catch(e){list.innerHTML=`<div style="color:var(--red);font-size:11px;padding:8px">${e.message}</div>`;}
+}
+async function newAgentConversation(){
+  const r=await fetch('/api/agent/conversations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+  const conv=await r.json();
+  AGENT_CONV=conv.id;
+  await loadAgentConversations();
+  document.getElementById('agent-msgs').innerHTML='<div style="text-align:center;padding:3rem;color:var(--muted)">New chat — ask about your ads, orders, PostEx, or accounting.</div>';
+  document.getElementById('agent-cost').textContent='';
+}
+async function selectAgentConversation(id){
+  AGENT_CONV=id;
+  document.querySelectorAll('.conv-item').forEach(el=>el.classList.remove('active'));
+  await loadAgentConversations();
+  await loadAgentMessages();
+}
+function agentMsgBlocksToHtml(content,role){
+  if(typeof content==='string')return `<div class="msg-bubble">${content.replace(/</g,'&lt;')}</div>`;
+  let html='';
+  const texts=(content||[]).filter(b=>b.type==='text').map(b=>b.text).join('\n').trim();
+  if(texts)html+=`<div class="msg-bubble">${texts.replace(/</g,'&lt;')}</div>`;
+  (content||[]).filter(b=>b.type==='tool_use').forEach(b=>{
+    html+=`<div class="msg-tool">🔧 ${b.name}(${JSON.stringify(b.input||{})})</div>`;
+  });
+  return html;
+}
+async function loadAgentMessages(){
+  const box=document.getElementById('agent-msgs');
+  if(!AGENT_CONV){box.innerHTML='<div style="text-align:center;padding:3rem;color:var(--muted)">Start a new chat or pick one from the left.</div>';return;}
+  box.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Loading…</div>';
+  try{
+    const r=await fetch(`/api/agent/conversations/${AGENT_CONV}/messages`);
+    const d=await r.json();
+    const msgs=(d.messages||[]).filter(m=>{
+      // Hide pure tool_result turns (role=user but content is tool_result blocks) from the
+      // transcript view -- they're already represented by the 🔧 tool-call line above them.
+      if(m.role==='user' && Array.isArray(m.content) && m.content.length && m.content[0].type==='tool_result')return false;
+      return true;
+    });
+    box.innerHTML=!msgs.length?'<div style="text-align:center;padding:3rem;color:var(--muted)">New chat — ask about your ads, orders, PostEx, or accounting.</div>':
+      msgs.map(m=>`<div class="msg-row ${m.role}">${agentMsgBlocksToHtml(m.content,m.role)}</div>`).join('');
+    box.scrollTop=box.scrollHeight;
+  }catch(e){box.innerHTML=`<div style="text-align:center;padding:2rem;color:var(--red)">${e.message}</div>`;}
+}
+function agentKey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendAgentMessage();}}
+async function sendAgentMessage(){
+  if(AGENT_SENDING)return;
+  const input=document.getElementById('agent-input');
+  const text=input.value.trim();
+  if(!text)return;
+  if(!AGENT_CONV){await newAgentConversation();}
+  input.value='';
+  const box=document.getElementById('agent-msgs');
+  if(box.querySelector('div[style*="text-align:center"]'))box.innerHTML='';
+  box.insertAdjacentHTML('beforeend',`<div class="msg-row user"><div class="msg-bubble">${text.replace(/</g,'&lt;')}</div></div>`);
+  box.scrollTop=box.scrollHeight;
+  AGENT_SENDING=true;
+  document.getElementById('agent-typing').style.display='block';
+  try{
+    const r=await fetch(`/api/agent/conversations/${AGENT_CONV}/messages`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+    const d=await r.json();
+    if(!r.ok){
+      box.insertAdjacentHTML('beforeend',`<div class="msg-row assistant"><div class="msg-bubble" style="color:var(--red)">Error: ${(d.detail||'something went wrong').replace(/</g,'&lt;')}</div></div>`);
+    }else{
+      let toolHtml='';
+      (d.tool_calls||[]).forEach(t=>{toolHtml+=`<div class="msg-tool">🔧 ${t.name}(${JSON.stringify(t.input||{})})</div>`;});
+      box.insertAdjacentHTML('beforeend',`<div class="msg-row assistant">${toolHtml}<div class="msg-bubble">${(d.text||'(no reply)').replace(/</g,'&lt;')}</div></div>`);
+      document.getElementById('agent-cost').textContent=`This turn: ${d.tokens_in}+${d.tokens_out} tokens · ~$${d.est_cost_usd} · (rough estimate, not a billing source of truth)`;
+      loadAgentConversations();
+    }
+  }catch(e){
+    box.insertAdjacentHTML('beforeend',`<div class="msg-row assistant"><div class="msg-bubble" style="color:var(--red)">${e.message}</div></div>`);
+  }
+  AGENT_SENDING=false;
+  document.getElementById('agent-typing').style.display='none';
+  box.scrollTop=box.scrollHeight;
+}
+
 // ── Notifications ─────────────────────────────────────────────────────────────
 async function loadNotifications(){
   try{
@@ -2010,6 +2198,7 @@ const CMDS=[
   {ic:'💰',l:'Accounts',s:'View',a:()=>showView('accounts')},
   {ic:'⚙️',l:'Automation',s:'View',a:()=>showView('automation')},
   {ic:'📣',l:'Ads & Social',s:'View',a:()=>showView('marketing')},
+  {ic:'🤖',l:'AI Agent',s:'View',a:()=>showView('agent')},
   {ic:'🕒',l:'History',s:'View',a:()=>showView('history')},
   ...Object.entries(OPS).map(([op,cfg])=>({ic:'⚡',l:cfg.t,s:'Operation',a:()=>openOp(op)})),
 ];
@@ -2025,7 +2214,7 @@ function showView(v){
   document.querySelectorAll('.sbi').forEach(el=>el.classList.remove('active'));
   document.getElementById(`view-${v}`)?.classList.add('active');
   document.getElementById(`nav-${v}`)?.classList.add('active');
-  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',automation:'Automation',history:'Operation History',accounts:'Accounts',marketing:'Ads & Social'};
+  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',automation:'Automation',history:'Operation History',accounts:'Accounts',marketing:'Ads & Social',agent:'AI Agent'};
   document.getElementById('view-title').textContent=titles[v]||v;
   if(v==='orders')loadOrders();
   if(v==='analytics')loadAnalytics();
@@ -2036,6 +2225,7 @@ function showView(v){
   if(v==='history')loadHistory();
   if(v==='accounts')showAccTab(ACC_TAB);
   if(v==='marketing')showMktTab(MKT_TAB);
+  if(v==='agent')loadAgentConversations();
   if(window.innerWidth<768)document.getElementById('sb').classList.remove('open');
 }
 

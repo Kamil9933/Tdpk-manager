@@ -301,4 +301,52 @@ class Database:
         settings = await self.get_automation_settings()
         return settings[key]
 
+    # ── In-app agent (Phase 3) ───────────────────────────────────────────────
+    async def create_agent_conversation(self, title=None):
+        res = get_client().table("agent_conversations").insert({"title": title or "New conversation"}).execute()
+        return res.data[0]
+
+    async def list_agent_conversations(self, limit=30):
+        try:
+            res = (get_client().table("agent_conversations").select("*")
+                   .order("updated_at", desc=True).limit(limit).execute())
+            return res.data
+        except Exception:
+            return []
+
+    async def get_agent_conversation(self, conversation_id):
+        res = get_client().table("agent_conversations").select("*").eq("id", conversation_id).execute()
+        return res.data[0] if res.data else None
+
+    async def delete_agent_conversation(self, conversation_id):
+        get_client().table("agent_conversations").delete().eq("id", conversation_id).execute()
+
+    async def list_agent_messages(self, conversation_id):
+        try:
+            res = (get_client().table("agent_messages").select("*")
+                   .eq("conversation_id", conversation_id).order("created_at").execute())
+            return res.data
+        except Exception:
+            return []
+
+    async def add_agent_message(self, conversation_id, role, content, tokens_in=0, tokens_out=0):
+        res = get_client().table("agent_messages").insert({
+            "conversation_id": conversation_id, "role": role, "content": content,
+            "tokens_in": tokens_in, "tokens_out": tokens_out,
+        }).execute()
+        return res.data[0] if res.data else None
+
+    async def bump_agent_conversation_tokens(self, conversation_id, tokens_in, tokens_out, title=None):
+        conv = await self.get_agent_conversation(conversation_id)
+        if not conv:
+            return
+        data = {
+            "total_input_tokens": (conv.get("total_input_tokens") or 0) + tokens_in,
+            "total_output_tokens": (conv.get("total_output_tokens") or 0) + tokens_out,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        if title:
+            data["title"] = title
+        get_client().table("agent_conversations").update(data).eq("id", conversation_id).execute()
+
 db = Database()

@@ -446,6 +446,45 @@ def build_mcp_server(shopify, postex, db, meta) -> FastMCP:
             return {"error": str(e)}
 
     @mcp.tool()
+    async def create_ad_campaign(
+        name: str, objective: str, daily_budget_pkr: float, message: str, link: str,
+        countries: Optional[list] = None, image_url: Optional[str] = None, cta: str = "SHOP_NOW",
+        age_min: int = 18, age_max: int = 65, genders: Optional[list] = None,
+        launch_active: bool = False, confirm: bool = False,
+    ) -> dict:
+        """Build a brand-new ad campaign from scratch (Campaign -> Ad Set ->
+        Creative -> Ad). objective is one of: OUTCOME_TRAFFIC, OUTCOME_ENGAGEMENT,
+        OUTCOME_SALES, OUTCOME_AWARENESS, OUTCOME_LEADS, OUTCOME_APP_PROMOTION.
+        daily_budget_pkr is in whole PKR (e.g. 1000 = PKR 1,000/day). countries
+        defaults to ["PK"]. launch_active=False (the default) creates it PAUSED
+        so nothing spends until it's resumed from the Ads tab or set_ad_status.
+
+        GUARDRAIL: this always requires confirm=true to actually create
+        anything, with NO automation-settings toggle able to skip that --
+        unlike pause/resume or budget changes on existing ads, new-campaign
+        creation always needs an explicit human approval in the conversation
+        first. Call once without confirm to get a full preview, show it to the
+        human, and only call again with confirm=true after they explicitly
+        approve that exact preview."""
+        if not confirm:
+            return _meta_preview("Create new ad campaign", {
+                "campaign_name": name, "objective": objective, "daily_budget_pkr": daily_budget_pkr,
+                "countries": countries or ["PK"], "age_range": f"{age_min}-{age_max}", "genders": genders or "all",
+                "ad_message": message, "link": link, "image_url": image_url or "(none)", "call_to_action": cta,
+                "launch_status": "ACTIVE immediately" if launch_active else "PAUSED (needs a manual resume to spend)",
+            })
+        try:
+            daily_budget_minor = int(round(daily_budget_pkr * 100))
+            result = await meta.create_full_campaign(
+                name, objective, daily_budget_minor, countries or ["PK"], message, link,
+                image_url=image_url, cta=cta, age_min=age_min, age_max=age_max,
+                genders=genders, launch_active=launch_active,
+            )
+            return {"ok": True, "result": result}
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
     async def list_facebook_posts(limit: int = 10) -> dict:
         """Recent posts on the Facebook Page, including scheduled ones."""
         try:

@@ -20,6 +20,7 @@ first, not duplicated into this client too.
 """
 
 import os
+import json
 import asyncio
 import httpx
 
@@ -149,6 +150,84 @@ class MetaClient:
     async def set_daily_budget(self, adset_id, amount_minor):
         """amount_minor is the smallest currency unit (cents for USD)."""
         return await self._call("POST", adset_id, {"daily_budget": amount_minor})
+
+    # ---------- ads: create new campaign from scratch (Phase 2) ----------
+    # Meta's object model is Campaign -> Ad Set -> Ad -> Creative, each with its
+    # own required fields. This wraps the whole chain behind one call so the
+    # confirm-gated route/tool one layer up only has to show ONE preview, not
+    # four. If a later step in the chain fails, everything created so far is
+    # left as-is (paused, so nothing spends) and its ids are returned in the
+    # error so the caller can tell the user exactly what partially exists.
+
+    # A reasonable default optimization goal per objective, so the user doesn't
+    # have to understand Meta's full goal taxonomy just to launch a campaign.
+    OBJECTIVE_OPTIMIZATION_DEFAULTS = {
+        "OUTCOME_TRAFFIC": "LINK_CLICKS",
+        "OUTCOME_ENGAGEMENT": "POST_ENGAGEMENT",
+        "OUTCOME_SALES": "OFFSITE_CONVERSIONS",
+        "OUTCOME_AWARENESS": "REACH",
+        "OUTCOME_LEADS": "LEAD_GENERATION",
+        "OUTCOME_APP_PROMOTION": "APP_INSTALLS",
+    }
+
+    async def create_campaign(self, name, objective, status="PAUSED"):
+        return await self._call("POST", f"{self._require(self.ad_account_id, 'META_AD_ACCOUNT_ID')}/campaigns", {
+            "name": name, "objective": objective, "status": status,
+            "special_ad_categories": "[]",
+        })
+
+    async def create_adset(self, campaign_id, name, daily_budget_minor, optimization_goal,
+                            countries, age_min=18, age_max=65, genders=None, status="PAUSED"):
+        targeting = {"geo_locations": {"countries": countries or ["PK"]}, "age_min": age_min, "age_max": age_max}
+        if genders:
+            targeting["genders"] = genders
+        return await self._call("POST", f"{self._require(self.ad_account_id, 'META_AD_ACCOUNT_ID')}/adsets", {
+            "name": name, "campaign_id": campaign_id, "daily_budget": daily_budget_minor,
+            "billing_event": "IMPRESSIONS", "optimization_goal": optimization_goal,
+            "targeting": json.dumps(targeting), "status": status,
+        })
+
+    async def create_ad_creative(self, name, message, link, image_url=None, cta="SHOP_NOW", page_id=None):
+        link_data = {"message": message, "link": link, "call_to_action": {"type": cta, "value": {"link": link}}}
+        if image_url:
+            link_data["picture"] = image_url
+        object_story_spec = {"page_id": page_id or self._require(self.page_id, "META_PAGE_ID"), "link_data": link_data}
+        return await self._call("POST", f"{self._require(self.ad_account_id, 'META_AD_ACCOUNT_ID')}/adcreatives", {
+            "name": name, "object_story_spec": json.dumps(object_story_spec),
+        })
+
+    async def create_ad(self, name, adset_id, creative_id, status="PAUSED"):
+        return await self._call("POST", f"{self._require(self.ad_account_id, 'META_AD_ACCOUNT_ID')}/ads", {
+            "name": name, "adset_id": adset_id, "creative": json.dumps({"creative_id": creative_id}), "status": status,
+        })
+
+    async def create_full_campaign(self, campaign_name, objective, daily_budget_minor, countries,
+                                    message, link, image_url=None, cta="SHOP_NOW",
+                                    age_min=18, age_max=65, genders=None, launch_active=False):
+        """Creates Campaign -> Ad Set -> Creative -> Ad in sequence. Defaults to
+        PAUSED (launch_active=False) as a second safety net on top of the
+        confirm gate one layer up -- nothing spends until it's explicitly
+        resumed from the Ads tab, same as any other ad."""
+        status = "ACTIVE" if launch_active else "PAUSED"
+        optimization_goal = self.OBJECTIVE_OPTIMIZATION_DEFAULTS.get(objective, "LINK_CLICKS")
+        progress = {}
+        try:
+            camp = await self.create_campaign(campaign_name, objective, status=status)
+            progress["campaign_id"] = camp["id"]
+            adset = await self.create_adset(camp["id"], f"{campaign_name} - Ad Set", daily_budget_minor,
+                                             optimization_goal, countries, age_min, age_max, genders, status=status)
+            progress["adset_id"] = adset["id"]
+            creative = await self.create_ad_creative(f"{campaign_name} - Creative", message, link, image_url, cta)
+            progress["creative_id"] = creative["id"]
+            ad = await self.create_ad(f"{campaign_name} - Ad", adset["id"], creative["id"], status=status)
+            progress["ad_id"] = ad["id"]
+            return {"ok": True, "status": status, **progress}
+        except MetaError as e:
+            raise MetaError(
+                f"{e} -- partially created (still PAUSED, nothing is spending): {progress or 'nothing yet'}. "
+                f"You may need to finish or delete this in Meta Ads Manager directly.",
+                status=e.status, body={"partial": progress, "original": e.body},
+            )
 
     # ---------- facebook page ----------
 
