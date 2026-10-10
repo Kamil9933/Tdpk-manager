@@ -263,4 +263,42 @@ class Database:
     async def create_postex_payout(self, data): return await self._insert("postex_payouts", data)
     async def delete_postex_payout(self, pid): await self._delete("postex_payouts", pid)
 
+    # ── Automation autonomy toggles (Meta ads/social) ────────────────────────
+    # Defensive like everything else here: if automation_schema.sql hasn't been
+    # run yet, reads return a hardcoded all-off default rather than 500ing, so
+    # the Marketing tab/MCP tools stay safe (ask-first) even before setup.
+    _AUTOMATION_DEFAULTS = {
+        "ads_pause_resume": {"enabled": False, "config": {}},
+        "ads_budget_change": {"enabled": False, "config": {"ceiling_minor": None}},
+        "social_publish": {"enabled": False, "config": {}},
+        "comment_reply": {"enabled": False, "config": {}},
+    }
+
+    async def get_automation_settings(self):
+        try:
+            res = get_client().table("automation_settings").select("*").execute()
+            found = {row["key"]: row for row in res.data}
+        except Exception:
+            found = {}
+        out = {}
+        for key, default in self._AUTOMATION_DEFAULTS.items():
+            row = found.get(key)
+            out[key] = {
+                "enabled": bool(row["enabled"]) if row else default["enabled"],
+                "config": row.get("config", {}) if row else default["config"],
+            }
+        return out
+
+    async def set_automation_setting(self, key, enabled=None, config=None):
+        if key not in self._AUTOMATION_DEFAULTS:
+            raise ValueError(f"Unknown automation setting: {key}")
+        data = {"key": key, "updated_at": datetime.utcnow().isoformat()}
+        if enabled is not None:
+            data["enabled"] = enabled
+        if config is not None:
+            data["config"] = config
+        get_client().table("automation_settings").upsert(data).execute()
+        settings = await self.get_automation_settings()
+        return settings[key]
+
 db = Database()

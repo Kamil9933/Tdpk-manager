@@ -29,3 +29,15 @@ services:
         sync: false
       - key: MCP_ALLOWED_HOSTS
         sync: false
+      - key: META_ACCESS_TOKEN
+        sync: false
+      - key: META_API_VERSION
+        sync: false
+      - key: META_PAGE_ID
+        sync: false
+      - key: META_AD_ACCOUNT_ID
+        sync: false
+      - key: META_IG_USER_ID
+        sync: false
+      - key: META_BUSINESS_ID
+        sync: false

@@ -47,6 +47,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 
 from core.accounting import generate_pnl, straight_line_depreciation, calc_cash_balance, reconcile_postex
+from core.meta import MetaError
 
 
 class MCPAuthMiddleware:
@@ -89,7 +90,7 @@ def _default_range(from_date, to_date, days=30):
     return from_date, to_date
 
 
-def build_mcp_server(shopify, postex, db) -> FastMCP:
+def build_mcp_server(shopify, postex, db, meta) -> FastMCP:
     """Construct the FastMCP server and register every tool. Takes the already-
     constructed shopify/postex clients and the db singleton so tools share the
     exact same clients (and therefore the exact same auth/token handling) the
@@ -372,6 +373,176 @@ def build_mcp_server(shopify, postex, db) -> FastMCP:
         repeat = [{"phone": p, **v} for p, v in by_phone.items() if v["orders"] >= min_orders]
         repeat.sort(key=lambda x: x["orders"], reverse=True)
         return {"repeat_customers": repeat, "from_date": fd, "to_date": td, "matched_any_phone_field": len(by_phone) > 0}
+
+    # ── Meta: ads, Facebook, Instagram ──────────────────────────────────────
+    # Every write tool below takes `confirm: bool = False`. Called without it
+    # (or with it false), nothing happens -- the tool returns a preview of
+    # exactly what it would do, so you (via chat) see it before anything is
+    # spent or published. Call the SAME tool again with confirm=true to
+    # actually execute. This is deliberate and not relaxed by the
+    # automation_settings toggles -- those govern a future autonomous agent
+    # acting without a human in the loop, not a live conversation like this one.
+    def _meta_preview(action, details):
+        return {"preview": True, "action": action, "details": details,
+                "note": "Nothing was changed. Call again with confirm=true to proceed."}
+
+    @mcp.tool()
+    async def meta_check_connection() -> dict:
+        """Check the Meta token works, and list which ad accounts, Facebook
+        Pages and Instagram account it can see."""
+        try:
+            return await meta.check_connection()
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def list_ad_campaigns(limit: int = 25) -> dict:
+        """List campaigns in the configured ad account with status and budget."""
+        try:
+            return await meta.list_campaigns(limit=limit)
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def list_ad_sets(campaign_id: Optional[str] = None, limit: int = 25) -> dict:
+        """List ad sets, optionally for one campaign. Budgets are in the smallest currency unit (cents)."""
+        try:
+            return await meta.list_adsets(campaign_id=campaign_id, limit=limit)
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def get_ad_insights(date_preset: str = "last_7d", level: str = "campaign", object_id: Optional[str] = None) -> dict:
+        """Ad performance: spend, reach, clicks, CPC, CTR, purchases and ROAS.
+        date_preset: today/yesterday/last_3d/last_7d/last_14d/last_30d/this_month/last_month.
+        level: account/campaign/adset/ad. object_id defaults to the whole account."""
+        try:
+            return await meta.get_insights(date_preset=date_preset, level=level, object_id=object_id)
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def set_ad_status(object_id: str, status: str, confirm: bool = False) -> dict:
+        """Pause or resume a campaign, ad set or ad (status: ACTIVE or PAUSED).
+        Affects live ad spend -- requires confirm=true to actually execute."""
+        if status not in ("ACTIVE", "PAUSED"):
+            return {"error": "status must be ACTIVE or PAUSED"}
+        if not confirm:
+            return _meta_preview("Change delivery status", {"object_id": object_id, "status": status})
+        try:
+            return {"ok": True, "result": await meta.set_status(object_id, status)}
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def set_ad_daily_budget(adset_id: str, amount_minor: int, confirm: bool = False) -> dict:
+        """Change an ad set's daily budget. amount_minor is in the smallest
+        currency unit (cents for USD, so 1000 = $10.00). Requires confirm=true to execute."""
+        if not confirm:
+            return _meta_preview("Change daily budget", {"adset_id": adset_id, "new_daily_budget_major_units": amount_minor / 100})
+        try:
+            return {"ok": True, "result": await meta.set_daily_budget(adset_id, amount_minor)}
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def list_facebook_posts(limit: int = 10) -> dict:
+        """Recent posts on the Facebook Page, including scheduled ones."""
+        try:
+            return await meta.list_page_posts(limit=limit)
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def post_to_facebook(message: str, image_url: Optional[str] = None, link: Optional[str] = None, schedule_at: Optional[int] = None, confirm: bool = False) -> dict:
+        """Publish or schedule a Facebook Page post. schedule_at is a unix
+        timestamp in seconds (10 min to 30 days ahead) to schedule instead of
+        posting now. Requires confirm=true to execute."""
+        if not confirm:
+            return _meta_preview(
+                "Schedule Facebook post" if schedule_at else "Publish Facebook post NOW",
+                {"message": message, "image_url": image_url, "link": link, "schedule_at": schedule_at or "now"},
+            )
+        try:
+            return {"ok": True, "result": await meta.post_to_page(message, image_url=image_url, link=link, schedule_at=schedule_at)}
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def list_instagram_media(limit: int = 12) -> dict:
+        """Recent Instagram posts with likes and comment counts."""
+        try:
+            return await meta.list_ig_media(limit=limit)
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def get_instagram_media_insights(media_id: str) -> dict:
+        """Reach, likes, comments, shares and saves for one Instagram post."""
+        try:
+            return await meta.ig_insights(media_id)
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def list_instagram_comments(media_id: str, limit: int = 25) -> dict:
+        """Comments on an Instagram post."""
+        try:
+            return await meta.list_comments(media_id, limit=limit)
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def reply_to_instagram_comment(comment_id: str, message: str, confirm: bool = False) -> dict:
+        """Reply publicly to an Instagram comment. Requires confirm=true to execute."""
+        if not confirm:
+            return _meta_preview("Reply to Instagram comment", {"comment_id": comment_id, "message": message})
+        try:
+            return {"ok": True, "result": await meta.reply_to_comment(comment_id, message)}
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def publish_instagram_image(image_url: str, caption: str, confirm: bool = False) -> dict:
+        """Publish an image to Instagram now. image_url must be a public JPEG
+        URL. Instagram has no native scheduling. Requires confirm=true to execute."""
+        if not confirm:
+            return _meta_preview("Publish Instagram image NOW", {"image_url": image_url, "caption": caption})
+        try:
+            return {"ok": True, "result": await meta.publish_ig_image(image_url, caption)}
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def publish_instagram_reel(video_url: str, caption: str, confirm: bool = False) -> dict:
+        """Publish a Reel to Instagram now. video_url must be a public MP4 URL.
+        Can take up to ~2.5 minutes to process. Requires confirm=true to execute."""
+        if not confirm:
+            return _meta_preview("Publish Instagram Reel NOW", {"video_url": video_url, "caption": caption})
+        try:
+            return {"ok": True, "result": await meta.publish_ig_reel(video_url, caption)}
+        except MetaError as e:
+            return {"error": str(e)}
+
+    # ── Automation autonomy toggles ──────────────────────────────────────────
+    @mcp.tool()
+    async def get_automation_settings() -> dict:
+        """Current autonomy toggles for ads/social actions (ads_pause_resume,
+        ads_budget_change, social_publish, comment_reply) -- whether each is
+        allowed to run without a human approving first, plus any config like a
+        budget ceiling. New ad/campaign creation has no toggle: it always
+        requires approval."""
+        return await db.get_automation_settings()
+
+    @mcp.tool()
+    async def set_automation_setting(key: str, enabled: Optional[bool] = None, config: Optional[dict] = None) -> dict:
+        """Turn an autonomy toggle on/off, or update its config (e.g. a budget
+        ceiling). key: ads_pause_resume, ads_budget_change, social_publish, or
+        comment_reply. WRITE action -- changes what future automation is allowed to do."""
+        try:
+            return await db.set_automation_setting(key, enabled=enabled, config=config)
+        except ValueError as e:
+            return {"error": str(e)}
 
     # ── Accounting: reads ────────────────────────────────────────────────────
     @mcp.tool()

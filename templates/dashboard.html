@@ -277,6 +277,20 @@ textarea.field-input{min-height:80px;resize:vertical}
 .notif-msg{color:var(--muted);font-size:11px}
 .notif-time{color:var(--muted2);font-size:10px;margin-top:2px}
 
+/* Toggle switch */
+.tgl-row{display:flex;align-items:center;justify-content:space-between;gap:12px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--r-md);padding:12px 14px;margin-bottom:8px}
+.tgl-label{font-size:12.5px;font-weight:600}
+.tgl-sub{font-size:10.5px;color:var(--muted);margin-top:2px;max-width:420px}
+.tgl-switch{position:relative;width:42px;height:24px;flex-shrink:0;background:var(--surface3);border:1px solid var(--border2);border-radius:20px;cursor:pointer;transition:all 0.2s var(--ease)}
+.tgl-switch::after{content:'';position:absolute;top:2px;left:2px;width:18px;height:18px;background:var(--muted);border-radius:50%;transition:all 0.2s var(--ease)}
+.tgl-switch.on{background:var(--green-d);border-color:rgba(31,191,108,0.4)}
+.tgl-switch.on::after{left:21px;background:var(--green)}
+.mkt-sub{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px}
+.media-item{position:relative;border-radius:var(--r-sm);overflow:hidden;cursor:pointer;background:var(--surface2);border:1px solid var(--border);aspect-ratio:1;display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--muted);text-align:center;padding:4px}
+.media-item:hover{border-color:var(--accent-b)}
+.guard-box{background:var(--yellow-d);border:1px solid rgba(242,172,46,0.3);border-radius:var(--r-sm);padding:9px 12px;font-size:11px;color:var(--yellow);margin-bottom:12px}
+
 /* Form box */
 .form-box{background:var(--surface2);border:1px solid var(--border2);border-radius:var(--r-md);padding:15px;margin-bottom:14px;box-shadow:var(--shadow-sm)}
 .form-box h4{font-size:13px;font-weight:700;margin-bottom:12px}
@@ -320,6 +334,8 @@ textarea.field-input{min-height:80px;resize:vertical}
     <div class="sbi" onclick="showView('postex')" id="nav-postex"><span class="ic">🚚</span>PostEx COD</div>
     <div class="sb-sec">Finance</div>
     <div class="sbi" onclick="showView('accounts')" id="nav-accounts"><span class="ic">💰</span>Accounts</div>
+    <div class="sb-sec">Marketing</div>
+    <div class="sbi" onclick="showView('marketing')" id="nav-marketing"><span class="ic">📣</span>Ads &amp; Social</div>
     <div class="sb-sec">Colour Ops</div>
     <div class="sbi" onclick="openOp('remove_color')"><span class="ic">🗑</span>Remove colour</div>
     <div class="sbi" onclick="openOp('add_color')"><span class="ic">➕</span>Add colour</div>
@@ -523,6 +539,20 @@ textarea.field-input{min-height:80px;resize:vertical}
         <button class="btn sm" data-tab="cash" onclick="showAccTab('cash')">Cash Accounts</button>
       </div>
       <div id="acc-content"></div>
+    </div>
+  </div>
+
+  <!-- MARKETING -->
+  <div class="view" id="view-marketing">
+    <div class="scroll-wrap">
+      <div class="mkt-sub" id="mkt-tabs">
+        <button class="btn sm primary" data-tab="connection" onclick="showMktTab('connection')">Connection</button>
+        <button class="btn sm" data-tab="ads" onclick="showMktTab('ads')">Ads</button>
+        <button class="btn sm" data-tab="facebook" onclick="showMktTab('facebook')">Facebook</button>
+        <button class="btn sm" data-tab="instagram" onclick="showMktTab('instagram')">Instagram</button>
+        <button class="btn sm" data-tab="automation" onclick="showMktTab('automation')">Automation</button>
+      </div>
+      <div id="mkt-content"></div>
     </div>
   </div>
 </div>
@@ -1574,6 +1604,289 @@ async function createPostexPayout(){
   loadAccCash();
 }
 
+// ── Marketing (Meta ads + Facebook + Instagram) ──────────────────────────────────
+let MKT_TAB='connection';
+function showMktTab(tab){
+  MKT_TAB=tab;
+  document.querySelectorAll('#mkt-tabs .btn').forEach(b=>b.classList.toggle('primary',b.dataset.tab===tab));
+  const map={connection:loadMktConnection,ads:loadMktAds,facebook:loadMktFacebook,instagram:loadMktInstagram,automation:loadMktAutomation};
+  (map[tab]||loadMktConnection)();
+}
+
+// Shared preview-then-confirm helper for every Meta write action. The backend
+// never acts on the first call -- it returns {preview:true, action, details} --
+// so this always shows the user exactly what will happen before resending with
+// confirm:true. This is the guardrail the user asked for: nothing posts, pauses,
+// or changes a budget without an explicit OK on what it's about to do.
+async function mktConfirmPost(url, body, successMsg, reloadFn){
+  try{
+    const r1=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d1=await r1.json();
+    if(!r1.ok){alert('Error: '+(d1.detail||JSON.stringify(d1)));return;}
+    if(d1.preview){
+      const lines=Object.entries(d1.details||{}).map(([k,v])=>`${k}: ${v}`).join('\n');
+      if(!confirm(`${d1.action}\n\n${lines}\n\nProceed?`))return;
+      const r2=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,confirm:true})});
+      const d2=await r2.json();
+      if(!r2.ok){alert('Error: '+(d2.detail||JSON.stringify(d2)));return;}
+    }
+    alert(successMsg||'Done');
+    if(reloadFn)reloadFn();
+  }catch(e){alert('Error: '+e.message);}
+}
+
+async function loadMktConnection(){
+  const c=document.getElementById('mkt-content');
+  c.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Checking connection…</div>';
+  try{
+    const r=await fetch('/api/meta/check');
+    const d=await r.json();
+    if(!r.ok){c.innerHTML=`<div class="guard-box">Could not connect: ${d.detail||'unknown error'}. Check the META_* environment variables on Render.</div>`;return;}
+    const me=d.me||{}, tok=d.token||{}, assets=d.assets||{};
+    const ownedAds=assets.owned_ad_accounts?.data||[];
+    const ownedPages=assets.owned_pages?.data||[];
+    const igAccounts=assets.ig_accounts?.data||[];
+    c.innerHTML=`
+      <div class="metric-grid">
+        <div class="metric-card green"><div class="m-label">System user</div><div class="m-value" style="font-size:15px">${me.name||'—'}</div><div class="m-sub">${me.id||''}</div></div>
+        <div class="metric-card ${tok.is_valid?'green':'red'}"><div class="m-label">Token</div><div class="m-value" style="font-size:15px">${tok.is_valid?'Valid':'Invalid'}</div><div class="m-sub">Expires: ${tok.expires_at||'—'}</div></div>
+      </div>
+      <div class="chart-container">
+        <div class="chart-title">Ad accounts</div>
+        ${ownedAds.length?ownedAds.map(a=>`<div style="font-size:12px;padding:4px 0">${a.name} <span style="color:var(--muted)">(${a.id}, ${a.currency||''}, ${a.account_status===1?'active':'status '+a.account_status})</span></div>`).join(''):'<div style="color:var(--muted);font-size:12px">None found — check META_BUSINESS_ID and that the system user has access.</div>'}
+      </div>
+      <div class="chart-container">
+        <div class="chart-title">Pages</div>
+        ${ownedPages.length?ownedPages.map(p=>`<div style="font-size:12px;padding:4px 0">${p.name} <span style="color:var(--muted)">(${p.id}${p.instagram_business_account?' · IG: '+p.instagram_business_account.username:''})</span></div>`).join(''):'<div style="color:var(--muted);font-size:12px">None found.</div>'}
+      </div>
+      <div class="chart-container">
+        <div class="chart-title">Instagram business accounts</div>
+        ${igAccounts.length?igAccounts.map(i=>`<div style="font-size:12px;padding:4px 0">@${i.username} <span style="color:var(--muted)">(${i.id})</span></div>`).join(''):'<div style="color:var(--muted);font-size:12px">None found.</div>'}
+      </div>
+      <button class="btn" onclick="loadMktConnection()">↻ Re-check</button>
+    `;
+  }catch(e){c.innerHTML=`<div class="guard-box">Could not reach Meta: ${e.message}</div>`;}
+}
+
+async function loadMktAds(){
+  const c=document.getElementById('mkt-content');
+  c.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Loading campaigns…</div>';
+  try{
+    const r=await fetch('/api/meta/campaigns');
+    const d=await r.json();
+    if(!r.ok){c.innerHTML=`<div class="guard-box">${d.detail||'Could not load campaigns.'}</div>`;return;}
+    const campaigns=d.data||[];
+    c.innerHTML=`
+      <div class="guard-box">Pausing/resuming and budget changes take effect immediately on live ad delivery and spend — you'll always see a confirmation of exactly what's about to change first.</div>
+      <div class="filters" style="padding:0 0 10px;border:none">
+        <select id="mkt-preset" onchange="loadMktInsights()"><option value="today">Today</option><option value="yesterday" selected>Yesterday</option><option value="last_7d">Last 7 days</option><option value="last_30d">Last 30 days</option></select>
+        <button class="btn" onclick="loadMktInsights()">📊 Load insights</button>
+      </div>
+      <div id="mkt-insights"></div>
+      <div id="mkt-campaigns">${!campaigns.length?'<div style="text-align:center;padding:1rem;color:var(--muted)">No campaigns found on this ad account</div>':campaigns.map(cm=>`
+        <div class="row-card" style="cursor:default;align-items:flex-start;flex-direction:column;gap:6px">
+          <div style="display:flex;width:100%;align-items:center;gap:10px">
+            <div style="flex:1">
+              <div style="font-size:13px;font-weight:600">${cm.name}</div>
+              <div style="font-size:11px;color:var(--muted)">${cm.objective||''} · ${cm.id}${cm.daily_budget?' · Daily: PKR '+(cm.daily_budget/100).toLocaleString():''}${cm.lifetime_budget?' · Lifetime: PKR '+(cm.lifetime_budget/100).toLocaleString():''}</div>
+            </div>
+            <span class="spill ${cm.effective_status==='ACTIVE'?'s-active':'s-draft'}">${cm.effective_status}</span>
+            ${cm.effective_status==='ACTIVE'
+              ?`<button class="btn danger sm" onclick="mktSetStatus('${cm.id}','PAUSED')">Pause</button>`
+              :`<button class="btn success sm" onclick="mktSetStatus('${cm.id}','ACTIVE')">Resume</button>`}
+            <button class="btn sm" onclick="loadMktAdsets('${cm.id}','${cm.name.replace(/'/g,"\\'")}')">Ad sets ▾</button>
+          </div>
+          <div id="adsets-${cm.id}" style="width:100%"></div>
+        </div>`).join('')}</div>
+    `;
+  }catch(e){c.innerHTML=`<div class="guard-box">Could not load campaigns: ${e.message}</div>`;}
+}
+async function mktSetStatus(objectId,status){
+  await mktConfirmPost('/api/meta/ads/status',{object_id:objectId,status},`Status updated to ${status}`,loadMktAds);
+}
+async function loadMktAdsets(campaignId,campaignName){
+  const box=document.getElementById(`adsets-${campaignId}`);
+  if(box.dataset.loaded==='1'){box.innerHTML='';box.dataset.loaded='0';return;}
+  box.innerHTML='<div style="font-size:11px;color:var(--muted);padding:6px 0">Loading ad sets…</div>';
+  try{
+    const r=await fetch(`/api/meta/adsets?campaign_id=${campaignId}`);
+    const d=await r.json();
+    const adsets=d.data||[];
+    box.innerHTML=!adsets.length?'<div style="font-size:11px;color:var(--muted);padding:6px 0">No ad sets</div>':adsets.map(as=>`
+      <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid var(--border);font-size:11.5px">
+        <div style="flex:1">${as.name} <span style="color:var(--muted)">(${as.effective_status})</span></div>
+        <input type="number" class="field-input" style="width:100px;padding:5px 7px" id="bud-${as.id}" placeholder="New daily PKR">
+        <button class="btn sm" onclick="mktSetBudget('${as.id}')">Set budget</button>
+        ${as.effective_status==='ACTIVE'
+          ?`<button class="btn danger sm" onclick="mktSetStatus('${as.id}','PAUSED')">Pause</button>`
+          :`<button class="btn success sm" onclick="mktSetStatus('${as.id}','ACTIVE')">Resume</button>`}
+      </div>`).join('');
+    box.dataset.loaded='1';
+  }catch(e){box.innerHTML=`<div style="font-size:11px;color:var(--red)">${e.message}</div>`;}
+}
+async function mktSetBudget(adsetId){
+  const v=document.getElementById(`bud-${adsetId}`).value;
+  if(!v){alert('Enter a new daily budget in PKR');return;}
+  const amountMinor=Math.round(parseFloat(v)*100);
+  await mktConfirmPost('/api/meta/ads/budget',{adset_id:adsetId,amount_minor:amountMinor},'Budget updated',loadMktAds);
+}
+async function loadMktInsights(){
+  const box=document.getElementById('mkt-insights');
+  box.innerHTML='<div style="font-size:11px;color:var(--muted);padding:6px 0">Loading insights…</div>';
+  try{
+    const preset=document.getElementById('mkt-preset').value;
+    const r=await fetch(`/api/meta/insights?date_preset=${preset}&level=campaign`);
+    const d=await r.json();
+    const rows=d.data||[];
+    box.innerHTML=!rows.length?'<div style="font-size:11px;color:var(--muted);padding:6px 0">No spend in this range</div>':`
+      <div class="chart-container">
+        <div class="chart-title">Spend (${preset.replace('_',' ')})</div>
+        <table><thead><tr><th>Campaign</th><th>Spend</th><th>Impr.</th><th>Clicks</th><th>CTR</th><th>CPC</th></tr></thead>
+        <tbody>${rows.map(r=>`<tr><td>${r.campaign_name||'—'}</td><td>PKR ${Math.round(r.spend||0).toLocaleString()}</td><td>${r.impressions||0}</td><td>${r.clicks||0}</td><td>${r.ctr?parseFloat(r.ctr).toFixed(2)+'%':'—'}</td><td>${r.cpc?'PKR '+parseFloat(r.cpc).toFixed(2):'—'}</td></tr>`).join('')}</tbody></table>
+      </div>`;
+  }catch(e){box.innerHTML=`<div style="font-size:11px;color:var(--red)">${e.message}</div>`;}
+}
+
+async function loadMktFacebook(){
+  const c=document.getElementById('mkt-content');
+  c.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Loading…</div>';
+  try{
+    const r=await fetch('/api/meta/posts');
+    const d=await r.json();
+    const posts=d.data||[];
+    c.innerHTML=`
+      <div class="form-box">
+        <h4>📘 New Facebook post</h4>
+        <div class="op-field"><label>Message</label><textarea class="field-input" id="fb-msg" placeholder="What's on your mind?"></textarea></div>
+        <div class="form-row">
+          <div class="op-field"><label>Image URL (optional, must be public)</label><input type="text" id="fb-img" placeholder="https://..."></div>
+          <div class="op-field"><label>Link (optional)</label><input type="text" id="fb-link" placeholder="https://thirddimension.pk/..."></div>
+        </div>
+        <div class="op-field"><label>Schedule for later (optional)</label><input type="datetime-local" id="fb-sched"></div>
+        <button class="btn primary" onclick="mktPostFacebook()">Post / Schedule</button>
+      </div>
+      <div class="chart-title" style="margin-bottom:8px">Recent posts</div>
+      ${!posts.length?'<div style="text-align:center;padding:1rem;color:var(--muted)">No posts found</div>':posts.map(p=>`
+        <div class="row-card" style="cursor:default">
+          <div style="flex:1"><div style="font-size:12px">${(p.message||'(no text)').slice(0,140)}</div><div style="font-size:10.5px;color:var(--muted)">${p.created_time||''}${p.scheduled_publish_time?' · scheduled':''}</div></div>
+          ${p.permalink_url?`<a class="btn sm" href="${p.permalink_url}" target="_blank">View</a>`:''}
+        </div>`).join('')}
+    `;
+  }catch(e){c.innerHTML=`<div class="guard-box">Could not load: ${e.message}</div>`;}
+}
+async function mktPostFacebook(){
+  const message=document.getElementById('fb-msg').value.trim();
+  if(!message){alert('Write a message first');return;}
+  const image_url=document.getElementById('fb-img').value.trim()||null;
+  const link=document.getElementById('fb-link').value.trim()||null;
+  const schedVal=document.getElementById('fb-sched').value;
+  const schedule_at=schedVal?Math.floor(new Date(schedVal).getTime()/1000):null;
+  await mktConfirmPost('/api/meta/post',{message,image_url,link,schedule_at},schedule_at?'Post scheduled':'Post published',loadMktFacebook);
+}
+
+async function loadMktInstagram(){
+  const c=document.getElementById('mkt-content');
+  c.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Loading…</div>';
+  try{
+    const r=await fetch('/api/meta/ig/media');
+    const d=await r.json();
+    const media=d.data||[];
+    c.innerHTML=`
+      <div class="form-box">
+        <h4>📸 New Instagram post</h4>
+        <div class="form-row">
+          <div class="op-field"><label>Type</label><select id="ig-type"><option value="image">Image</option><option value="reel">Reel (video)</option></select></div>
+          <div class="op-field"><label>Media URL (must be public)</label><input type="text" id="ig-url" placeholder="https://..."></div>
+        </div>
+        <div class="op-field"><label>Caption</label><textarea class="field-input" id="ig-caption"></textarea></div>
+        <button class="btn primary" onclick="mktPostInstagram()">Publish</button>
+        <div style="font-size:11px;color:var(--muted);margin-top:8px">Reels take a bit longer to process — the page will wait for Instagram to finish before publishing.</div>
+      </div>
+      <div class="chart-title" style="margin-bottom:8px">Recent media</div>
+      <div class="media-grid">${!media.length?'<div style="color:var(--muted);font-size:12px">No media found</div>':media.map(m=>`
+        <div class="media-item" onclick="loadMktComments('${m.id}')" title="${(m.caption||'').slice(0,80)}">
+          ${m.media_type||'MEDIA'}<br>❤ ${m.like_count||0} · 💬 ${m.comments_count||0}
+        </div>`).join('')}</div>
+      <div id="ig-comments-panel" style="margin-top:14px"></div>
+    `;
+  }catch(e){c.innerHTML=`<div class="guard-box">Could not load: ${e.message}</div>`;}
+}
+async function mktPostInstagram(){
+  const type=document.getElementById('ig-type').value;
+  const url=document.getElementById('ig-url').value.trim();
+  const caption=document.getElementById('ig-caption').value;
+  if(!url){alert('Enter a public media URL');return;}
+  if(type==='reel'){
+    await mktConfirmPost('/api/meta/ig/publish/reel',{video_url:url,caption},'Reel published',loadMktInstagram);
+  }else{
+    await mktConfirmPost('/api/meta/ig/publish/image',{image_url:url,caption},'Image published',loadMktInstagram);
+  }
+}
+async function loadMktComments(mediaId){
+  const box=document.getElementById('ig-comments-panel');
+  box.innerHTML='<div style="font-size:11px;color:var(--muted)">Loading comments…</div>';
+  try{
+    const r=await fetch(`/api/meta/ig/media/${mediaId}/comments`);
+    const d=await r.json();
+    const comments=d.data||[];
+    box.innerHTML=`
+      <div class="chart-container">
+        <div class="chart-title">Comments</div>
+        ${!comments.length?'<div style="color:var(--muted);font-size:12px">No comments</div>':comments.map(cm=>`
+          <div style="padding:8px 0;border-top:1px solid var(--border)">
+            <div style="font-size:12px"><b>${cm.username||'user'}</b>: ${cm.text}</div>
+            <div style="display:flex;gap:6px;margin-top:5px">
+              <input type="text" class="field-input" style="padding:5px 7px;font-size:11px" id="reply-${cm.id}" placeholder="Reply...">
+              <button class="btn sm" onclick="mktReplyComment('${mediaId}','${cm.id}')">Reply</button>
+            </div>
+          </div>`).join('')}
+      </div>`;
+  }catch(e){box.innerHTML=`<div style="font-size:11px;color:var(--red)">${e.message}</div>`;}
+}
+async function mktReplyComment(mediaId,commentId){
+  const message=document.getElementById(`reply-${commentId}`).value.trim();
+  if(!message){alert('Write a reply first');return;}
+  await mktConfirmPost(`/api/meta/ig/media/${mediaId}/comments/reply`,{comment_id:commentId,message},'Reply posted',()=>loadMktComments(mediaId));
+}
+
+const MKT_AUTOMATION_META={
+  ads_pause_resume:{label:'Auto pause/resume ads',sub:'Allow an unattended automation (e.g. a future agent) to pause or resume ads on its own, without you confirming each time.'},
+  ads_budget_change:{label:'Auto budget changes',sub:'Allow unattended daily budget changes, optionally capped by the ceiling below.'},
+  social_publish:{label:'Auto social publishing',sub:'Allow unattended Facebook/Instagram posting.'},
+  comment_reply:{label:'Auto comment replies',sub:'Allow unattended replies to Instagram comments.'},
+};
+async function loadMktAutomation(){
+  const c=document.getElementById('mkt-content');
+  c.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Loading…</div>';
+  try{
+    const r=await fetch('/api/settings/automation');
+    const settings=await r.json();
+    c.innerHTML=`
+      <div class="guard-box">New ad/campaign creation always requires your explicit approval — there's no toggle for it, by design. These toggles only govern whether a future automated/agent-driven action needs to ask first, for existing ads and posts.</div>
+      ${Object.entries(MKT_AUTOMATION_META).map(([key,meta])=>{
+        const s=settings[key]||{enabled:false,config:{}};
+        return `
+        <div class="tgl-row">
+          <div>
+            <div class="tgl-label">${meta.label}</div>
+            <div class="tgl-sub">${meta.sub}</div>
+            ${key==='ads_budget_change'?`<div style="margin-top:8px"><input type="number" class="field-input" style="width:160px;padding:6px 9px" id="ceiling-input" placeholder="Ceiling PKR (optional)" value="${s.config?.ceiling_minor?(s.config.ceiling_minor/100):''}" onchange="mktSetCeiling(this.value)"></div>`:''}
+          </div>
+          <div class="tgl-switch ${s.enabled?'on':''}" onclick="mktToggleAutomation('${key}',${!s.enabled})"></div>
+        </div>`;
+      }).join('')}
+    `;
+  }catch(e){c.innerHTML=`<div class="guard-box">Could not load: ${e.message}</div>`;}
+}
+async function mktToggleAutomation(key,enabled){
+  await fetch(`/api/settings/automation/${key}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
+  loadMktAutomation();
+}
+async function mktSetCeiling(value){
+  const ceiling_minor=value?Math.round(parseFloat(value)*100):null;
+  await fetch('/api/settings/automation/ads_budget_change',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:{ceiling_minor}})});
+}
+
 // ── Notifications ─────────────────────────────────────────────────────────────
 async function loadNotifications(){
   try{
@@ -1696,6 +2009,7 @@ const CMDS=[
   {ic:'🚚',l:'PostEx COD',s:'View',a:()=>showView('postex')},
   {ic:'💰',l:'Accounts',s:'View',a:()=>showView('accounts')},
   {ic:'⚙️',l:'Automation',s:'View',a:()=>showView('automation')},
+  {ic:'📣',l:'Ads & Social',s:'View',a:()=>showView('marketing')},
   {ic:'🕒',l:'History',s:'View',a:()=>showView('history')},
   ...Object.entries(OPS).map(([op,cfg])=>({ic:'⚡',l:cfg.t,s:'Operation',a:()=>openOp(op)})),
 ];
@@ -1711,7 +2025,7 @@ function showView(v){
   document.querySelectorAll('.sbi').forEach(el=>el.classList.remove('active'));
   document.getElementById(`view-${v}`)?.classList.add('active');
   document.getElementById(`nav-${v}`)?.classList.add('active');
-  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',automation:'Automation',history:'Operation History',accounts:'Accounts'};
+  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',automation:'Automation',history:'Operation History',accounts:'Accounts',marketing:'Ads & Social'};
   document.getElementById('view-title').textContent=titles[v]||v;
   if(v==='orders')loadOrders();
   if(v==='analytics')loadAnalytics();
@@ -1721,6 +2035,7 @@ function showView(v){
   if(v==='automation')loadRules();
   if(v==='history')loadHistory();
   if(v==='accounts')showAccTab(ACC_TAB);
+  if(v==='marketing')showMktTab(MKT_TAB);
   if(window.innerWidth<768)document.getElementById('sb').classList.remove('open');
 }
 

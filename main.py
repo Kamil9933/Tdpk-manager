@@ -16,6 +16,7 @@ from core.operations import run_operation
 from core.intelligence import generate_briefing
 from core.postex import PostexClient
 from core.accounting import generate_pnl, straight_line_depreciation, calc_cash_balance, reconcile_postex
+from core.meta import MetaClient, MetaError
 from core.mcp_server import build_mcp_server, MCPAuthMiddleware
 
 shopify = ShopifyClient(
@@ -25,12 +26,13 @@ shopify = ShopifyClient(
     client_secret=os.getenv("SHOPIFY_CLIENT_SECRET", "")
 )
 postex = PostexClient(token=os.getenv("POSTEX_TOKEN", ""))
+meta = MetaClient()
 
 # The MCP connector is built here (before the FastAPI app itself) because its
 # ASGI app's own lifespan (mcp_server.session_manager.run()) has to be combined
 # into the main app's lifespan below -- Starlette doesn't automatically run a
 # mounted sub-app's lifespan, only the top-level app's.
-mcp_server = build_mcp_server(shopify, postex, db)
+mcp_server = build_mcp_server(shopify, postex, db, meta)
 mcp_asgi_app = mcp_server.streamable_http_app()
 
 @asynccontextmanager
@@ -314,6 +316,181 @@ async def track_postex(tracking_number: str, session=Depends(verify_session)):
 @app.get("/api/postex/statuses")
 async def postex_statuses(session=Depends(verify_session)):
     return await postex.get_order_statuses()
+
+# ── Meta: ads, Facebook, Instagram ──────────────────────────────────────────────
+# Every write here (pausing/resuming an ad, changing a budget, publishing a
+# post, replying to a comment) requires `confirm: true` in the request body --
+# without it, the route returns a preview of exactly what would happen and
+# changes nothing. This is the same preview-then-confirm pattern the original
+# local meta-mcp tool used, and it's deliberately always required for a
+# live/human-driven request regardless of the automation_settings toggles
+# below: those toggles govern what a *future autonomous* process (the Phase 3
+# in-app agent, acting without a human typing confirm itself) is allowed to do
+# unsupervised -- they don't relax the guardrail for a direct API call.
+def _meta_preview(action, details):
+    return {"ok": False, "preview": True, "action": action, "details": details,
+            "note": "Nothing was changed. Resend with confirm=true to proceed."}
+
+@app.get("/api/meta/check")
+async def meta_check(session=Depends(verify_session)):
+    try:
+        return await meta.check_connection()
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/meta/campaigns")
+async def meta_campaigns(limit: int = 25, session=Depends(verify_session)):
+    try:
+        return await meta.list_campaigns(limit=limit)
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/meta/adsets")
+async def meta_adsets(campaign_id: str = None, limit: int = 25, session=Depends(verify_session)):
+    try:
+        return await meta.list_adsets(campaign_id=campaign_id, limit=limit)
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/meta/insights")
+async def meta_insights(date_preset: str = "last_7d", level: str = "campaign", object_id: str = None, session=Depends(verify_session)):
+    try:
+        return await meta.get_insights(date_preset=date_preset, level=level, object_id=object_id)
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/meta/ads/status")
+async def meta_ads_status(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    object_id, status, confirm = data.get("object_id"), data.get("status"), bool(data.get("confirm"))
+    if status not in ("ACTIVE", "PAUSED"):
+        raise HTTPException(status_code=400, detail="status must be ACTIVE or PAUSED")
+    if not confirm:
+        return _meta_preview("Change delivery status", {"object_id": object_id, "status": status})
+    try:
+        result = await meta.set_status(object_id, status)
+        await db.add_notification("meta", f"Ad {object_id} set to {status}")
+        return {"ok": True, "result": result}
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/meta/ads/budget")
+async def meta_ads_budget(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    adset_id, amount_minor, confirm = data.get("adset_id"), data.get("amount_minor"), bool(data.get("confirm"))
+    try:
+        amount_minor = int(amount_minor)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="amount_minor must be an integer (smallest currency unit)")
+    settings = await db.get_automation_settings()
+    ceiling = (settings.get("ads_budget_change", {}).get("config") or {}).get("ceiling_minor")
+    if ceiling and amount_minor > int(ceiling):
+        raise HTTPException(status_code=400, detail=f"Requested budget ({amount_minor}) exceeds your configured ceiling ({ceiling})")
+    if not confirm:
+        return _meta_preview("Change daily budget", {"adset_id": adset_id, "new_daily_budget_major_units": amount_minor / 100})
+    try:
+        result = await meta.set_daily_budget(adset_id, amount_minor)
+        await db.add_notification("meta", f"Ad set {adset_id} budget changed to {amount_minor/100}")
+        return {"ok": True, "result": result}
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/meta/posts")
+async def meta_posts(limit: int = 10, session=Depends(verify_session)):
+    try:
+        return await meta.list_page_posts(limit=limit)
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/meta/post")
+async def meta_post(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    message, image_url, link = data.get("message", ""), data.get("image_url"), data.get("link")
+    schedule_at, confirm = data.get("schedule_at"), bool(data.get("confirm"))
+    if not confirm:
+        return _meta_preview(
+            "Schedule Facebook post" if schedule_at else "Publish Facebook post NOW",
+            {"message": message, "image_url": image_url, "link": link,
+             "schedule_at": datetime.fromtimestamp(schedule_at).isoformat() if schedule_at else "now"},
+        )
+    try:
+        result = await meta.post_to_page(message, image_url=image_url, link=link, schedule_at=schedule_at)
+        await db.add_notification("meta", "Facebook post published" if not schedule_at else "Facebook post scheduled")
+        return {"ok": True, "result": result}
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/meta/ig/media")
+async def meta_ig_media(limit: int = 12, session=Depends(verify_session)):
+    try:
+        return await meta.list_ig_media(limit=limit)
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/meta/ig/media/{media_id}/insights")
+async def meta_ig_media_insights(media_id: str, session=Depends(verify_session)):
+    try:
+        return await meta.ig_insights(media_id)
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/meta/ig/media/{media_id}/comments")
+async def meta_ig_comments(media_id: str, limit: int = 25, session=Depends(verify_session)):
+    try:
+        return await meta.list_comments(media_id, limit=limit)
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/meta/ig/media/{media_id}/comments/reply")
+async def meta_ig_reply(media_id: str, request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    comment_id, message, confirm = data.get("comment_id"), data.get("message", ""), bool(data.get("confirm"))
+    if not confirm:
+        return _meta_preview("Reply to Instagram comment", {"comment_id": comment_id, "message": message})
+    try:
+        result = await meta.reply_to_comment(comment_id, message)
+        return {"ok": True, "result": result}
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/meta/ig/publish/image")
+async def meta_ig_publish_image(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    image_url, caption, confirm = data.get("image_url"), data.get("caption", ""), bool(data.get("confirm"))
+    if not confirm:
+        return _meta_preview("Publish Instagram image NOW", {"image_url": image_url, "caption": caption})
+    try:
+        result = await meta.publish_ig_image(image_url, caption)
+        await db.add_notification("meta", "Instagram image published")
+        return {"ok": True, "result": result}
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/meta/ig/publish/reel")
+async def meta_ig_publish_reel(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    video_url, caption, confirm = data.get("video_url"), data.get("caption", ""), bool(data.get("confirm"))
+    if not confirm:
+        return _meta_preview("Publish Instagram Reel NOW", {"video_url": video_url, "caption": caption})
+    try:
+        result = await meta.publish_ig_reel(video_url, caption)
+        await db.add_notification("meta", "Instagram Reel published")
+        return {"ok": True, "result": result}
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# ── Automation autonomy toggles ──────────────────────────────────────────────
+@app.get("/api/settings/automation")
+async def get_automation_settings(session=Depends(verify_session)):
+    return await db.get_automation_settings()
+
+@app.put("/api/settings/automation/{key}")
+async def update_automation_setting(key: str, request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    try:
+        return await db.set_automation_setting(key, enabled=data.get("enabled"), config=data.get("config"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 # ── Operations ────────────────────────────────────────────────────────────────
 @app.post("/api/operations/preview")
