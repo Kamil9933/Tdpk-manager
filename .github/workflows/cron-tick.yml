@@ -1,0 +1,29 @@
+﻿name: TDPK cron tick
+
+# Render's free plan has no built-in scheduler and the web service spins down
+# when idle, so this workflow pings the app's /api/cron/tick endpoint every
+# 30 minutes -- that both wakes it up and drives anything time-based (the
+# twice-daily digest, due reminders). The endpoint is idempotent per digest
+# slot/reminder, so pinging this often is always safe.
+#
+# Setup (one-time):
+#   1. In the repo's GitHub Settings -> Secrets and variables -> Actions, add:
+#      - TDPK_APP_URL     e.g. https://tdpk-manager.onrender.com
+#      - TDPK_CRON_SECRET matching the CRON_SECRET env var set on Render
+#   2. That's it -- this runs automatically on the schedule below. Use the
+#      "Run workflow" button on the Actions tab to fire it manually and check
+#      it's wired up correctly.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping TDPK cron tick endpoint
+        run: |
+          curl -fsS -X POST "${{ secrets.TDPK_APP_URL }}/api/cron/tick" \
+            -H "X-Cron-Secret: ${{ secrets.TDPK_CRON_SECRET }}"

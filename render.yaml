@@ -45,3 +45,29 @@ services:
         sync: false
       - key: AGENT_MODEL
         sync: false
+      # Phone notifications -- Telegram (free, no approval needed) and/or
+      # email. Both are optional independently; notify_all() skips whichever
+      # isn't configured. See core/notify.py's module docstring for setup
+      # steps for each.
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: DIGEST_EMAIL_TO
+        sync: false
+      # Shared secret the GitHub Actions cron-tick workflow sends as
+      # X-Cron-Secret -- must match the TDPK_CRON_SECRET repo secret.
+      - key: CRON_SECRET
+        sync: false
+      # Optional: comma-separated HH:MM (24h, Pakistan local time) digest
+      # send times. Defaults to "09:00,21:00" if unset.
+      - key: DIGEST_TIMES
+        sync: false

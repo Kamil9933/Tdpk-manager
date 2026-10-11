@@ -39,7 +39,7 @@ Design choices worth knowing about:
 """
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
 
 from mcp.server.fastmcp import FastMCP
@@ -49,6 +49,11 @@ from starlette.responses import JSONResponse
 from core.accounting import generate_pnl, straight_line_depreciation, calc_cash_balance, reconcile_postex
 from core.meta import MetaError
 from core.operations import run_operation
+from core.filament import deduct_filament_for_order, compute_filament_status
+from core.returns import compute_product_return_breakdown
+from core.notify import notify_all
+
+PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time -- fixed UTC+5 offset, no DST
 
 
 class MCPAuthMiddleware:
@@ -268,7 +273,8 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
             }
         }
         result = await shopify._post("/fulfillments.json", payload)
-        return {"ok": True, "fulfillment": result}
+        filament_result = await deduct_filament_for_order(db, shopify, order_id)
+        return {"ok": True, "fulfillment": result, "filament": filament_result}
 
     @mcp.tool()
     async def update_variant_price(product_id: int, variant_id: int, price: str) -> dict:
@@ -475,7 +481,24 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
             if o.get("_bucket") == "returned":
                 row["returned"] += 1
         result = [{"band_pkr": k, "total": v["total"], "returned": v["returned"], "return_rate": round(v["returned"] / v["total"] * 100, 1) if v["total"] else 0} for k, v in by_band.items()]
-        return {"bands": result, "from_date": fd, "to_date": td, "note": "Value bands only -- no per-product breakdown available from PostEx data alone."}
+        return {"bands": result, "from_date": fd, "to_date": td, "note": "Value bands only -- for a real per-product breakdown use get_product_return_breakdown."}
+
+    @mcp.tool()
+    async def get_product_return_breakdown(days: int = 30, from_date: Optional[str] = None, to_date: Optional[str] = None, limit: int = 30) -> dict:
+        """Which specific products/variants get returned most, cross-referencing
+        PostEx's delivered/returned outcome for each shipment with the Shopify
+        order's line items (matched via PostEx's orderRefNumber against the
+        Shopify order number). Sorted by return rate, highest first. Not every
+        PostEx order can always be matched to a Shopify order -- check
+        match_rate in the response; a low match rate means treat the product
+        breakdown as a sample, not the full picture."""
+        fd, td = _default_range(from_date, to_date, days)
+        postex_orders, _ = await postex.get_orders_classified(status_id=0, from_date=fd, to_date=td)
+        shopify_orders = await shopify.get_all_orders_range(fd, td, status="any")
+        result = compute_product_return_breakdown(postex_orders, shopify_orders)
+        result["products"] = result["products"][:limit]
+        result["from_date"], result["to_date"] = fd, td
+        return result
 
     @mcp.tool()
     async def get_postex_repeat_customers(days: int = 90, from_date: Optional[str] = None, to_date: Optional[str] = None, min_orders: int = 2) -> dict:
@@ -942,5 +965,111 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
             "order_count": order_count, "notes": notes,
         })
         return {"ok": True, "payout": row}
+
+    # ── Filament inventory ───────────────────────────────────────────────────
+    @mcp.tool()
+    async def list_filament_types() -> dict:
+        """All stocked filament types (material + colour), e.g. 'PLA Black',
+        'PETG Red'. Use this to find a filament_type_id before logging a
+        purchase or resolving a needs-review item."""
+        return {"types": await db.list_filament_types()}
+
+    @mcp.tool()
+    async def add_filament_type(color: str, material: str = "PLA", reorder_threshold_grams: float = 200, spool_weight_grams: float = 1000, vendor_id: Optional[str] = None, notes: str = "") -> dict:
+        """Register a new filament type you stock (e.g. material='PLA',
+        color='Black'). WRITE action -- but low risk, just a catalog entry,
+        no confirm needed."""
+        row = await db.create_filament_type({
+            "material": material, "color": color,
+            "reorder_threshold_grams": reorder_threshold_grams, "spool_weight_grams": spool_weight_grams,
+            "vendor_id": vendor_id, "notes": notes,
+        })
+        return {"ok": True, "filament_type": row}
+
+    @mcp.tool()
+    async def log_filament_purchase(filament_type_id: str, grams: float, cost: float = 0, vendor_id: Optional[str] = None, purchase_date: Optional[str] = None, notes: str = "") -> dict:
+        """Log filament you just bought (e.g. a 1kg spool -> grams=1000),
+        adding it to that type's stock. WRITE action, no confirm needed --
+        this only adds stock, it can't remove or damage anything."""
+        row = await db.create_filament_purchase({
+            "filament_type_id": filament_type_id, "grams": grams, "cost": cost,
+            "vendor_id": vendor_id, "purchase_date": purchase_date or datetime.utcnow().date().isoformat(),
+            "notes": notes,
+        })
+        return {"ok": True, "purchase": row}
+
+    @mcp.tool()
+    async def get_filament_status(lead_time_days: int = 14) -> dict:
+        """Current stock, recent daily usage, projected days left, and a
+        reorder suggestion (in whole spools) for every filament type --
+        'when will I run out of X and how much should I buy'."""
+        types = await db.list_filament_types()
+        purchases = await db.list_filament_purchases()
+        consumption = await db.list_filament_consumption(days=60)
+        return {"status": compute_filament_status(types, purchases, consumption, lead_time_days=lead_time_days)}
+
+    @mcp.tool()
+    async def list_filament_needs_review() -> dict:
+        """Order line items that couldn't be auto-matched to a filament type
+        (multi-colour product, unstocked colour, no colour variant at all) --
+        each needs a one-time manual filament assignment via
+        resolve_filament_consumption."""
+        return {"items": await db.list_filament_needs_review()}
+
+    @mcp.tool()
+    async def resolve_filament_consumption(consumption_id: str, filament_type_id: str, grams: Optional[float] = None, remember_for_product: bool = False) -> dict:
+        """Manually assign a needs-review line item to the correct filament
+        type (optionally overriding the grams used). Set remember_for_product
+        =true to also save this as that product/variant's mapping so future
+        orders auto-match without needing review again. WRITE action, no
+        confirm needed -- this only corrects bookkeeping, not a live system."""
+        items = await db.list_filament_needs_review()
+        item = next((i for i in items if i["id"] == consumption_id), None)
+        await db.resolve_filament_consumption(consumption_id, filament_type_id, grams=grams)
+        if remember_for_product and item and item.get("product_id"):
+            await db.upsert_product_filament_link(
+                item["product_id"], item.get("variant_id"), filament_type_id,
+                grams if grams is not None else (item.get("grams") or 50),
+            )
+        return {"ok": True}
+
+    # ── Reminders / follow-ups ───────────────────────────────────────────────
+    @mcp.tool()
+    async def create_reminder(due_at: str, message: str, context: Optional[dict] = None) -> dict:
+        """Set a follow-up reminder for yourself to check back on something and
+        tell the human about it later (e.g. "check this ad's performance
+        tomorrow at 9am and report back"). due_at is an ISO date/time
+        (YYYY-MM-DDTHH:MM:SS, Pakistan local time). When it's due, it's pushed
+        to the human over whatever notification channels are configured
+        (Telegram/email) -- you don't need to still be in this conversation
+        for it to fire. WRITE action, no confirm needed -- it's just a note,
+        not a live system action."""
+        dt = datetime.fromisoformat(due_at)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=PKT)  # bare date/times are assumed Pakistan local, not UTC
+        row = await db.create_reminder(dt.isoformat(), message, context=context)
+        return {"ok": True, "reminder": row}
+
+    @mcp.tool()
+    async def list_reminders(status: Optional[str] = None) -> dict:
+        """Your pending/sent/cancelled reminders. status filters to one of
+        those three if given, otherwise all of them."""
+        return {"reminders": await db.list_reminders(status=status)}
+
+    @mcp.tool()
+    async def cancel_reminder(reminder_id: str) -> dict:
+        """Cancel a pending reminder that's no longer needed. WRITE action, no confirm needed."""
+        await db.cancel_reminder(reminder_id)
+        return {"ok": True}
+
+    # ── Notifications ────────────────────────────────────────────────────────
+    @mcp.tool()
+    async def send_test_notification(message: str = "Test notification from TDPK Manager.") -> dict:
+        """Sends a test push to every configured phone channel (Telegram/
+        email) right now, so the human can confirm their setup actually
+        works. Reports which channels are configured and whether each send
+        succeeded. WRITE action (sends a real message), no confirm needed --
+        it's explicitly a test, harmless to send."""
+        return await notify_all("TDPK Manager test", message, db=db)
 
     return mcp

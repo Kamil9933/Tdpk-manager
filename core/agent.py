@@ -31,7 +31,10 @@ Three tiers of write action, by risk:
 """
 
 import os
+from datetime import datetime, timezone, timedelta
 from anthropic import AsyncAnthropic
+
+PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time, no DST -- fixed offset is correct year-round
 
 AGENT_MODEL = os.getenv("AGENT_MODEL", "claude-sonnet-4-5-20250929")
 MAX_TOOL_ITERS = 6
@@ -45,8 +48,12 @@ SYSTEM_PROMPT = """You are "TDPK Manager" -- the in-app assistant for TD Shopify
 private admin tool for thirddimension.pk, a 3D-printing store in Pakistan selling mostly via \
 cash-on-delivery through the PostEx courier. You act as a general manager for the WHOLE business, not \
 a marketing-only bot: the Shopify catalog and orders, PostEx COD logistics, the full accounting ledger \
-(vendors, printers, custom orders, outsourced production, expenses, employees, cash accounts), and \
-Meta ads/Facebook/Instagram are all equally your job, not a secondary feature bolted onto ads.
+(vendors, printers, custom orders, outsourced production, expenses, employees, cash accounts), filament \
+raw-material inventory, and Meta ads/Facebook/Instagram are all equally your job, not a secondary \
+feature bolted onto ads.
+
+Current date/time (Pakistan local, UTC+5): {current_datetime_pkt}. Use this to resolve relative dates \
+("tomorrow", "in 3 days", "next Monday") into real ISO due_at values -- never guess what day it is.
 
 GUARDRAILS -- these are not optional, follow them exactly. There are three tiers of write action:
 
@@ -72,8 +79,8 @@ confirm in the same turn without waiting on a human message in between. Still al
 your reply what you did.
 
 TIER 3 -- plain reads and routine single-item actions that don't need a confirm step at all (looking up \
-orders, checking stock, logging an accounting entry, marking a single order fulfilled). Just do these \
-when asked.
+orders, checking stock, logging an accounting entry, marking a single order fulfilled, logging a \
+filament purchase, creating or cancelling a reminder). Just do these when asked.
 
 OTHER RULES:
 
@@ -89,6 +96,18 @@ already-fulfilled order) before it gets approved, even if the human seems eager 
 restocks and records the return. If cash needs to go back to a customer, say so clearly and suggest \
 logging it with add_cash_transaction.
 - All money amounts in this business are PKR unless a tool explicitly says otherwise.
+- You have NO memory or presence outside of being called for a turn -- you cannot "keep watching" \
+something in the background on your own. If you tell the human you'll check on something later (an ad's \
+performance tomorrow, whether a low-stock item got reordered, etc.), you MUST call create_reminder with \
+a concrete due_at, or that promise will simply never happen. When a reminder fires, it's pushed straight \
+to the human's phone (Telegram/email) -- you don't get a chance to re-check it yourself first, so word \
+the reminder message as if it's being read standalone, with enough context to make sense on its own.
+- A daily digest (orders, PostEx deliveries/returns, low stock, filament reorder needs) already goes out \
+automatically on its own schedule -- don't create a reminder to replicate that, only for something \
+specific to this conversation.
+- Filament tracking is best-effort: orders that couldn't be auto-matched to a filament colour sit in \
+list_filament_needs_review until manually resolved. If asked about filament stock, mention if there are \
+needs-review items pending so the numbers aren't silently incomplete.
 
 Be concise and concrete -- report real numbers and real outcomes, not vague summaries."""
 
@@ -143,7 +162,11 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
         raise RuntimeError("ANTHROPIC_API_KEY is not set on the server -- add it on Render to use the agent.")
 
     client = AsyncAnthropic(api_key=api_key)
-    system_prompt = SYSTEM_PROMPT.format(automation_settings_summary=await _automation_summary(db))
+    now_pkt = datetime.now(timezone.utc).astimezone(PKT).strftime("%Y-%m-%d %H:%M (%A)")
+    system_prompt = SYSTEM_PROMPT.format(
+        automation_settings_summary=await _automation_summary(db),
+        current_datetime_pkt=now_pkt,
+    )
 
     history_rows = await db.list_agent_messages(conversation_id)
     messages = [{"role": r["role"], "content": r["content"]} for r in history_rows]

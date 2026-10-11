@@ -1,6 +1,6 @@
 import os, json, asyncio, hashlib, csv, io
 from contextlib import asynccontextmanager, AsyncExitStack
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +19,10 @@ from core.accounting import generate_pnl, straight_line_depreciation, calc_cash_
 from core.meta import MetaClient, MetaError
 from core.mcp_server import build_mcp_server, MCPAuthMiddleware
 from core.agent import run_agent_turn
+from core.notify import notify_all
+from core.digest import generate_digest
+from core.filament import deduct_filament_for_order, compute_filament_status
+from core.returns import compute_product_return_breakdown
 
 shopify = ShopifyClient(
     store=os.getenv("SHOPIFY_STORE", "1gdih3-zv.myshopify.com"),
@@ -275,7 +279,8 @@ async def fulfill_order(order_id: int, request: Request, session=Depends(verify_
             }
         }
         result = await shopify._post("/fulfillments.json", payload)
-        return {"ok": True, "fulfillment": result}
+        filament_result = await deduct_filament_for_order(db, shopify, order_id)
+        return {"ok": True, "fulfillment": result, "filament": filament_result}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1146,6 +1151,167 @@ async def accounting_export(from_date: str = None, to_date: str = None, session=
         content=buf.getvalue(), media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="tdpk_accounts_{from_date}_to_{to_date}.csv"'}
     )
+
+# ── Accounting: Filament inventory ───────────────────────────────────────────
+@app.get("/api/accounting/filament-types")
+async def list_filament_types_route(session=Depends(verify_session)):
+    return {"types": await db.list_filament_types()}
+
+@app.post("/api/accounting/filament-types")
+async def create_filament_type_route(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    row = await db.create_filament_type({
+        "material": data.get("material", "PLA"),
+        "color": data.get("color", "Unnamed"),
+        "reorder_threshold_grams": float(data.get("reorder_threshold_grams") or 200),
+        "spool_weight_grams": float(data.get("spool_weight_grams") or 1000),
+        "vendor_id": data.get("vendor_id"),
+        "notes": data.get("notes", ""),
+    })
+    return {"ok": True, "type": row}
+
+@app.put("/api/accounting/filament-types/{type_id}")
+async def update_filament_type_route(type_id: str, request: Request, session=Depends(verify_session)):
+    await db.update_filament_type(type_id, await request.json())
+    return {"ok": True}
+
+@app.delete("/api/accounting/filament-types/{type_id}")
+async def delete_filament_type_route(type_id: str, session=Depends(verify_session)):
+    await db.delete_filament_type(type_id)
+    return {"ok": True}
+
+@app.get("/api/accounting/filament-purchases")
+async def list_filament_purchases_route(from_date: str = None, to_date: str = None, session=Depends(verify_session)):
+    return {"purchases": await db.list_filament_purchases(from_date, to_date)}
+
+@app.post("/api/accounting/filament-purchases")
+async def create_filament_purchase_route(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    row = await db.create_filament_purchase({
+        "filament_type_id": data.get("filament_type_id"),
+        "grams": float(data.get("grams") or 0),
+        "cost": float(data.get("cost") or 0),
+        "vendor_id": data.get("vendor_id"),
+        "purchase_date": data.get("purchase_date") or datetime.utcnow().date().isoformat(),
+        "notes": data.get("notes", ""),
+    })
+    return {"ok": True, "purchase": row}
+
+@app.delete("/api/accounting/filament-purchases/{purchase_id}")
+async def delete_filament_purchase_route(purchase_id: str, session=Depends(verify_session)):
+    await db.delete_filament_purchase(purchase_id)
+    return {"ok": True}
+
+@app.get("/api/accounting/filament-status")
+async def filament_status_route(lead_time_days: int = 14, session=Depends(verify_session)):
+    types = await db.list_filament_types()
+    purchases = await db.list_filament_purchases()
+    consumption = await db.list_filament_consumption(days=60)
+    return {"status": compute_filament_status(types, purchases, consumption, lead_time_days=lead_time_days)}
+
+@app.get("/api/accounting/filament-needs-review")
+async def filament_needs_review_route(session=Depends(verify_session)):
+    return {"items": await db.list_filament_needs_review()}
+
+@app.post("/api/accounting/filament-consumption/{consumption_id}/resolve")
+async def resolve_filament_consumption_route(consumption_id: str, request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    filament_type_id = data.get("filament_type_id")
+    if not filament_type_id:
+        raise HTTPException(status_code=400, detail="filament_type_id is required")
+    grams = data.get("grams")
+    items = await db.list_filament_needs_review()
+    item = next((i for i in items if i["id"] == consumption_id), None)
+    await db.resolve_filament_consumption(consumption_id, filament_type_id, grams=float(grams) if grams is not None else None)
+    if data.get("remember_for_product") and item and item.get("product_id"):
+        await db.upsert_product_filament_link(
+            item["product_id"], item.get("variant_id"), filament_type_id,
+            float(grams) if grams is not None else (item.get("grams") or 50),
+        )
+    return {"ok": True}
+
+# ── Product-level return breakdown (PostEx x Shopify cross-reference) ───────
+@app.get("/api/postex/product-returns")
+async def product_returns_route(days: int = 30, from_date: str = None, to_date: str = None, session=Depends(verify_session)):
+    if not to_date:
+        to_date = datetime.now().strftime("%Y-%m-%d")
+    if not from_date:
+        from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    postex_orders, _ = await postex.get_orders_classified(status_id=0, from_date=from_date, to_date=to_date)
+    shopify_orders = await shopify.get_all_orders_range(from_date, to_date, status="any")
+    result = compute_product_return_breakdown(postex_orders, shopify_orders)
+    result["from_date"], result["to_date"] = from_date, to_date
+    return result
+
+# ── Reminders (agent follow-ups) ─────────────────────────────────────────────
+@app.get("/api/reminders")
+async def list_reminders_route(status: str = None, session=Depends(verify_session)):
+    return {"reminders": await db.list_reminders(status=status)}
+
+@app.post("/api/reminders/{reminder_id}/cancel")
+async def cancel_reminder_route(reminder_id: str, session=Depends(verify_session)):
+    await db.cancel_reminder(reminder_id)
+    return {"ok": True}
+
+# ── Notifications: test send ──────────────────────────────────────────────────
+@app.post("/api/notifications/test")
+async def test_notification_route(session=Depends(verify_session)):
+    return await notify_all("TDPK Manager test", "This is a test notification from your dashboard.", db=db)
+
+# ── Cron / scheduled jobs ─────────────────────────────────────────────────────
+# Render's free plan has no built-in scheduler and the web service spins down
+# when idle, so an external pinger (a GitHub Actions workflow in this repo --
+# see .github/workflows/cron-tick.yml -- or any free cron-ping service) hits
+# this endpoint periodically (every 30 min recommended) to both wake the
+# service up and drive anything time-based: the digest and due reminders.
+# Idempotent per digest slot (digest_log) and per reminder (status flips to
+# 'sent'), so pinging more often than needed is always safe, never causes a
+# duplicate send.
+CRON_SECRET = os.getenv("CRON_SECRET", "")
+PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time -- fixed UTC+5 offset, no DST
+
+def _digest_slots():
+    raw = os.getenv("DIGEST_TIMES", "09:00,21:00")
+    slots = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            hh, mm = part.split(":")
+            slots.append((int(hh), int(mm)))
+        except ValueError:
+            continue
+    return slots or [(9, 0)]
+
+@app.post("/api/cron/tick")
+async def cron_tick(request: Request):
+    if not CRON_SECRET or request.headers.get("X-Cron-Secret") != CRON_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid or missing cron secret")
+
+    fired = {"digests": [], "reminders": 0}
+    now_pkt = datetime.now(timezone.utc).astimezone(PKT)
+
+    for hh, mm in _digest_slots():
+        # Fires once current PKT time has reached-or-passed the slot within
+        # the SAME hour (so a ping cadence that isn't exactly on the minute
+        # still catches it), but a ping outage of several hours doesn't fire
+        # a stale digest hours late once service resumes.
+        if now_pkt.hour == hh and now_pkt.minute >= mm:
+            slot_key = f"{now_pkt.date().isoformat()}:{hh:02d}:{mm:02d}"
+            if not await db.digest_already_sent(slot_key):
+                text = await generate_digest(db, shopify, postex)
+                await notify_all(f"TDPK daily digest ({hh:02d}:{mm:02d})", text, db=db)
+                await db.mark_digest_sent(slot_key)
+                fired["digests"].append(slot_key)
+
+    due = await db.list_due_reminders()
+    for r in due:
+        await notify_all("TDPK Manager reminder", r["message"], db=db)
+        await db.mark_reminder_sent(r["id"])
+        fired["reminders"] += 1
+
+    return {"ok": True, "now_pkt": now_pkt.isoformat(), "fired": fired}
 
 # ── MCP connector ─────────────────────────────────────────────────────────────
 # Mounted last (and at root "/") so it never shadows any of the specific routes

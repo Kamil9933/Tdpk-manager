@@ -354,4 +354,111 @@ class Database:
             data["title"] = title
         get_client().table("agent_conversations").update(data).eq("id", conversation_id).execute()
 
+    # ── Filament inventory ────────────────────────────────────────────────────
+    async def list_filament_types(self): return await self._list("filament_types", order_col="color", desc=False)
+    async def create_filament_type(self, data): return await self._insert("filament_types", data)
+    async def update_filament_type(self, tid, data): await self._update("filament_types", tid, data)
+    async def delete_filament_type(self, tid): await self._delete("filament_types", tid)
+
+    async def list_filament_purchases(self, from_date=None, to_date=None):
+        return await self._list_ranged("filament_purchases", "purchase_date", from_date, to_date)
+    async def create_filament_purchase(self, data): return await self._insert("filament_purchases", data)
+    async def delete_filament_purchase(self, pid): await self._delete("filament_purchases", pid)
+
+    async def list_filament_consumption(self, days=90):
+        try:
+            since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+            res = (get_client().table("filament_consumption").select("*")
+                   .gte("created_at", since).order("created_at", desc=True).execute())
+            return res.data
+        except Exception:
+            return []
+
+    async def list_filament_needs_review(self, limit=50):
+        try:
+            res = (get_client().table("filament_consumption").select("*")
+                   .eq("matched", "needs_review").order("created_at", desc=False).limit(limit).execute())
+            return res.data
+        except Exception:
+            return []
+
+    async def create_filament_consumption(self, data): return await self._insert("filament_consumption", data)
+
+    async def resolve_filament_consumption(self, consumption_id, filament_type_id, grams=None):
+        data = {"filament_type_id": filament_type_id, "matched": "manual"}
+        if grams is not None:
+            data["grams"] = grams
+        await self._update("filament_consumption", consumption_id, data)
+
+    async def order_has_filament_consumption(self, shopify_order_id):
+        try:
+            res = (get_client().table("filament_consumption").select("id")
+                   .eq("shopify_order_id", shopify_order_id).limit(1).execute())
+            return bool(res.data)
+        except Exception:
+            return False
+
+    async def get_product_filament_link(self, product_id, variant_id=None):
+        try:
+            q = get_client().table("product_filament_links").select("*").eq("product_id", product_id)
+            q = q.eq("variant_id", variant_id) if variant_id is not None else q.is_("variant_id", "null")
+            res = q.execute()
+            return res.data[0] if res.data else None
+        except Exception:
+            return None
+
+    async def upsert_product_filament_link(self, product_id, variant_id, filament_type_id, grams_per_unit):
+        try:
+            get_client().table("product_filament_links").upsert({
+                "product_id": product_id, "variant_id": variant_id,
+                "filament_type_id": filament_type_id, "grams_per_unit": grams_per_unit,
+                "updated_at": datetime.utcnow().isoformat(),
+            }, on_conflict="product_id,variant_id").execute()
+        except Exception:
+            pass
+
+    # ── Agent reminders (follow-ups the Manager chat sets for itself) ────────
+    async def create_reminder(self, due_at, message, context=None):
+        return await self._insert("agent_reminders", {
+            "due_at": due_at, "message": message, "context": context or {},
+        })
+
+    async def list_reminders(self, status=None):
+        try:
+            q = get_client().table("agent_reminders").select("*").order("due_at")
+            if status:
+                q = q.eq("status", status)
+            return q.execute().data
+        except Exception:
+            return []
+
+    async def list_due_reminders(self):
+        try:
+            now = datetime.utcnow().isoformat()
+            res = (get_client().table("agent_reminders").select("*")
+                   .eq("status", "pending").lte("due_at", now).execute())
+            return res.data
+        except Exception:
+            return []
+
+    async def mark_reminder_sent(self, reminder_id):
+        await self._update("agent_reminders", reminder_id, {"status": "sent", "sent_at": datetime.utcnow().isoformat()})
+
+    async def cancel_reminder(self, reminder_id):
+        await self._update("agent_reminders", reminder_id, {"status": "cancelled"})
+
+    # ── Digest send-log (idempotency for the twice-daily digest) ─────────────
+    async def digest_already_sent(self, slot):
+        try:
+            res = get_client().table("digest_log").select("id").eq("slot", slot).limit(1).execute()
+            return bool(res.data)
+        except Exception:
+            return False
+
+    async def mark_digest_sent(self, slot):
+        try:
+            get_client().table("digest_log").insert({"slot": slot}).execute()
+        except Exception:
+            pass
+
 db = Database()
