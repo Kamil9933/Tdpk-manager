@@ -1264,9 +1264,25 @@ async def test_notification_route(session=Depends(verify_session)):
 # tightened) auth actually lets this account read bound-printer status at
 # all before building anything that depends on it. Session-gated like every
 # other admin route since the raw responses could include token material.
+def _redact_tokens(obj):
+    """Walks a dict/list and masks any value whose key looks like a token,
+    so a live credential never round-trips into a browser console or a chat
+    transcript -- the real value is still stored server-side separately."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(v, str) and len(v) > 12 and ("token" in k.lower() or k.lower() in ("jwt", "refreshtoken")):
+                out[k] = v[:6] + "…redacted…" + v[-4:]
+            else:
+                out[k] = _redact_tokens(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact_tokens(x) for x in obj]
+    return obj
+
 @app.post("/api/printers/bambu/login-start")
 async def bambu_login_start_route(session=Depends(verify_session)):
-    return await bambu_cloud.login_start()
+    return _redact_tokens(await bambu_cloud.login_start())
 
 @app.post("/api/printers/bambu/login-verify")
 async def bambu_login_verify_route(request: Request, session=Depends(verify_session)):
@@ -1274,7 +1290,7 @@ async def bambu_login_verify_route(request: Request, session=Depends(verify_sess
     result = await bambu_cloud.login_verify(body.get("code", ""))
     if result.get("ok") and result.get("raw", {}).get("accessToken"):
         await db.update_cost_settings({"bambu_access_token": result["raw"]["accessToken"]})
-    return result
+    return _redact_tokens(result)
 
 @app.post("/api/printers/bambu/status-test")
 async def bambu_status_test_route(session=Depends(verify_session)):
@@ -1282,7 +1298,7 @@ async def bambu_status_test_route(session=Depends(verify_session)):
     token = settings.get("bambu_access_token", "")
     if not token:
         return {"ok": False, "error": "No stored token yet -- run login-start then login-verify first."}
-    return await bambu_cloud.list_bound_devices(token)
+    return _redact_tokens(await bambu_cloud.list_bound_devices(token))
 
 # ── Telegram bot (two-way: the Manager agent talking back through Telegram) ──
 # Telegram pushes updates here via webhook (registered once -- see the URL in
