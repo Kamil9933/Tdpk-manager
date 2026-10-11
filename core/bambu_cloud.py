@@ -99,6 +99,18 @@ async def list_bound_devices(access_token: str) -> dict:
         return {"http_status": resp.status_code, "raw": _safe_json(resp)}
 
 
+async def get_print_status(access_token: str) -> dict:
+    """Finer-grained than list_bound_devices: this endpoint (used by Bambu's
+    own slicer) includes per-device task fields -- task_name (what's being
+    printed), progress, prediction (time remaining), task_status, start_time
+    -- not just the coarse online/RUNNING state. Community-documented, not
+    officially published, so treat field meaning/units as unverified until we
+    see a real in-progress job come back through it."""
+    async with httpx.AsyncClient(timeout=20, headers={"User-Agent": UA, "Authorization": f"Bearer {access_token}"}) as client:
+        resp = await client.get(f"{BASE}/v1/iot-service/api/user/print", params={"force": "true"})
+        return {"http_status": resp.status_code, "raw": _safe_json(resp)}
+
+
 def _safe_json(resp) -> dict:
     try:
         return resp.json()

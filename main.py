@@ -1271,8 +1271,9 @@ def _redact_tokens(obj):
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            if isinstance(v, str) and len(v) > 12 and ("token" in k.lower() or k.lower() in ("jwt", "refreshtoken")):
-                out[k] = v[:6] + "…redacted…" + v[-4:]
+            is_sensitive_key = "token" in k.lower() or k.lower() in ("jwt", "refreshtoken", "dev_access_code", "access_code")
+            if isinstance(v, str) and len(v) > 5 and is_sensitive_key:
+                out[k] = v[:2] + "…redacted…" + v[-2:] if len(v) > 12 else "…redacted…"
             else:
                 out[k] = _redact_tokens(v)
         return out
@@ -1289,7 +1290,14 @@ async def bambu_login_verify_route(request: Request, session=Depends(verify_sess
     body = await request.json()
     result = await bambu_cloud.login_verify(body.get("code", ""))
     if result.get("ok") and result.get("raw", {}).get("accessToken"):
-        await db.update_cost_settings({"bambu_access_token": result["raw"]["accessToken"]})
+        await db.update_cost_settings({
+            "bambu_access_token": result["raw"]["accessToken"],
+            # Community-documented expiresIn is ~7,776,000s (~90 days) but
+            # unverified against Bambu's own docs (they don't publish any) --
+            # storing when we got it lets us warn before it goes stale
+            # instead of finding out when a poll silently starts failing.
+            "bambu_token_obtained_at": datetime.utcnow().isoformat(),
+        })
     return _redact_tokens(result)
 
 @app.post("/api/printers/bambu/status-test")
@@ -1299,6 +1307,18 @@ async def bambu_status_test_route(session=Depends(verify_session)):
     if not token:
         return {"ok": False, "error": "No stored token yet -- run login-start then login-verify first."}
     return _redact_tokens(await bambu_cloud.list_bound_devices(token))
+
+@app.post("/api/printers/bambu/print-status-test")
+async def bambu_print_status_test_route(session=Depends(verify_session)):
+    """Community docs (OpenBambuAPI) describe this endpoint as returning
+    per-device task_name/progress/prediction -- i.e. what's printing, how far
+    along, and time left -- which /bind does not. Unverified until we see it
+    return real non-null values for a job that's actually running."""
+    settings = await db.get_cost_settings()
+    token = settings.get("bambu_access_token", "")
+    if not token:
+        return {"ok": False, "error": "No stored token yet -- run login-start then login-verify first."}
+    return _redact_tokens(await bambu_cloud.get_print_status(token))
 
 # ── Telegram bot (two-way: the Manager agent talking back through Telegram) ──
 # Telegram pushes updates here via webhook (registered once -- see the URL in
