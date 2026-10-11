@@ -23,6 +23,7 @@ from core.notify import notify_all, send_telegram, format_for_telegram, TELEGRAM
 from core.digest import generate_digest
 from core.filament import deduct_filament_for_order, compute_filament_status
 from core.returns import compute_product_return_breakdown
+from core import bambu_cloud
 
 shopify = ShopifyClient(
     store=os.getenv("SHOPIFY_STORE", "1gdih3-zv.myshopify.com"),
@@ -1257,6 +1258,31 @@ async def cancel_reminder_route(reminder_id: str, session=Depends(verify_session
 @app.post("/api/notifications/test")
 async def test_notification_route(session=Depends(verify_session)):
     return await notify_all("TDPK Manager test", "This is a test notification from your dashboard.", db=db)
+
+# ── Bambu Cloud login: diagnostic only, not yet wired into anything ──────────
+# Step one of the printer-status work -- confirms Bambu's current (recently
+# tightened) auth actually lets this account read bound-printer status at
+# all before building anything that depends on it. Session-gated like every
+# other admin route since the raw responses could include token material.
+@app.post("/api/printers/bambu/login-start")
+async def bambu_login_start_route(session=Depends(verify_session)):
+    return await bambu_cloud.login_start()
+
+@app.post("/api/printers/bambu/login-verify")
+async def bambu_login_verify_route(request: Request, session=Depends(verify_session)):
+    body = await request.json()
+    result = await bambu_cloud.login_verify(body.get("code", ""))
+    if result.get("ok") and result.get("raw", {}).get("accessToken"):
+        await db.update_cost_settings({"bambu_access_token": result["raw"]["accessToken"]})
+    return result
+
+@app.post("/api/printers/bambu/status-test")
+async def bambu_status_test_route(session=Depends(verify_session)):
+    settings = await db.get_cost_settings()
+    token = settings.get("bambu_access_token", "")
+    if not token:
+        return {"ok": False, "error": "No stored token yet -- run login-start then login-verify first."}
+    return await bambu_cloud.list_bound_devices(token)
 
 # ── Telegram bot (two-way: the Manager agent talking back through Telegram) ──
 # Telegram pushes updates here via webhook (registered once -- see the URL in

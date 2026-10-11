@@ -77,3 +77,11 @@ services:
       # send times. Defaults to "09:00,21:00" if unset.
       - key: DIGEST_TIMES
         sync: false
+      # Bambu Cloud account (read-only use -- see core/bambu_cloud.py). This
+      # account has 2FA on, so the login flow needs a one-time emailed code
+      # via /api/printers/bambu/login-start then /login-verify; the resulting
+      # token is cached in cost_settings, not re-derived from these every call.
+      - key: BAMBU_CLOUD_EMAIL
+        sync: false
+      - key: BAMBU_CLOUD_PASSWORD
+        sync: false
