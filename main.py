@@ -1344,6 +1344,191 @@ async def bambu_mqtt_status_test_route(request: Request, session=Depends(verify_
     result = await bambu_cloud.mqtt_get_live_status(token, uid_result["uid"], dev_id)
     return _redact_tokens(result)
 
+# ── Print Queue ───────────────────────────────────────────────────────────────
+# Backs the dashboard's "Print Queue" tab -- replaces q.thirddimension.pk's
+# PHP/queue_data.json setup with the shared `print_queue` Supabase table
+# (see the create_print_queue migration + the one-time 373-row migration from
+# the legacy JSON). Single login, no separate staff PIN -- confirmed only one
+# person (the owner) manages the queue, so q.tdpk's PIN/staff-role layer was
+# deliberately not rebuilt here.
+QUEUE_STATUSES = ("queued", "printing", "paused", "done", "shipped", "archived")
+
+@app.get("/api/queue")
+async def list_queue(status: str = None, printer: str = None, session=Depends(verify_session)):
+    statuses = [s.strip() for s in status.split(",")] if status else None
+    jobs = await db.list_queue(statuses=statuses, printer=printer)
+    return {"jobs": jobs}
+
+@app.get("/api/queue/summary")
+async def queue_summary(session=Depends(verify_session)):
+    jobs = await db.list_queue()
+    by_status, by_printer = {}, {}
+    for j in jobs:
+        by_status[j.get("status") or "unknown"] = by_status.get(j.get("status") or "unknown", 0) + 1
+        if j.get("status") in ("queued", "printing", "paused"):
+            key = j.get("printer") or "unassigned"
+            by_printer[key] = by_printer.get(key, 0) + 1
+    return {"total": len(jobs), "by_status": by_status, "by_printer": by_printer}
+
+@app.post("/api/queue")
+async def create_queue_job_route(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    row = await db.create_queue_job({
+        "name": data.get("name", "Untitled job"),
+        "type": data.get("type", "custom"),
+        "priority": data.get("priority", "normal"),
+        "customer": data.get("customer", ""),
+        "order_id": data.get("order_id", ""),
+        "phone": data.get("phone", ""),
+        "cod_amount": float(data.get("cod_amount") or 0),
+        "print_time_hours": float(data.get("print_time_hours") or 0),
+        "qty": int(data.get("qty") or 1),
+        "material": data.get("material", ""),
+        "colour": data.get("colour", ""),
+        "printer": data.get("printer"),
+        "notes": data.get("notes", ""),
+        "status": data.get("status", "queued"),
+        "image": data.get("image"),
+    })
+    return {"ok": True, "job": row}
+
+@app.put("/api/queue/{job_id}")
+async def update_queue_job_route(job_id: str, request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    patch = {k: v for k, v in data.items() if k in (
+        "name", "type", "priority", "customer", "order_id", "phone", "cod_amount",
+        "print_time_hours", "qty", "material", "colour", "printer", "postex_tracking",
+        "notes", "status", "image",
+    )}
+    # Stamp the matching timestamp whenever a status actually changes, same
+    # fields the legacy q.tdpk queue tracked (printingStarted/completedAt/
+    # shippedAt) -- lets the dashboard show "started 2h ago" etc.
+    if "status" in patch:
+        now = datetime.utcnow().isoformat()
+        if patch["status"] == "printing":
+            patch["printing_started_at"] = now
+        elif patch["status"] == "done":
+            patch["completed_at"] = now
+        elif patch["status"] == "shipped":
+            patch["shipped_at"] = now
+        elif patch["status"] == "archived":
+            patch["auto_archived_at"] = now
+    await db.update_queue_job(job_id, patch)
+    return {"ok": True}
+
+@app.delete("/api/queue/{job_id}")
+async def delete_queue_job_route(job_id: str, session=Depends(verify_session)):
+    await db.delete_queue_job(job_id)
+    return {"ok": True}
+
+@app.post("/api/queue/fetch-orders")
+async def fetch_queue_orders(session=Depends(verify_session)):
+    """Pulls unfulfilled Shopify orders into the queue, one row per line
+    item -- mirrors q.tdpk's fetch_orders action. Dedupes on
+    (shopify_order_id, shopify_item_id) so re-running this is always safe."""
+    orders = await shopify.get_orders(status="open")
+    product_ids = {li["product_id"] for o in orders for li in o.get("line_items", []) if li.get("product_id")}
+    images_by_product = {}
+    if product_ids:
+        products = await shopify.get_products_by_ids(list(product_ids))
+        for p in products:
+            img = (p.get("image") or {}).get("src")
+            if img:
+                images_by_product[p["id"]] = img
+
+    created = 0
+    for o in orders:
+        if o.get("fulfillment_status") == "fulfilled" or o.get("cancelled_at"):
+            continue
+        customer = o.get("customer") or {}
+        cust_name = f"{customer.get('first_name','')} {customer.get('last_name','')}".strip() or (o.get("email") or "Guest")
+        phone = o.get("phone") or (o.get("shipping_address") or {}).get("phone") or customer.get("phone") or ""
+        for li in o.get("line_items", []):
+            if await db.find_queue_job_by_line_item(o["id"], li["id"]):
+                continue
+            await db.create_queue_job({
+                "name": li.get("name") or li.get("title") or "Unnamed item",
+                "type": "website",
+                "priority": "normal",
+                "customer": cust_name,
+                "order_id": f"#{o.get('order_number')}",
+                "phone": phone,
+                "cod_amount": float(o.get("total_price") or 0),
+                "qty": li.get("quantity", 1),
+                "material": "",
+                "colour": "",
+                "notes": f"Qty: {li.get('quantity', 1)}",
+                "status": "queued",
+                "image": images_by_product.get(li.get("product_id")),
+                "shopify_order_id": str(o["id"]),
+                "shopify_item_id": str(li["id"]),
+                "shopify_customer_id": str(customer.get("id")) if customer.get("id") else None,
+                "created_at": o.get("created_at"),
+            })
+            created += 1
+    return {"ok": True, "created": created, "orders_checked": len(orders)}
+
+@app.post("/api/queue/{job_id}/fulfill")
+async def fulfill_queue_job(job_id: str, request: Request, session=Depends(verify_session)):
+    body = await request.json()
+    tracking_number = body.get("tracking_number", "")
+    job = await db.get_queue_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("shopify_order_id"):
+        order_id = int(job["shopify_order_id"])
+        fo_data = await shopify._get(f"/orders/{order_id}/fulfillment_orders.json")
+        if fo_data.get("fulfillment_orders"):
+            fo_id = fo_data["fulfillment_orders"][0]["id"]
+            try:
+                await shopify._post("/fulfillments.json", {
+                    "fulfillment": {
+                        "line_items_by_fulfillment_order": [{"fulfillment_order_id": fo_id}],
+                        "tracking_info": {"number": tracking_number} if tracking_number else {},
+                    }
+                })
+                await deduct_filament_for_order(db, shopify, order_id)
+            except Exception as e:
+                # Shopify side may already be fulfilled by another route (e.g.
+                # the Orders tab) -- don't block updating the local queue row.
+                pass
+    await db.update_queue_job(job_id, {
+        "status": "shipped", "postex_tracking": tracking_number,
+        "shipped_at": datetime.utcnow().isoformat(),
+    })
+    return {"ok": True}
+
+@app.post("/api/queue/{job_id}/cancel")
+async def cancel_queue_job(job_id: str, request: Request, session=Depends(verify_session)):
+    body = await request.json()
+    job = await db.get_queue_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("shopify_order_id") and body.get("cancel_shopify"):
+        try:
+            await shopify._post(f"/orders/{job['shopify_order_id']}/cancel.json", {
+                "reason": body.get("reason", "customer"), "restock": body.get("restock", True), "email": False,
+            })
+        except Exception:
+            pass
+    await db.update_queue_job(job_id, {"status": "archived", "auto_archived_at": datetime.utcnow().isoformat()})
+    return {"ok": True}
+
+@app.get("/api/queue/customer-history")
+async def queue_customer_history(phone: str, session=Depends(verify_session)):
+    local_jobs = await db.list_queue_by_phone(phone)
+    shopify_orders = []
+    try:
+        all_orders = await shopify.get_all_orders(status="any", days=365)
+        shopify_orders = [
+            o for o in all_orders
+            if phone and phone.replace("+92", "0").replace(" ", "") in
+               ((o.get("phone") or "") + (o.get("shipping_address") or {}).get("phone", "")).replace("+92", "0").replace(" ", "")
+        ]
+    except Exception:
+        pass
+    return {"queue_jobs": local_jobs, "shopify_orders": shopify_orders}
+
 # ── Telegram bot (two-way: the Manager agent talking back through Telegram) ──
 # Telegram pushes updates here via webhook (registered once -- see the URL in
 # core/notify.py's module docstring) rather than us polling for them, which
@@ -1449,6 +1634,7 @@ async def cron_tick(request: Request):
         fired["reminders"] += 1
 
     fired["printers_polled"] = await _poll_bambu_printers()
+    fired["queue_synced"] = await _sync_queue_with_printers()
 
     return {"ok": True, "now_pkt": now_pkt.isoformat(), "fired": fired}
 
@@ -1516,6 +1702,57 @@ async def _poll_bambu_printers() -> int:
                 continue  # one printer's failure shouldn't skip the others
 
         return polled
+    except Exception:
+        return 0
+
+async def _sync_queue_with_printers() -> int:
+    """Keeps print_queue job statuses lined up with what the printers are
+    actually doing -- the owner explicitly asked for the dashboard to "keep
+    the queue updated" rather than just display it. Runs right after
+    _poll_bambu_printers() in the same tick so it reads a fresh live_status.
+    Matching is by printers.name against print_queue.printer (both free-text
+    labels like 'bambu1'/'bambu2') -- same convention the legacy q.tdpk queue
+    used, and the data already migrated from it uses those same values.
+
+    Deliberately conservative: never touches a job with no printer assigned,
+    and never guesses which queued job to start if staff haven't assigned one
+    to that printer yet.
+      - printer reports RUNNING and has no job already 'printing' on it ->
+        promote the oldest 'queued' job assigned to that printer to
+        'printing'.
+      - printer reports FINISH/IDLE and has a job 'printing' on it -> mark
+        that job 'done' (staff still manually move it to 'shipped' once
+        packed/fulfilled, via the queue tab's Fulfill action).
+    Best-effort throughout -- one printer's or job's failure never blocks
+    another, and this must never raise into the cron tick."""
+    try:
+        printers = [p for p in await db.list_printers() if p.get("bambu_dev_id") and p.get("name")]
+        transitioned = 0
+        for p in printers:
+            try:
+                live = p.get("live_status")
+                live = json.loads(live) if isinstance(live, str) else (live or {})
+                state = live.get("gcode_state")
+                printer_name = p["name"]
+                if state == "RUNNING":
+                    if not await db.list_queue_by_printer_status(printer_name, "printing"):
+                        queued = await db.list_queue_by_printer_status(printer_name, "queued")
+                        if queued:
+                            await db.update_queue_job(queued[0]["id"], {
+                                "status": "printing",
+                                "printing_started_at": datetime.utcnow().isoformat(),
+                            })
+                            transitioned += 1
+                elif state in ("FINISH", "IDLE"):
+                    for job in await db.list_queue_by_printer_status(printer_name, "printing"):
+                        await db.update_queue_job(job["id"], {
+                            "status": "done",
+                            "completed_at": datetime.utcnow().isoformat(),
+                        })
+                        transitioned += 1
+            except Exception:
+                continue  # one printer's failure shouldn't skip the others
+        return transitioned
     except Exception:
         return 0
 

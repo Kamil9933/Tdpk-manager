@@ -231,6 +231,14 @@ textarea.field-input{min-height:80px;resize:vertical}
 .os-cancelled{background:var(--red-d);color:var(--red)}
 .os-partial{background:var(--blue-d);color:var(--blue)}
 
+/* Print queue status pills */
+.qs-queued{background:var(--blue-d);color:var(--blue)}
+.qs-printing{background:var(--green-d);color:var(--green)}
+.qs-paused{background:var(--yellow-d);color:var(--yellow)}
+.qs-done{background:var(--purple-d);color:var(--purple)}
+.qs-shipped{background:var(--green-d);color:var(--green)}
+.qs-archived{background:var(--surface2);color:var(--muted)}
+
 /* Insight */
 .insight{display:flex;align-items:flex-start;gap:10px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--r-md);padding:11px 13px;font-size:12px;margin-bottom:7px;box-shadow:var(--shadow-sm)}
 .idot{width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-top:3px;box-shadow:0 0 0 3px currentColor;opacity:0.95}
@@ -398,6 +406,8 @@ textarea.field-input{min-height:80px;resize:vertical}
     <div class="sbi" onclick="showView('abandoned')" id="nav-abandoned"><span class="ic">⚠️</span>Abandoned</div>
     <div class="sb-sec">Logistics</div>
     <div class="sbi" onclick="showView('postex')" id="nav-postex"><span class="ic">🚚</span>PostEx COD</div>
+    <div class="sb-sec">Production</div>
+    <div class="sbi" onclick="showView('queue')" id="nav-queue"><span class="ic">🖨️</span>Print Queue</div>
     <div class="sb-sec">Finance</div>
     <div class="sbi" onclick="showView('accounts')" id="nav-accounts"><span class="ic">💰</span>Accounts</div>
     <div class="sb-sec">Marketing</div>
@@ -565,6 +575,31 @@ textarea.field-input{min-height:80px;resize:vertical}
     <div class="scroll-wrap" id="postex-wrap">
       <div style="text-align:center;padding:3rem;color:var(--muted)">Loading PostEx data...</div>
     </div>
+  </div>
+
+  <!-- PRINT QUEUE -->
+  <div class="view" id="view-queue">
+    <div class="filters" style="flex-wrap:wrap">
+      <div id="q-status-tabs" style="display:flex;gap:4px;flex-wrap:wrap">
+        <button class="btn sm primary" data-qs="active" onclick="setQueueStatusFilter('active')">Active</button>
+        <button class="btn sm" data-qs="queued" onclick="setQueueStatusFilter('queued')">Queued</button>
+        <button class="btn sm" data-qs="printing" onclick="setQueueStatusFilter('printing')">Printing</button>
+        <button class="btn sm" data-qs="done" onclick="setQueueStatusFilter('done')">Done</button>
+        <button class="btn sm" data-qs="shipped" onclick="setQueueStatusFilter('shipped')">Shipped</button>
+        <button class="btn sm" data-qs="archived" onclick="setQueueStatusFilter('archived')">Archived</button>
+      </div>
+      <div class="vsep"></div>
+      <select id="q-printer" onchange="loadQueue()">
+        <option value="">All printers</option>
+        <option value="bambu1">bambu1</option>
+        <option value="bambu2">bambu2</option>
+      </select>
+      <div style="flex:1"></div>
+      <button class="btn sm" onclick="fetchShopifyOrdersIntoQueue(event)">⬇ Fetch Shopify orders</button>
+      <button class="btn sm primary" onclick="openNewQueueJob()">➕ New job</button>
+    </div>
+    <div class="metric-grid" id="queue-metrics" style="padding:10px 16px 0;flex-shrink:0"></div>
+    <div class="scroll-x" id="queue-list" style="padding:8px 16px 16px"></div>
   </div>
 
   <!-- AUTOMATION -->
@@ -2510,6 +2545,103 @@ async function runOp(){
   }catch(e){failProg(e.message);}
 }
 
+// ── Print Queue ───────────────────────────────────────────────────────────────
+// Backs the "Print Queue" tab -- replaces q.thirddimension.pk's own
+// PHP/JSON queue UI. Printer status transitions (queued -> printing -> done)
+// happen automatically via the cron-tick sync against live Bambu telemetry;
+// this UI is for everything that still needs a human: assigning a printer,
+// fulfilling/shipping, archiving, and pulling in new Shopify orders.
+let Q_STATUS='active';
+function setQueueStatusFilter(s){
+  Q_STATUS=s;
+  document.querySelectorAll('#q-status-tabs .btn').forEach(b=>b.classList.toggle('primary',b.dataset.qs===s));
+  loadQueue();
+}
+function qsClass(s){return {queued:'qs-queued',printing:'qs-printing',paused:'qs-paused',done:'qs-done',shipped:'qs-shipped',archived:'qs-archived'}[s]||'qs-queued';}
+
+async function loadQueue(){
+  const printer=document.getElementById('q-printer').value;
+  const statusMap={active:'queued,printing,paused',queued:'queued',printing:'printing',done:'done',shipped:'shipped',archived:'archived'};
+  document.getElementById('queue-list').innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Loading...</div>';
+  const params=new URLSearchParams();
+  params.set('status',statusMap[Q_STATUS]||'queued,printing,paused');
+  if(printer)params.set('printer',printer);
+  const [r1,r2]=await Promise.all([fetch(`/api/queue?${params}`),fetch('/api/queue/summary')]);
+  const d=await r1.json(); const sum=await r2.json();
+  const bs=sum.by_status||{};
+  document.getElementById('queue-metrics').innerHTML=`
+    <div class="metric-card"><div class="m-label">Total jobs</div><div class="m-value">${sum.total||0}</div></div>
+    <div class="metric-card blue"><div class="m-label">Queued</div><div class="m-value">${bs.queued||0}</div></div>
+    <div class="metric-card green"><div class="m-label">Printing</div><div class="m-value">${bs.printing||0}</div></div>
+    <div class="metric-card purple"><div class="m-label">Done, unshipped</div><div class="m-value">${bs.done||0}</div></div>
+    ${Object.entries(sum.by_printer||{}).map(([p,n])=>`<div class="metric-card"><div class="m-label">${p}</div><div class="m-value">${n}</div></div>`).join('')}
+  `;
+  const jobs=d.jobs||[];
+  document.getElementById('queue-list').innerHTML=!jobs.length?'<div style="text-align:center;padding:2rem;color:var(--muted)">No jobs in this view</div>':jobs.map(j=>queueRowHtml(j)).join('');
+}
+
+function queueRowHtml(j){
+  return `<div class="row-card" style="cursor:default;align-items:flex-start;flex-wrap:wrap">
+    <div style="flex:1;min-width:220px">
+      <div style="font-size:13px;font-weight:600">${(j.name||'Untitled job').replace(/</g,'&lt;')}</div>
+      <div style="font-size:11px;color:var(--muted)">${j.customer||''}${j.order_id?' · '+j.order_id:''}${j.phone?' · '+j.phone:''} · ${j.created_at?new Date(j.created_at).toLocaleDateString():''}</div>
+      ${j.notes?`<div style="font-size:11px;color:var(--muted);margin-top:2px">${j.notes.replace(/</g,'&lt;')}</div>`:''}
+      ${j.postex_tracking?`<div style="font-size:11px;color:var(--muted);margin-top:2px">📮 ${j.postex_tracking}</div>`:''}
+    </div>
+    <span class="ostatus ${qsClass(j.status)}">${j.status}</span>
+    <select onchange="updateQueueJob('${j.id}',{printer:this.value||null})" title="Assigned printer">
+      <option value="" ${!j.printer?'selected':''}>Unassigned</option>
+      <option value="bambu1" ${j.printer==='bambu1'?'selected':''}>bambu1</option>
+      <option value="bambu2" ${j.printer==='bambu2'?'selected':''}>bambu2</option>
+    </select>
+    <select onchange="updateQueueJob('${j.id}',{status:this.value})" title="Status">
+      ${['queued','printing','paused','done','shipped','archived'].map(s=>`<option value="${s}" ${j.status===s?'selected':''}>${s}</option>`).join('')}
+    </select>
+    <div style="display:flex;gap:4px">
+      <button class="btn sm" onclick="fulfillQueueJobPrompt('${j.id}')" title="Fulfill / ship">📦</button>
+      <button class="btn sm" onclick="cancelQueueJobPrompt('${j.id}')" title="Archive">🗑</button>
+    </div>
+  </div>`;
+}
+
+async function updateQueueJob(id,patch){
+  await fetch(`/api/queue/${id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)});
+  loadQueue();
+}
+
+async function fulfillQueueJobPrompt(id){
+  const tracking=prompt('PostEx tracking number (leave blank if none yet):','');
+  if(tracking===null)return;
+  await fetch(`/api/queue/${id}/fulfill`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tracking_number:tracking})});
+  loadQueue();
+}
+
+async function cancelQueueJobPrompt(id){
+  if(!confirm('Archive this job? This will NOT touch the Shopify order.'))return;
+  await fetch(`/api/queue/${id}/cancel`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cancel_shopify:false})});
+  loadQueue();
+}
+
+async function fetchShopifyOrdersIntoQueue(evt){
+  const btn=evt?.target; if(btn){btn.disabled=true;btn.textContent='Fetching...';}
+  try{
+    const r=await fetch('/api/queue/fetch-orders',{method:'POST'});
+    const d=await r.json();
+    alert(`Checked ${d.orders_checked||0} open orders, added ${d.created||0} new job(s) to the queue.`);
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='⬇ Fetch Shopify orders';}
+  }
+  loadQueue();
+}
+
+async function openNewQueueJob(){
+  const name=prompt('Job name:'); if(!name)return;
+  const customer=prompt('Customer name:','')||'';
+  const qty=parseInt(prompt('Quantity:','1')||'1')||1;
+  await fetch('/api/queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,customer,qty,type:'custom'})});
+  loadQueue();
+}
+
 // ── Progress ──────────────────────────────────────────────────────────────────
 function showProg(title,scope){
   document.getElementById('prog-title').textContent=title;
@@ -2538,6 +2670,7 @@ const CMDS=[
   {ic:'👥',l:'Customers',s:'View',a:()=>showView('customers')},
   {ic:'⚠️',l:'Abandoned Carts',s:'View',a:()=>showView('abandoned')},
   {ic:'🚚',l:'PostEx COD',s:'View',a:()=>showView('postex')},
+  {ic:'🖨️',l:'Print Queue',s:'View',a:()=>showView('queue')},
   {ic:'💰',l:'Accounts',s:'View',a:()=>showView('accounts')},
   {ic:'⚙️',l:'Automation',s:'View',a:()=>showView('automation')},
   {ic:'📣',l:'Ads & Social',s:'View',a:()=>showView('marketing')},
@@ -2557,13 +2690,14 @@ function showView(v){
   document.querySelectorAll('.sbi').forEach(el=>el.classList.remove('active'));
   document.getElementById(`view-${v}`)?.classList.add('active');
   document.getElementById(`nav-${v}`)?.classList.add('active');
-  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',automation:'Automation',history:'Operation History',accounts:'Accounts',marketing:'Ads & Social',agent:'Manager Chat'};
+  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',queue:'Print Queue',automation:'Automation',history:'Operation History',accounts:'Accounts',marketing:'Ads & Social',agent:'Manager Chat'};
   document.getElementById('view-title').textContent=titles[v]||v;
   if(v==='orders')loadOrders();
   if(v==='analytics')loadAnalytics();
   if(v==='customers')loadCustomers();
   if(v==='abandoned')loadAbandoned();
   if(v==='postex')loadPostex();
+  if(v==='queue')loadQueue();
   if(v==='automation')loadRules();
   if(v==='history')loadHistory();
   if(v==='accounts')showAccTab(ACC_TAB);

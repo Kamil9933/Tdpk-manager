@@ -217,6 +217,54 @@ class Database:
             "live_status_updated_at": datetime.utcnow().isoformat(),
         }).eq("id", printer_id).execute()
 
+    # ── Print queue ───────────────────────────────────────────────────────────
+    # Backs the dashboard's "Print Queue" tab -- the single source of truth
+    # that replaced q.thirddimension.pk's queue_data.json (see the
+    # create_print_queue migration + the one-time 373-row data migration).
+    # `printer` here is a free-text label ('bambu1'/'bambu2'/...) matching the
+    # `printers.name` column, NOT a foreign key -- same convention q.tdpk used.
+    async def list_queue(self, statuses=None, printer=None):
+        try:
+            q = get_client().table("print_queue").select("*").order("created_at", desc=True)
+            if statuses:
+                q = q.in_("status", statuses if isinstance(statuses, list) else statuses.split(","))
+            if printer:
+                q = q.eq("printer", printer)
+            return q.execute().data
+        except Exception:
+            return []
+
+    async def get_queue_job(self, job_id):
+        res = get_client().table("print_queue").select("*").eq("id", job_id).execute()
+        return res.data[0] if res.data else None
+
+    async def find_queue_job_by_line_item(self, shopify_order_id, shopify_item_id):
+        res = (get_client().table("print_queue").select("id")
+               .eq("shopify_order_id", str(shopify_order_id))
+               .eq("shopify_item_id", str(shopify_item_id)).execute())
+        return res.data[0] if res.data else None
+
+    async def create_queue_job(self, data): return await self._insert("print_queue", data)
+    async def update_queue_job(self, job_id, data): await self._update("print_queue", job_id, data)
+    async def delete_queue_job(self, job_id): await self._delete("print_queue", job_id)
+
+    async def list_queue_by_printer_status(self, printer, status):
+        """Oldest-first -- used by the auto-sync job to pick which queued job
+        a printer should pick up next, and to find the job currently printing
+        on a given printer."""
+        res = (get_client().table("print_queue").select("*")
+               .eq("printer", printer).eq("status", status)
+               .order("created_at", desc=False).execute())
+        return res.data
+
+    async def list_queue_by_phone(self, phone):
+        try:
+            res = (get_client().table("print_queue").select("*")
+                   .eq("phone", phone).order("created_at", desc=True).execute())
+            return res.data
+        except Exception:
+            return []
+
     async def log_printer_maintenance(self, data): return await self._insert("printer_maintenance_logs", data)
     async def list_printer_maintenance(self, printer_id=None, from_date=None, to_date=None):
         eq = {"printer_id": printer_id} if printer_id else None
