@@ -40,11 +40,36 @@ AGENT_MODEL = os.getenv("AGENT_MODEL", "claude-sonnet-4-5-20250929")
 MAX_TOOL_ITERS = 6
 MAX_TOKENS = 2048
 
+# How many of the most recent user-initiated turns get replayed to the model
+# each call. Full history is always kept in Supabase for the dashboard
+# transcript -- this only bounds what gets RESENT as input tokens, which
+# otherwise grows without limit for a long-running conversation (most
+# importantly the standing "Telegram" conversation, which never gets
+# replaced with a fresh one the way a dashboard conversation does). Override
+# with AGENT_HISTORY_TURNS if needed.
+MAX_HISTORY_TURNS = int(os.getenv("AGENT_HISTORY_TURNS", "15") or 15)
+
+# Tool results (e.g. list_orders, get_pnl) can be large. The live turn still
+# sees the full result so its immediate answer is accurate, but only a
+# truncated copy gets written to history -- otherwise every big read ever
+# made in a conversation gets re-billed as input tokens on every future turn
+# in that same conversation, forever.
+MAX_STORED_TOOL_RESULT_CHARS = 4000
+
 # Rough USD-per-million-token estimate shown in the UI -- NOT a billing source
 # of truth, just enough to keep an eye on spend. Update if pricing changes.
-PRICING_PER_MTOK = {"in": 3.0, "out": 15.0}
+# Cache writes cost 1.25x a normal input token (one-time, when a cache entry
+# is first created); cache reads cost 0.1x a normal input token (every turn
+# after that reuses the cached system prompt + tools for a tenth of the
+# price) -- see Anthropic's prompt-caching pricing.
+PRICING_PER_MTOK = {"in": 3.0, "out": 15.0, "cache_write": 3.75, "cache_read": 0.3}
 
-SYSTEM_PROMPT = """You are "TDPK Manager" -- the in-app assistant for TD Shopify Manager (TDPK), a \
+# Split into a large STATIC block (cached -- identical on every call, so
+# Anthropic's prompt caching reuses it instead of rebilling it as fresh input
+# tokens each turn) and a small DYNAMIC block appended after (current time +
+# live automation-toggle state, which do change turn to turn so must stay
+# outside the cached portion).
+SYSTEM_PROMPT_STATIC = """You are "TDPK Manager" -- the in-app assistant for TD Shopify Manager (TDPK), a \
 private admin tool for thirddimension.pk, a 3D-printing store in Pakistan selling mostly via \
 cash-on-delivery through the PostEx courier. You act as a general manager for the WHOLE business, not \
 a marketing-only bot: the Shopify catalog and orders, PostEx COD logistics, the full accounting ledger \
@@ -52,8 +77,8 @@ a marketing-only bot: the Shopify catalog and orders, PostEx COD logistics, the 
 raw-material inventory, and Meta ads/Facebook/Instagram are all equally your job, not a secondary \
 feature bolted onto ads.
 
-Current date/time (Pakistan local, UTC+5): {current_datetime_pkt}. Use this to resolve relative dates \
-("tomorrow", "in 3 days", "next Monday") into real ISO due_at values -- never guess what day it is.
+You will be told the current date/time (Pakistan local, UTC+5) below -- use it to resolve relative \
+dates ("tomorrow", "in 3 days", "next Monday") into real ISO due_at values, never guess what day it is.
 
 GUARDRAILS -- these are not optional, follow them exactly. There are three tiers of write action:
 
@@ -70,8 +95,7 @@ multiple different previews at once.
 
 TIER 2 -- governed by a live on/off toggle. For actions on EXISTING ads/posts (pausing/resuming, \
 budget changes, publishing a social post, replying to a comment), your current autonomy settings for \
-this account are:
-{automation_settings_summary}
+this account are listed below, under "Current automation settings":
    - A category marked OFF means: behave exactly like Tier 1 above -- preview, then wait for explicit \
 human approval in chat, then confirm.
    - A category marked ON means: the human has pre-approved that category, so you may preview and then \
@@ -113,7 +137,42 @@ Be concise and concrete -- report real numbers and real outcomes, not vague summ
 
 
 def _mcp_tools_to_anthropic(mcp_tools):
-    return [{"name": t.name, "description": t.description or "", "input_schema": t.inputSchema} for t in mcp_tools]
+    tools = [{"name": t.name, "description": t.description or "", "input_schema": t.inputSchema} for t in mcp_tools]
+    if tools:
+        # Marks the end of a cacheable segment -- the whole tool list (all 70+
+        # schemas) gets reused from cache on the next call instead of being
+        # rebilled as input tokens, as long as the tool list itself hasn't
+        # changed since the last call.
+        tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+    return tools
+
+
+def _truncate_for_storage(text, limit=MAX_STORED_TOOL_RESULT_CHARS):
+    """Caps what a tool result looks like once it's history (replayed to the
+    model on every future turn in this conversation) -- the current turn
+    still sees and reasons over the FULL result, only the stored copy is
+    capped."""
+    if not isinstance(text, str) or len(text) <= limit:
+        return text
+    cut = len(text) - limit
+    return text[:limit] + f"\n...[truncated {cut} more characters -- re-run the tool call for the full result]"
+
+
+def _window_messages(messages, max_turns=MAX_HISTORY_TURNS):
+    """Keeps only the most recent `max_turns` user-initiated turns (a real
+    human message, not a tool_result handed back mid-turn) and everything
+    from that point on. Always cuts at a genuine turn boundary, so a
+    tool_use/tool_result pair is never split across the cut. Full history
+    stays in Supabase regardless -- this only bounds what gets resent to the
+    model as input tokens."""
+    turn_starts = [
+        i for i, m in enumerate(messages)
+        if m["role"] == "user" and isinstance(m["content"], list)
+        and any(b.get("type") == "text" for b in m["content"])
+    ]
+    if len(turn_starts) <= max_turns:
+        return messages
+    return messages[turn_starts[-max_turns]:]
 
 
 def _content_to_blocks(resp_content):
@@ -163,21 +222,33 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
 
     client = AsyncAnthropic(api_key=api_key)
     now_pkt = datetime.now(timezone.utc).astimezone(PKT).strftime("%Y-%m-%d %H:%M (%A)")
-    system_prompt = SYSTEM_PROMPT.format(
-        automation_settings_summary=await _automation_summary(db),
-        current_datetime_pkt=now_pkt,
+    dynamic_context = (
+        f"Current date/time (Pakistan local, UTC+5): {now_pkt}.\n\n"
+        f"Current automation settings:\n{await _automation_summary(db)}"
     )
+    # Two blocks: the big static instructions (cached -- reused across calls
+    # instead of rebilled every turn) and this small per-turn block (never
+    # cached, since it changes turn to turn).
+    system_prompt = [
+        {"type": "text", "text": SYSTEM_PROMPT_STATIC, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": dynamic_context},
+    ]
 
     history_rows = await db.list_agent_messages(conversation_id)
-    messages = [{"role": r["role"], "content": r["content"]} for r in history_rows]
+    full_messages = [{"role": r["role"], "content": r["content"]} for r in history_rows]
     is_first_message = not history_rows
 
     await db.add_agent_message(conversation_id, "user", [{"type": "text", "text": user_text}])
-    messages.append({"role": "user", "content": [{"type": "text", "text": user_text}]})
+    full_messages.append({"role": "user", "content": [{"type": "text", "text": user_text}]})
+
+    # Only the most recent MAX_HISTORY_TURNS get sent to the model -- bounds
+    # input-token cost for long-running conversations (the standing Telegram
+    # thread especially). Full history is still in Supabase regardless.
+    messages = _window_messages(full_messages)
 
     tools = _mcp_tools_to_anthropic(await mcp_server.list_tools())
 
-    total_in = total_out = 0
+    total_in = total_out = total_cache_write = total_cache_read = 0
     final_text = ""
     tool_calls_made = []
 
@@ -188,6 +259,8 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
         )
         total_in += resp.usage.input_tokens
         total_out += resp.usage.output_tokens
+        total_cache_write += getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
+        total_cache_read += getattr(resp.usage, "cache_read_input_tokens", 0) or 0
         blocks = _content_to_blocks(resp.content)
         messages.append({"role": "assistant", "content": blocks})
         await db.add_agent_message(conversation_id, "assistant", blocks,
@@ -208,8 +281,15 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
             except Exception as e:
                 result_text = f"Error: {e}"
             tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": result_text})
+        # The live turn keeps the full-size results (messages/tools list) so
+        # its own answer this turn is accurate; only the copy written to
+        # history is capped, so a big read made now doesn't get rebilled at
+        # full size on every future turn in this conversation.
         messages.append({"role": "user", "content": tool_results})
-        await db.add_agent_message(conversation_id, "user", tool_results)
+        stored_tool_results = [
+            {**tr, "content": _truncate_for_storage(tr["content"])} for tr in tool_results
+        ]
+        await db.add_agent_message(conversation_id, "user", stored_tool_results)
     else:
         final_text = final_text or "I hit this turn's tool-call limit -- say \"continue\" and I'll pick back up."
 
@@ -222,10 +302,20 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
         current_title = (conv or {}).get("title")
         if not current_title or current_title == "New conversation":
             title = _derive_title(user_text)
+    # total_in from the API already excludes cache_read tokens (counted
+    # separately), so this sums all four buckets at their own real price
+    # instead of treating a cheap cache-read token as a full-price one.
     await db.bump_agent_conversation_tokens(conversation_id, total_in, total_out, title=title)
-    cost_usd = (total_in / 1_000_000) * PRICING_PER_MTOK["in"] + (total_out / 1_000_000) * PRICING_PER_MTOK["out"]
+    cost_usd = (
+        (total_in / 1_000_000) * PRICING_PER_MTOK["in"]
+        + (total_out / 1_000_000) * PRICING_PER_MTOK["out"]
+        + (total_cache_write / 1_000_000) * PRICING_PER_MTOK["cache_write"]
+        + (total_cache_read / 1_000_000) * PRICING_PER_MTOK["cache_read"]
+    )
     return {
         "text": final_text,
-        "tokens_in": total_in, "tokens_out": total_out, "est_cost_usd": round(cost_usd, 4),
+        "tokens_in": total_in, "tokens_out": total_out,
+        "cache_write_tokens": total_cache_write, "cache_read_tokens": total_cache_read,
+        "est_cost_usd": round(cost_usd, 4),
         "tool_calls": tool_calls_made,
     }
