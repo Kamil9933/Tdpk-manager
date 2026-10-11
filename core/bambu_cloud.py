@@ -27,14 +27,31 @@ already lives in (BAMBU_CLOUD_EMAIL / BAMBU_CLOUD_PASSWORD) -- this module
 only ever reads those two, never logs or persists them elsewhere.
 """
 
+import asyncio
+import json
 import os
+import ssl
+import time
+
 import httpx
+
+try:
+    import aiomqtt
+except ImportError:  # keeps the app importable even before the dep lands
+    aiomqtt = None
 
 BAMBU_CLOUD_EMAIL = os.getenv("BAMBU_CLOUD_EMAIL", "")
 BAMBU_CLOUD_PASSWORD = os.getenv("BAMBU_CLOUD_PASSWORD", "")
 
 BASE = "https://api.bambulab.com"
 UA = "bambu_network_agent/01.09.05.01"
+
+# Cloud MQTT broker Bambu's own apps use for live print telemetry (percent,
+# remaining time, current file) -- REST only gives coarse online/RUNNING
+# state, this is where the detail actually lives. Community-documented
+# (OpenBambuAPI project), not officially published by Bambu.
+MQTT_HOST = "us.mqtt.bambulab.com"
+MQTT_PORT = 8883
 
 
 async def login_start() -> dict:
@@ -109,6 +126,81 @@ async def get_print_status(access_token: str) -> dict:
     async with httpx.AsyncClient(timeout=20, headers={"User-Agent": UA, "Authorization": f"Bearer {access_token}"}) as client:
         resp = await client.get(f"{BASE}/v1/iot-service/api/user/print", params={"force": "true"})
         return {"http_status": resp.status_code, "raw": _safe_json(resp)}
+
+
+async def get_uid(access_token: str) -> dict:
+    """MQTT's cloud username is `u_{uid}` -- this account-profile endpoint is
+    the only documented place that number comes from."""
+    async with httpx.AsyncClient(timeout=20, headers={"User-Agent": UA, "Authorization": f"Bearer {access_token}"}) as client:
+        resp = await client.get(f"{BASE}/v1/design-user-service/my/preference")
+        data = _safe_json(resp)
+        return {"http_status": resp.status_code, "uid": data.get("uid"), "raw": data}
+
+
+async def mqtt_get_live_status(access_token: str, uid, dev_id: str, listen_seconds: float = 6.0) -> dict:
+    """Connects to Bambu's cloud MQTT broker just long enough to ask for a
+    full status push and capture whatever report messages come back, then
+    disconnects. This is deliberately NOT a persistent connection -- Render's
+    free tier can't hold one open anyway -- it's a short connect/ask/listen/
+    close cycle, meant to be called from a periodic poll (the same cron-tick
+    pattern already used elsewhere in this project), not a live socket.
+
+    Unverified until tested against a printer mid-print: field names and
+    whether a single pushall response is enough (vs needing to merge several
+    partial messages, which some models send instead of the full object) are
+    both open questions this function is built to answer."""
+    if aiomqtt is None:
+        return {"ok": False, "error": "aiomqtt is not installed"}
+    if not uid:
+        return {"ok": False, "error": "no uid -- call get_uid() first"}
+
+    report_topic = f"device/{dev_id}/report"
+    request_topic = f"device/{dev_id}/request"
+    client_id = f"tdpk-manager-{int(time.time())}"
+    ssl_context = ssl.create_default_context()
+
+    messages = []
+    merged_print = {}
+
+    async def _collect(client):
+        async for message in client.messages:
+            try:
+                payload = json.loads(message.payload)
+            except Exception:
+                continue
+            messages.append(payload)
+            print_block = payload.get("print")
+            if isinstance(print_block, dict):
+                merged_print.update(print_block)
+
+    try:
+        async with aiomqtt.Client(
+            hostname=MQTT_HOST,
+            port=MQTT_PORT,
+            username=f"u_{uid}",
+            password=access_token,
+            identifier=client_id,
+            tls_context=ssl_context,
+            timeout=15,
+        ) as client:
+            await client.subscribe(report_topic)
+            await client.publish(request_topic, payload=json.dumps({
+                "pushing": {"sequence_id": "0", "command": "pushall", "version": 1, "push_target": 1},
+            }))
+            try:
+                await asyncio.wait_for(_collect(client), timeout=listen_seconds)
+            except asyncio.TimeoutError:
+                pass
+
+        return {
+            "ok": True,
+            "dev_id": dev_id,
+            "messages_received": len(messages),
+            "merged_print_status": merged_print,
+            "raw_messages": messages[:10],  # capped -- diagnostic only
+        }
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 def _safe_json(resp) -> dict:

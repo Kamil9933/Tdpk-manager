@@ -1320,6 +1320,30 @@ async def bambu_print_status_test_route(session=Depends(verify_session)):
         return {"ok": False, "error": "No stored token yet -- run login-start then login-verify first."}
     return _redact_tokens(await bambu_cloud.get_print_status(token))
 
+@app.post("/api/printers/bambu/mqtt-status-test")
+async def bambu_mqtt_status_test_route(request: Request, session=Depends(verify_session)):
+    """The real test: REST only gave us online/RUNNING, not file name or
+    percent -- this connects briefly to Bambu's cloud MQTT broker (same feed
+    the app itself uses) for one of your printers and reports back whatever
+    it captures. Pass {"dev_id": "..."} in the body -- use the dev_id values
+    from status-test's response (03900D5A1906211 / 03919D470900302)."""
+    body = await request.json()
+    dev_id = body.get("dev_id", "")
+    if not dev_id:
+        return {"ok": False, "error": "Pass {\"dev_id\": \"...\"} in the request body."}
+
+    settings = await db.get_cost_settings()
+    token = settings.get("bambu_access_token", "")
+    if not token:
+        return {"ok": False, "error": "No stored token yet -- run login-start then login-verify first."}
+
+    uid_result = await bambu_cloud.get_uid(token)
+    if not uid_result.get("uid"):
+        return {"ok": False, "error": "Could not resolve account uid", "uid_lookup": _redact_tokens(uid_result)}
+
+    result = await bambu_cloud.mqtt_get_live_status(token, uid_result["uid"], dev_id)
+    return _redact_tokens(result)
+
 # ── Telegram bot (two-way: the Manager agent talking back through Telegram) ──
 # Telegram pushes updates here via webhook (registered once -- see the URL in
 # core/notify.py's module docstring) rather than us polling for them, which
