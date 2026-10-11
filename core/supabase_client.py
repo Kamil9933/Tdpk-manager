@@ -208,6 +208,15 @@ class Database:
     async def list_printer_usage(self, printer_id):
         return await self._list_ranged("printer_usage_logs", "log_date", eq={"printer_id": printer_id})
 
+    async def update_printer_live_status(self, printer_id, status: dict):
+        """Overwrites the printer row's current-state snapshot (not a log --
+        see the add_bambu_live_status_to_printers migration). Called from the
+        cron-tick poll, once per printer, every ~15 minutes."""
+        get_client().table("printers").update({
+            "live_status": json.dumps(status),
+            "live_status_updated_at": datetime.utcnow().isoformat(),
+        }).eq("id", printer_id).execute()
+
     async def log_printer_maintenance(self, data): return await self._insert("printer_maintenance_logs", data)
     async def list_printer_maintenance(self, printer_id=None, from_date=None, to_date=None):
         eq = {"printer_id": printer_id} if printer_id else None

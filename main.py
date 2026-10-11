@@ -1448,7 +1448,76 @@ async def cron_tick(request: Request):
         await db.mark_reminder_sent(r["id"])
         fired["reminders"] += 1
 
+    fired["printers_polled"] = await _poll_bambu_printers()
+
     return {"ok": True, "now_pkt": now_pkt.isoformat(), "fired": fired}
+
+async def _poll_bambu_printers() -> int:
+    """Refreshes the live_status snapshot on every printer row that has a
+    bambu_dev_id, every cron tick (~15 min). Dashboard-tile use only, no
+    notifications -- just overwrites "what's it doing right now" so the
+    accounting > Printers tab can show it without the user having to check
+    Bambu's own app. Entirely best-effort: any failure here (Bambu's API
+    down, token expired, MQTT timeout) must never block the digest/reminder
+    logic in the same tick, so everything is caught and swallowed per
+    printer rather than raised."""
+    try:
+        printers = [p for p in await db.list_printers() if p.get("bambu_dev_id")]
+        if not printers:
+            return 0
+
+        settings = await db.get_cost_settings()
+        token = settings.get("bambu_access_token", "")
+        if not token:
+            return 0
+
+        uid = settings.get("bambu_uid")
+        if not uid:
+            uid_result = await bambu_cloud.get_uid(token)
+            uid = uid_result.get("uid")
+            if uid:
+                await db.update_cost_settings({"bambu_uid": uid})
+        if not uid:
+            return 0
+
+        bind_result = await bambu_cloud.list_bound_devices(token)
+        online_by_dev_id = {
+            d.get("dev_id"): d.get("online", False)
+            for d in bind_result.get("raw", {}).get("devices", [])
+        }
+
+        polled = 0
+        for p in printers:
+            dev_id = p["bambu_dev_id"]
+            try:
+                if not online_by_dev_id.get(dev_id, False):
+                    await db.update_printer_live_status(p["id"], {"online": False})
+                    polled += 1
+                    continue
+
+                live = await bambu_cloud.mqtt_get_live_status(token, uid, dev_id, listen_seconds=6)
+                merged = live.get("merged_print_status", {}) if live.get("ok") else {}
+                status = {
+                    "online": True,
+                    "gcode_state": merged.get("gcode_state"),
+                    "mc_percent": merged.get("mc_percent"),
+                    "mc_remaining_time": merged.get("mc_remaining_time"),
+                    "gcode_file": merged.get("gcode_file"),
+                    "subtask_name": merged.get("subtask_name"),
+                    "layer_num": merged.get("layer_num"),
+                    "total_layer_num": merged.get("total_layer_num"),
+                    "nozzle_temper": merged.get("nozzle_temper"),
+                    "bed_temper": merged.get("bed_temper"),
+                    "mqtt_ok": live.get("ok", False),
+                }
+                await db.update_printer_live_status(p["id"], status)
+                polled += 1
+            except Exception:
+                continue  # one printer's failure shouldn't skip the others
+
+        return polled
+    except Exception:
+        return 0
 
 # ── MCP connector ─────────────────────────────────────────────────────────────
 # Mounted last (and at root "/") so it never shadows any of the specific routes

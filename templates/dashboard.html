@@ -1397,6 +1397,37 @@ async function createPurchase(){
 }
 async function delPurchase(id){if(!confirm('Delete purchase?'))return;await fetch(`/api/accounting/purchases/${id}`,{method:'DELETE'});loadAccVendors();}
 
+function liveStatusTile(p){
+  let s; try{ s = typeof p.live_status==='string' ? JSON.parse(p.live_status) : (p.live_status||null); }catch(e){ s = null; }
+  if(!s) return '<div style="font-size:11px;color:var(--muted);padding:4px 0 10px">No live status yet — next cron tick (~15 min) will pick it up.</div>';
+  if(s.online===false) return '<div style="font-size:11px;color:var(--muted);padding:4px 0 10px">⚪ Offline / not reachable right now</div>';
+
+  const state = s.gcode_state || 'UNKNOWN';
+  const badge = {RUNNING:'🟢 Printing', IDLE:'⚪ Idle', FINISH:'✅ Finished', FAILED:'🔴 Failed', PAUSE:'🟡 Paused'}[state] || state;
+  const pct = (s.mc_percent===null||s.mc_percent===undefined) ? null : s.mc_percent;
+  const mins = s.mc_remaining_time;
+  const eta = (mins===null||mins===undefined) ? '' : (mins>=60 ? `${Math.floor(mins/60)}h ${mins%60}m left` : `${mins}m left`);
+  const file = s.subtask_name || s.gcode_file || '';
+  const updated = p.live_status_updated_at ? timeAgo(p.live_status_updated_at) : '';
+
+  return `
+    <div style="background:var(--bg2,rgba(127,127,127,.08));border-radius:8px;padding:8px 12px;margin:-4px 0 12px;font-size:12px">
+      <div style="display:flex;justify-content:space-between;align-items:center"><b>${badge}</b><span style="color:var(--muted);font-size:11px">updated ${updated}</span></div>
+      ${file?`<div style="margin-top:2px;color:var(--muted)">${file}</div>`:''}
+      ${pct!==null?`
+      <div style="background:rgba(127,127,127,.2);border-radius:4px;height:6px;margin-top:6px;overflow:hidden"><div style="background:#4caf80;height:100%;width:${pct}%"></div></div>
+      <div style="display:flex;justify-content:space-between;margin-top:3px;color:var(--muted)"><span>${pct}%</span><span>${eta}</span></div>`:''}
+      ${(s.nozzle_temper||s.bed_temper)?`<div style="margin-top:4px;color:var(--muted)">🌡️ Nozzle ${Math.round(s.nozzle_temper||0)}°C · Bed ${Math.round(s.bed_temper||0)}°C</div>`:''}
+    </div>`;
+}
+function timeAgo(iso){
+  const asUtc = /Z$|[+-]\d\d:\d\d$/.test(iso) ? iso : iso+'Z'; // DB timestamps come back without a zone suffix -- they're UTC
+  const sec = Math.max(0, Math.floor((Date.now() - new Date(asUtc).getTime())/1000));
+  if(sec<60) return 'just now';
+  if(sec<3600) return Math.floor(sec/60)+'m ago';
+  return Math.floor(sec/3600)+'h ago';
+}
+
 async function loadAccPrinters(){
   const c=document.getElementById('acc-content');
   c.innerHTML='<div style="text-align:center;padding:2rem;color:var(--muted)">Loading…</div>';
@@ -1424,7 +1455,8 @@ async function loadAccPrinters(){
         <div style="flex:1;min-width:180px"><div style="font-size:13px;font-weight:500">${p.name}${p.model?' — '+p.model:''}</div><div style="font-size:11px;color:var(--muted)">${(p.total_hours||0).toLocaleString()} hrs run · ${d.age_months||0} months old${d.fully_depreciated?' · fully depreciated':''}</div></div>
         <div style="font-size:11px;text-align:right"><div>Book value: <b>${fmtMoney(d.book_value)}</b></div><div style="color:var(--muted)">${fmtMoney(d.monthly_depreciation)}/mo dep.</div></div>
         <button class="btn danger sm" onclick="delPrinter('${p.id}')">Delete</button>
-      </div>`;}).join('')}</div>
+      </div>
+      ${p.bambu_dev_id?liveStatusTile(p):''}`;}).join('')}</div>
 
     <div class="form-box" style="margin-top:16px">
       <h4>🕐 Log running hours</h4>
