@@ -26,9 +26,18 @@ then create an "App Password" (myaccount.google.com/apppasswords) -- use
 that as SMTP_PASS, never the real account password. SMTP_USER is the full
 gmail address. DIGEST_EMAIL_TO is where alerts land (can be the same
 address, or any inbox).
+
+Two-way Telegram (talk to the Manager agent through the bot itself, not just
+receive pushes from it) -- the webhook handler lives in main.py's
+/api/telegram/webhook route, this module just provides the sender and a
+plain-text formatter for it. One-time setup after deploying with
+TELEGRAM_WEBHOOK_SECRET set: open this in a browser (fills in your own
+values) to register the webhook with Telegram --
+  https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=<your Render URL>/api/telegram/webhook&secret_token=<TELEGRAM_WEBHOOK_SECRET>
 """
 
 import os
+import re
 import asyncio
 import smtplib
 from email.message import EmailMessage
@@ -36,6 +45,7 @@ import httpx
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587") or 587)
@@ -95,3 +105,15 @@ async def notify_all(subject: str, text: str, db=None) -> dict:
         except Exception:
             pass
     return {"telegram": telegram_result, "email": email_result}
+
+
+def format_for_telegram(text: str) -> str:
+    """Cleans up the Manager agent's markdown-ish reply text (the same text
+    the dashboard runs through mdToHtml) into plain text for Telegram --
+    sent with no parse_mode, so this is cosmetic stripping, not structural
+    HTML/MarkdownV2 formatting (which would risk Telegram rejecting the
+    message over an unescaped special character)."""
+    text = re.sub(r'^#{1,4}\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'(?<!\*)\*(?!\*)([^\n*]+?)(?<!\*)\*(?!\*)', r'\1', text)
+    return text.strip()

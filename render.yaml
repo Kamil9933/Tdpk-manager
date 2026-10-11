@@ -53,6 +53,12 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      # Shared secret Telegram sends back on every webhook call (set when
+      # registering the webhook -- see core/notify.py's docstring) so the
+      # /api/telegram/webhook route can verify a request actually came from
+      # Telegram and not someone else hitting the URL.
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT

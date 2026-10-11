@@ -1,7 +1,7 @@
 import os, json, asyncio, hashlib, csv, io
 from contextlib import asynccontextmanager, AsyncExitStack
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -19,7 +19,7 @@ from core.accounting import generate_pnl, straight_line_depreciation, calc_cash_
 from core.meta import MetaClient, MetaError
 from core.mcp_server import build_mcp_server, MCPAuthMiddleware
 from core.agent import run_agent_turn
-from core.notify import notify_all
+from core.notify import notify_all, send_telegram, format_for_telegram, TELEGRAM_WEBHOOK_SECRET, TELEGRAM_CHAT_ID
 from core.digest import generate_digest
 from core.filament import deduct_filament_for_order, compute_filament_status
 from core.returns import compute_product_return_breakdown
@@ -1257,6 +1257,57 @@ async def cancel_reminder_route(reminder_id: str, session=Depends(verify_session
 @app.post("/api/notifications/test")
 async def test_notification_route(session=Depends(verify_session)):
     return await notify_all("TDPK Manager test", "This is a test notification from your dashboard.", db=db)
+
+# ── Telegram bot (two-way: the Manager agent talking back through Telegram) ──
+# Telegram pushes updates here via webhook (registered once -- see the URL in
+# core/notify.py's module docstring) rather than us polling for them, which
+# fits a Render free-tier service far better: nothing has to run
+# continuously, and the incoming request itself wakes the service if it was
+# asleep. Only messages from TELEGRAM_CHAT_ID are processed -- this is a
+# private single-user bot, not a public one, same principle as the MCP
+# connector's bearer token. Replies go through the SAME Manager agent as the
+# dashboard (shared tool registry, same Tier 1/2/3 guardrails -- Tier 1
+# approvals work over a Telegram reply exactly like a dashboard chat reply)
+# in one dedicated standing conversation, kept separate from whatever's open
+# on the web dashboard so the two never cross-talk.
+#
+# The actual agent turn runs in a background task so this route can ack
+# Telegram immediately: a full tool-calling agent turn plus a Render
+# free-tier cold start can easily take longer than Telegram is willing to
+# wait on the webhook response, and a slow/missing ack makes Telegram retry
+# the same update, which would otherwise risk processing it twice.
+async def _telegram_conversation_id():
+    settings = await db.get_cost_settings()
+    conv_id = settings.get("telegram_conversation_id")
+    if conv_id:
+        existing = await db.get_agent_conversation(conv_id)
+        if existing:
+            return conv_id
+    conv = await db.create_agent_conversation(title="📱 Telegram")
+    await db.update_cost_settings({"telegram_conversation_id": conv["id"]})
+    return conv["id"]
+
+async def _process_telegram_message(text: str):
+    try:
+        conv_id = await _telegram_conversation_id()
+        result = await run_agent_turn(mcp_server, db, conv_id, text)
+        await send_telegram(format_for_telegram(result.get("text") or "(no reply)"))
+    except Exception as e:
+        await send_telegram(f"Something went wrong processing that: {e}")
+
+@app.post("/api/telegram/webhook")
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
+    if not TELEGRAM_WEBHOOK_SECRET or request.headers.get("X-Telegram-Bot-Api-Secret-Token") != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+    update = await request.json()
+    message = update.get("message") or update.get("edited_message")
+    if not message or "text" not in message:
+        return {"ok": True}  # nothing to do -- not a text message
+    chat_id = str(message.get("chat", {}).get("id", ""))
+    if not TELEGRAM_CHAT_ID or chat_id != TELEGRAM_CHAT_ID.strip():
+        return {"ok": True}  # not you -- silently ignored, never processed or replied to
+    background_tasks.add_task(_process_telegram_message, message["text"])
+    return {"ok": True}
 
 # ── Cron / scheduled jobs ─────────────────────────────────────────────────────
 # Render's free plan has no built-in scheduler and the web service spins down
