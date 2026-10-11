@@ -562,6 +562,15 @@ async def agent_new_conversation(request: Request, session=Depends(verify_sessio
     data = await request.json() if await request.body() else {}
     return await db.create_agent_conversation(title=data.get("title"))
 
+@app.put("/api/agent/conversations/{conversation_id}")
+async def agent_rename_conversation(conversation_id: str, request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    title = (data.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    await db.rename_agent_conversation(conversation_id, title)
+    return {"ok": True}
+
 @app.delete("/api/agent/conversations/{conversation_id}")
 async def agent_delete_conversation(conversation_id: str, session=Depends(verify_session)):
     await db.delete_agent_conversation(conversation_id)

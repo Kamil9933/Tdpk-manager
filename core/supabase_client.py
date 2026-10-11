@@ -321,6 +321,11 @@ class Database:
     async def delete_agent_conversation(self, conversation_id):
         get_client().table("agent_conversations").delete().eq("id", conversation_id).execute()
 
+    async def rename_agent_conversation(self, conversation_id, title):
+        get_client().table("agent_conversations").update({
+            "title": title, "updated_at": datetime.utcnow().isoformat(),
+        }).eq("id", conversation_id).execute()
+
     async def list_agent_messages(self, conversation_id):
         try:
             res = (get_client().table("agent_messages").select("*")

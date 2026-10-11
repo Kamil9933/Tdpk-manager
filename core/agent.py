@@ -109,6 +109,16 @@ def _extract_text(blocks):
     return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
 
 
+def _derive_title(user_text):
+    """Turns a user's first message into a short conversation title, so the
+    sidebar doesn't fill up with indistinguishable "New conversation" rows.
+    No extra model call -- just a cheap, deterministic truncation."""
+    collapsed = " ".join(user_text.split())
+    if len(collapsed) > 48:
+        collapsed = collapsed[:45].rstrip() + "..."
+    return collapsed or "New conversation"
+
+
 async def _automation_summary(db):
     try:
         settings = await db.get_automation_settings()
@@ -137,6 +147,7 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
 
     history_rows = await db.list_agent_messages(conversation_id)
     messages = [{"role": r["role"], "content": r["content"]} for r in history_rows]
+    is_first_message = not history_rows
 
     await db.add_agent_message(conversation_id, "user", [{"type": "text", "text": user_text}])
     messages.append({"role": "user", "content": [{"type": "text", "text": user_text}]})
@@ -179,7 +190,16 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
     else:
         final_text = final_text or "I hit this turn's tool-call limit -- say \"continue\" and I'll pick back up."
 
-    await db.bump_agent_conversation_tokens(conversation_id, total_in, total_out)
+    title = None
+    if is_first_message:
+        try:
+            conv = await db.get_agent_conversation(conversation_id)
+        except Exception:
+            conv = None
+        current_title = (conv or {}).get("title")
+        if not current_title or current_title == "New conversation":
+            title = _derive_title(user_text)
+    await db.bump_agent_conversation_tokens(conversation_id, total_in, total_out, title=title)
     cost_usd = (total_in / 1_000_000) * PRICING_PER_MTOK["in"] + (total_out / 1_000_000) * PRICING_PER_MTOK["out"]
     return {
         "text": final_text,
