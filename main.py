@@ -18,7 +18,7 @@ from core.postex import PostexClient
 from core.accounting import generate_pnl, straight_line_depreciation, calc_cash_balance, reconcile_postex
 from core.meta import MetaClient, MetaError
 from core.mcp_server import build_mcp_server, MCPAuthMiddleware
-from core.agent import run_agent_turn
+from core.agent import run_agent_turn, AgentUnavailableError
 from core.notify import notify_all, send_telegram, format_for_telegram, TELEGRAM_WEBHOOK_SECRET, TELEGRAM_CHAT_ID
 from core.digest import generate_digest
 from core.filament import deduct_filament_for_order, compute_filament_status
@@ -594,6 +594,17 @@ async def agent_send_message(conversation_id: str, request: Request, session=Dep
         raise HTTPException(status_code=400, detail="Message text is required")
     try:
         return await run_agent_turn(mcp_server, db, conversation_id, text)
+    except AgentUnavailableError as e:
+        # Anthropic itself is unreachable (out of credit, overloaded, etc.)
+        # and no rule-based bypass could handle this message -- surface it
+        # as a normal assistant reply (not a 500) so it renders in the chat
+        # like any other message instead of an error toast. Nothing was
+        # lost: the user's message is already saved, see core/agent.py.
+        return {
+            "text": str(e), "tokens_in": 0, "tokens_out": 0,
+            "cache_write_tokens": 0, "cache_read_tokens": 0,
+            "est_cost_usd": 0, "tool_calls": [], "unavailable": True,
+        }
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1563,6 +1574,14 @@ async def _process_telegram_message(text: str):
         conv_id = await _telegram_conversation_id()
         result = await run_agent_turn(mcp_server, db, conv_id, text)
         await send_telegram(format_for_telegram(result.get("text") or "(no reply)"))
+    except AgentUnavailableError as e:
+        # Already a clean, user-facing message (credit/overload/etc.) -- send
+        # as-is, no "Something went wrong" wrapper. The user's message was
+        # already saved to this conversation's history before the API call
+        # was attempted, so nothing needs retyping once Anthropic is back --
+        # just reply again (or "yes"/"no" if it was a pending confirmation,
+        # which may have already gone through via the rule-based bypass).
+        await send_telegram(format_for_telegram(str(e)))
     except Exception as e:
         await send_telegram(f"Something went wrong processing that: {e}")
 

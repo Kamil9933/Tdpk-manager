@@ -30,14 +30,107 @@ Three tiers of write action, by risk:
     must never be auto-confirmed, regardless of any toggle.
 """
 
-import os
+import os, json, re
 from datetime import datetime, timezone, timedelta
+import anthropic
 from anthropic import AsyncAnthropic
+from core import gemini_fallback
 
 PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time, no DST -- fixed offset is correct year-round
 
 AGENT_MODEL = os.getenv("AGENT_MODEL", "claude-sonnet-4-5-20250929")
 MAX_TOOL_ITERS = 6
+
+# ── Fallback when the Anthropic API itself is unreachable (out of credit,
+# rate-limited, momentarily down) ───────────────────────────────────────────
+# A full natural-language instruction genuinely needs an LLM to interpret --
+# there's no safe way around that. But the single most common thing typed
+# right after a guardrail preview is a bare "yes"/"confirm" or "no"/"cancel",
+# and THAT doesn't need an LLM at all: the previous (working) turn already
+# left a structured tool_use call with confirm=false sitting in history.
+# When the primary call fails, _try_confirm_bypass looks for exactly that
+# and, if found, re-invokes the same tool with confirm=true directly --
+# otherwise it reports the API error plainly instead of guessing.
+YES_RE = re.compile(r"^\s*(yes|y|confirm(ed)?|proceed|do it|go ahead|approved?)\b", re.I)
+NO_RE = re.compile(r"^\s*(no|n|cancel|stop|abort|never\s*mind)\b", re.I)
+
+class AgentUnavailableError(Exception):
+    """Raised when the primary model call fails and no rule-based fallback
+    could handle it either. Always carries a clean, user-facing message --
+    never a raw SDK/HTTP error string -- so callers (the Telegram webhook,
+    the dashboard chat route) can show or send it as-is."""
+    pass
+
+def _find_pending_confirmation(history_rows):
+    """Scans the FULL conversation history for the most recent guardrail-style
+    tool_use call (one whose input includes a `confirm` key) that hasn't been
+    confirmed yet. Returns {"name":, "input":} or None. Deliberately looks at
+    the whole history, not just the windowed slice sent to the model, since a
+    pending confirmation needs to survive even a long-running thread."""
+    last_call = None  # (row_idx, name, input, tool_use_id)
+    for idx, row in enumerate(history_rows):
+        if row.get("role") != "assistant":
+            continue
+        for block in row.get("content") or []:
+            if block.get("type") == "tool_use" and "confirm" in (block.get("input") or {}):
+                last_call = (idx, block["name"], block.get("input") or {}, block.get("id"))
+    if not last_call:
+        return None
+    idx, name, tool_input, tool_use_id = last_call
+    if tool_input.get("confirm"):
+        return None  # the last guardrail call already WAS the confirm -- nothing pending
+    if idx + 1 >= len(history_rows):
+        return None
+    for rblock in history_rows[idx + 1].get("content") or []:
+        if rblock.get("type") == "tool_result" and rblock.get("tool_use_id") == tool_use_id:
+            try:
+                parsed = json.loads(rblock.get("content") or "{}")
+            except Exception:
+                parsed = {}
+            if parsed.get("preview"):
+                return {"name": name, "input": tool_input}
+    return None
+
+async def _try_confirm_bypass(mcp_server, db, conversation_id, history_rows, user_text):
+    """Returns the reply text if this message could be handled without the
+    LLM (a bare yes/no answering a pending guardrail preview), else None --
+    None means the caller should report the API error as-is rather than
+    silently guessing at a brand-new instruction."""
+    text = (user_text or "").strip()
+    is_yes, is_no = bool(YES_RE.match(text)), bool(NO_RE.match(text))
+    if not (is_yes or is_no):
+        return None
+    pending = _find_pending_confirmation(history_rows)
+    if not pending:
+        return None
+    if is_no:
+        return (
+            f"⚠️ Anthropic is unavailable right now, so I can't have a real conversation about it, but I "
+            f"caught that you want to cancel \"{pending['name']}\" -- done, nothing was changed."
+        )
+    try:
+        result = await mcp_server.call_tool(pending["name"], {**pending["input"], "confirm": True})
+        result_text = "\n".join(getattr(c, "text", str(c)) for c in result) if hasattr(result, "__iter__") else str(result)
+    except Exception as e:
+        return f"⚠️ Anthropic is unavailable, and the fallback confirm for \"{pending['name']}\" also failed: {e}"
+    return (
+        f"⚠️ Anthropic is unavailable right now (likely low credit balance), so this went through via a "
+        f"rule-based fallback instead of me actually reading your message -- confirmed \"{pending['name']}\".\n\n"
+        f"Raw result: {result_text[:800]}"
+    )
+
+def _friendly_api_error(e) -> str:
+    msg = str(e)
+    low = msg.lower()
+    if "credit balance" in low or "insufficient_quota" in low:
+        return (
+            "⚠️ Can't reach the Manager's AI model right now -- the Anthropic account is out of credit. "
+            "Top up at console.anthropic.com (Settings → Billing), then just send your message again -- "
+            "nothing was lost, I'll pick up right where we left off."
+        )
+    if "overloaded" in low or "529" in msg or "503" in msg:
+        return "⚠️ Anthropic's API is temporarily overloaded. Try again in a minute or two -- your message is saved, nothing was lost."
+    return f"⚠️ Couldn't reach the Manager's AI model right now ({msg[:200]}). Your message is saved -- try again shortly."
 MAX_TOKENS = 2048
 
 # How many of the most recent user-initiated turns get replayed to the model
@@ -253,10 +346,40 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
     tool_calls_made = []
 
     for _ in range(MAX_TOOL_ITERS):
-        resp = await client.messages.create(
-            model=AGENT_MODEL, max_tokens=MAX_TOKENS, system=system_prompt,
-            tools=tools, messages=messages,
-        )
+        try:
+            resp = await client.messages.create(
+                model=AGENT_MODEL, max_tokens=MAX_TOKENS, system=system_prompt,
+                tools=tools, messages=messages,
+            )
+        except (anthropic.APIStatusError, anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+            # 1. Cheapest, most reliable fallback: a bare yes/no answering a
+            #    guardrail preview that already ran doesn't need an LLM at all.
+            bypass_text = await _try_confirm_bypass(mcp_server, db, conversation_id, history_rows, user_text)
+            if bypass_text is not None:
+                await db.add_agent_message(conversation_id, "assistant", [{"type": "text", "text": bypass_text}])
+                return {
+                    "text": bypass_text, "tokens_in": 0, "tokens_out": 0,
+                    "cache_write_tokens": 0, "cache_read_tokens": 0,
+                    "est_cost_usd": 0, "tool_calls": [], "bypass": True,
+                }
+            # 2. A brand-new instruction genuinely needs a model to interpret
+            #    it -- if a Gemini key is configured, hand this SAME turn
+            #    (same tools, same guardrails) to it instead of just failing.
+            if gemini_fallback.is_configured():
+                try:
+                    system_text = SYSTEM_PROMPT_STATIC + "\n\n" + dynamic_context
+                    mcp_tools = await mcp_server.list_tools()
+                    result = await gemini_fallback.run_gemini_turn(mcp_server, db, conversation_id, system_text, messages, mcp_tools)
+                    result["text"] = (
+                        "🔁 _(Anthropic is unavailable right now -- this reply came from the Gemini fallback instead.)_\n\n"
+                        + result["text"]
+                    )
+                    return result
+                except Exception:
+                    pass  # Gemini fallback itself failed -- fall through to the plain friendly error below
+            friendly = _friendly_api_error(e)
+            await db.add_agent_message(conversation_id, "assistant", [{"type": "text", "text": friendly}])
+            raise AgentUnavailableError(friendly) from e
         total_in += resp.usage.input_tokens
         total_out += resp.usage.output_tokens
         total_cache_write += getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
