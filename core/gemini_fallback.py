@@ -1,20 +1,21 @@
 """
-Secondary LLM fallback for the TDPK Manager agent -- used ONLY when the
-primary Anthropic call fails (out of credit, rate-limited, momentarily down)
-and the rule-based yes/no bypass in core/agent.py doesn't apply (i.e. this is
-a brand-new instruction, not just confirming/cancelling something already
-previewed). Routes that SAME turn -- same MCP tool registry, same guardrails
-(a write tool with a `confirm` param still does nothing on the first call,
-unconditionally, regardless of which model is driving) -- through Google's
-Gemini API instead, via direct REST calls (no SDK dependency, httpx is
-already a project dependency) so the Manager keeps working end-to-end during
-an Anthropic outage/empty balance rather than just failing.
+Google Gemini driver for the TDPK Manager agent. As of the cost-control
+rework in core/agent.py, this is the DEFAULT model for any turn Tier 1
+(core/rules.py) didn't handle with zero LLM cost -- not a last-resort
+fallback any more. Claude is the one held in reserve now (used only if a
+message explicitly asks for it, or if Gemini itself can't be reached) --
+see core/agent.py's module docstring for the full routing chain. Routes a
+turn through the SAME MCP tool registry and the SAME guardrails (a write
+tool with a `confirm` param still does nothing on the first call,
+unconditionally, regardless of which model is driving) via direct REST
+calls to Google's API (no SDK dependency, httpx is already a project
+dependency).
 
 Needs GEMINI_API_KEY set on Render (free tier covers light usage).
 GEMINI_FALLBACK_MODEL to change the model (default: a fast/free-tier-eligible
 one).
 
-Known limitations -- this is a fallback, not a parity guarantee:
+Known limitations -- this is a cheaper default, not a Claude-parity guarantee:
   - Gemini's own judgement about when to ask for confirmation, or how it
     phrases things, can differ from Claude's. The TOOL-LEVEL guardrail
     (confirm=false always returns a preview, never executes) is what

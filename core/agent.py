@@ -7,15 +7,17 @@ second copy of the logic.
 
 How it reuses the MCP tools: `mcp_server` (the FastMCP instance built in
 main.py) already has every tool registered with its schema. We hand its
-tool list straight to Claude as the tool definitions, and execute a tool call
-by calling `mcp_server.call_tool(name, args)` -- same function, same
-confirm-gating, same preview-then-confirm behaviour as the MCP connector and
-the dashboard's own buttons get. Nothing here duplicates a single API call.
+tool list straight to whichever model is driving as the tool definitions,
+and execute a tool call by calling `mcp_server.call_tool(name, args)` -- same
+function, same confirm-gating, same preview-then-confirm behaviour as the MCP
+connector and the dashboard's own buttons get. Nothing here duplicates a
+single API call.
 
 Guardrails live in two places:
   1. The tools themselves -- any write action with a `confirm` parameter does
      nothing on the first call and returns a preview instead. That's
-     unconditional, not something this module can bypass by accident.
+     unconditional, not something this module can bypass by accident, no
+     matter which model (or none at all) is driving a given turn.
   2. The system prompt -- told explicitly, every turn, which automation
      categories are currently toggled on (meaning the agent may confirm an
      action for that category without waiting for a fresh human "yes" in
@@ -28,6 +30,32 @@ Three tiers of write action, by risk:
     catalog operations (can touch hundreds of products), and order
     cancel/refund. These are called out explicitly in the prompt below and
     must never be auto-confirmed, regardless of any toggle.
+
+── Model routing (the cost-control chain) ───────────────────────────────────
+Anthropic credit is expensive and most day-to-day messages don't need Claude
+at all -- this is deliberately NOT "Claude with a cheap fallback" any more.
+The chain, in order, every turn:
+
+  Tier 1 -- core/rules.py, zero LLM cost. Handles a bare yes/no answering an
+            already-open guardrail preview (regardless of who opened it), and
+            a fixed set of routine lookups/actions matched by plain pattern
+            (order lookups, stock/filament/queue/pnl checks, fulfill/cancel/
+            refund by order id, a name-matched price change). Conservative by
+            design: anything remotely ambiguous falls through to Tier 2
+            rather than guessing.
+  Tier 2 -- Google Gemini (free tier), the DEFAULT model for anything Tier 1
+            didn't handle. Same MCP tool registry, same guardrails.
+  Tier 3 -- Claude, reserved. Only used when (a) the message contains a
+            keyword like "use claude"/"ask claude", or (b) Gemini itself is
+            unreachable (not configured, down, rate-limited) -- never as a
+            silent "Gemini's answer seemed off, let me spend credit to
+            double-check" retry. If you ask for Claude and Claude can't be
+            reached either, Gemini is tried as the fallback in that
+            direction too, so one working model is always attempted before
+            giving up.
+  If nothing in the chain can answer: a clean AgentUnavailableError message,
+  never raw SDK/HTTP text. Your message is never lost either way -- it's
+  persisted to Supabase before any model is even attempted.
 """
 
 import os, json, re
@@ -35,38 +63,52 @@ from datetime import datetime, timezone, timedelta
 import anthropic
 from anthropic import AsyncAnthropic
 from core import gemini_fallback
+from core import rules
 
 PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time, no DST -- fixed offset is correct year-round
 
 AGENT_MODEL = os.getenv("AGENT_MODEL", "claude-sonnet-4-5-20250929")
 MAX_TOOL_ITERS = 6
+MAX_TOKENS = 2048
 
-# ── Fallback when the Anthropic API itself is unreachable (out of credit,
-# rate-limited, momentarily down) ───────────────────────────────────────────
-# A full natural-language instruction genuinely needs an LLM to interpret --
-# there's no safe way around that. But the single most common thing typed
-# right after a guardrail preview is a bare "yes"/"confirm" or "no"/"cancel",
-# and THAT doesn't need an LLM at all: the previous (working) turn already
-# left a structured tool_use call with confirm=false sitting in history.
-# When the primary call fails, _try_confirm_bypass looks for exactly that
-# and, if found, re-invokes the same tool with confirm=true directly --
-# otherwise it reports the API error plainly instead of guessing.
+# A message containing one of these phrases routes THAT turn to Claude
+# instead of the default Gemini -- e.g. "use claude to check this order" or
+# just "ask claude". Doesn't require it to be the whole message.
+CLAUDE_TRIGGER_RE = re.compile(r"\b(?:use|ask|switch to)\s+claude\b", re.I)
+
+# A bare yes/no (matched against the FULL message, not just a prefix, since
+# "yes" on its own is the common case but "yes confirm" etc. should also
+# count) answering a pending guardrail preview -- the single most common
+# thing typed right after ANY preview, whoever opened it. Doesn't need any
+# model at all: the preview already left a structured tool_use call with
+# confirm=false sitting in history.
 YES_RE = re.compile(r"^\s*(yes|y|confirm(ed)?|proceed|do it|go ahead|approved?)\b", re.I)
 NO_RE = re.compile(r"^\s*(no|n|cancel|stop|abort|never\s*mind)\b", re.I)
 
+
 class AgentUnavailableError(Exception):
-    """Raised when the primary model call fails and no rule-based fallback
-    could handle it either. Always carries a clean, user-facing message --
-    never a raw SDK/HTTP error string -- so callers (the Telegram webhook,
-    the dashboard chat route) can show or send it as-is."""
+    """Raised when nothing in the model-routing chain could handle this
+    turn. Always carries a clean, user-facing message -- never a raw SDK/HTTP
+    error string -- so callers (the Telegram webhook, the dashboard chat
+    route) can show or send it as-is."""
     pass
+
+
+class _ModelUnreachable(Exception):
+    """Internal signal that a specific model (Claude or Gemini) couldn't be
+    used for this turn -- wraps whatever the underlying error was so
+    run_agent_turn can decide whether to try the other one."""
+    pass
+
 
 def _find_pending_confirmation(history_rows):
     """Scans the FULL conversation history for the most recent guardrail-style
     tool_use call (one whose input includes a `confirm` key) that hasn't been
     confirmed yet. Returns {"name":, "input":} or None. Deliberately looks at
     the whole history, not just the windowed slice sent to the model, since a
-    pending confirmation needs to survive even a long-running thread."""
+    pending confirmation needs to survive even a long-running thread. Works
+    identically whether Claude, Gemini, or Tier 1 (core/rules.py) opened the
+    preview -- they all write the same tool_use/tool_result shape."""
     last_call = None  # (row_idx, name, input, tool_use_id)
     for idx, row in enumerate(history_rows):
         if row.get("role") != "assistant":
@@ -91,11 +133,12 @@ def _find_pending_confirmation(history_rows):
                 return {"name": name, "input": tool_input}
     return None
 
+
 async def _try_confirm_bypass(mcp_server, db, conversation_id, history_rows, user_text):
-    """Returns the reply text if this message could be handled without the
-    LLM (a bare yes/no answering a pending guardrail preview), else None --
-    None means the caller should report the API error as-is rather than
-    silently guessing at a brand-new instruction."""
+    """Returns the reply text if this message is a bare yes/no answering an
+    already-open guardrail preview, else None. Zero LLM cost either way --
+    this is checked FIRST, every turn, not just when a model call fails, so
+    the single most common reply in this whole app never spends anything."""
     text = (user_text or "").strip()
     is_yes, is_no = bool(YES_RE.match(text)), bool(NO_RE.match(text))
     if not (is_yes or is_no):
@@ -104,64 +147,45 @@ async def _try_confirm_bypass(mcp_server, db, conversation_id, history_rows, use
     if not pending:
         return None
     if is_no:
-        return (
-            f"⚠️ Anthropic is unavailable right now, so I can't have a real conversation about it, but I "
-            f"caught that you want to cancel \"{pending['name']}\" -- done, nothing was changed."
-        )
+        return f"Got it -- cancelled \"{pending['name']}\". Nothing was changed."
     try:
         result = await mcp_server.call_tool(pending["name"], {**pending["input"], "confirm": True})
         result_text = "\n".join(getattr(c, "text", str(c)) for c in result) if hasattr(result, "__iter__") else str(result)
     except Exception as e:
-        return f"⚠️ Anthropic is unavailable, and the fallback confirm for \"{pending['name']}\" also failed: {e}"
+        return f"Tried to confirm \"{pending['name']}\" but it failed: {e}"
+    return f"Confirmed -- \"{pending['name']}\" went through.\n\nResult: {result_text[:800]}"
+
+
+def _friendly_unavailable_error(primary_name, primary_err, secondary_name, secondary_err) -> str:
+    """Builds a plain-language message when BOTH the primary and secondary
+    model in this turn's routing order failed. Named per-provider so the
+    message is accurate regardless of which one was tried first (Gemini by
+    default, Claude if you asked for it or Gemini wasn't reachable)."""
+    msg = str(primary_err).lower()
+    if primary_name == "claude" and ("credit balance" in msg or "insufficient_quota" in msg):
+        claude_note = "the Anthropic account is out of credit (top up at console.anthropic.com -> Settings -> Billing)"
+    elif primary_name == "claude" and ("overloaded" in msg or "529" in msg or "503" in msg):
+        claude_note = "Anthropic's API is temporarily overloaded"
+    elif primary_name == "gemini":
+        claude_note = "Gemini couldn't be reached (check GEMINI_API_KEY on Render, or it may be rate-limited)"
+    else:
+        claude_note = f"{primary_name.capitalize()} couldn't be reached ({str(primary_err)[:150]})"
     return (
-        f"⚠️ Anthropic is unavailable right now (likely low credit balance), so this went through via a "
-        f"rule-based fallback instead of me actually reading your message -- confirmed \"{pending['name']}\".\n\n"
-        f"Raw result: {result_text[:800]}"
+        f"⚠️ Couldn't get a reply -- {claude_note}, and the {secondary_name} fallback didn't work "
+        f"either ({str(secondary_err)[:150]}). Your message is saved -- try again shortly, or check the "
+        f"dashboard's direct panels (Orders/Catalog/Inventory) which don't need any model at all."
     )
 
-def _friendly_api_error(e) -> str:
-    msg = str(e)
-    low = msg.lower()
-    if "credit balance" in low or "insufficient_quota" in low:
-        return (
-            "⚠️ Can't reach the Manager's AI model right now -- the Anthropic account is out of credit. "
-            "Top up at console.anthropic.com (Settings → Billing), then just send your message again -- "
-            "nothing was lost, I'll pick up right where we left off."
-        )
-    if "overloaded" in low or "529" in msg or "503" in msg:
-        return "⚠️ Anthropic's API is temporarily overloaded. Try again in a minute or two -- your message is saved, nothing was lost."
-    return f"⚠️ Couldn't reach the Manager's AI model right now ({msg[:200]}). Your message is saved -- try again shortly."
-MAX_TOKENS = 2048
 
-# How many of the most recent user-initiated turns get replayed to the model
-# each call. Full history is always kept in Supabase for the dashboard
-# transcript -- this only bounds what gets RESENT as input tokens, which
-# otherwise grows without limit for a long-running conversation (most
-# importantly the standing "Telegram" conversation, which never gets
-# replaced with a fresh one the way a dashboard conversation does). Override
-# with AGENT_HISTORY_TURNS if needed.
 MAX_HISTORY_TURNS = int(os.getenv("AGENT_HISTORY_TURNS", "15") or 15)
-
-# Tool results (e.g. list_orders, get_pnl) can be large. The live turn still
-# sees the full result so its immediate answer is accurate, but only a
-# truncated copy gets written to history -- otherwise every big read ever
-# made in a conversation gets re-billed as input tokens on every future turn
-# in that same conversation, forever.
 MAX_STORED_TOOL_RESULT_CHARS = 4000
 
 # Rough USD-per-million-token estimate shown in the UI -- NOT a billing source
-# of truth, just enough to keep an eye on spend. Update if pricing changes.
-# Cache writes cost 1.25x a normal input token (one-time, when a cache entry
-# is first created); cache reads cost 0.1x a normal input token (every turn
-# after that reuses the cached system prompt + tools for a tenth of the
-# price) -- see Anthropic's prompt-caching pricing.
+# of truth, just enough to keep an eye on spend. Only applies to Claude turns;
+# Gemini's free tier is tracked as zero cost (tokens_in/out are reported as 0
+# by gemini_fallback.run_gemini_turn).
 PRICING_PER_MTOK = {"in": 3.0, "out": 15.0, "cache_write": 3.75, "cache_read": 0.3}
 
-# Split into a large STATIC block (cached -- identical on every call, so
-# Anthropic's prompt caching reuses it instead of rebilling it as fresh input
-# tokens each turn) and a small DYNAMIC block appended after (current time +
-# live automation-toggle state, which do change turn to turn so must stay
-# outside the cached portion).
 SYSTEM_PROMPT_STATIC = """You are "TDPK Manager" -- the in-app assistant for TD Shopify Manager (TDPK), a \
 private admin tool for thirddimension.pk, a 3D-printing store in Pakistan selling mostly via \
 cash-on-delivery through the PostEx courier. You act as a general manager for the WHOLE business, not \
@@ -197,7 +221,8 @@ your reply what you did.
 
 TIER 3 -- plain reads and routine single-item actions that don't need a confirm step at all (looking up \
 orders, checking stock, logging an accounting entry, marking a single order fulfilled, logging a \
-filament purchase, creating or cancelling a reminder). Just do these when asked.
+filament purchase, creating or cancelling a reminder, updating one specific variant's price when you \
+already know its exact product_id/variant_id). Just do these when asked.
 
 OTHER RULES:
 
@@ -232,19 +257,11 @@ Be concise and concrete -- report real numbers and real outcomes, not vague summ
 def _mcp_tools_to_anthropic(mcp_tools):
     tools = [{"name": t.name, "description": t.description or "", "input_schema": t.inputSchema} for t in mcp_tools]
     if tools:
-        # Marks the end of a cacheable segment -- the whole tool list (all 70+
-        # schemas) gets reused from cache on the next call instead of being
-        # rebilled as input tokens, as long as the tool list itself hasn't
-        # changed since the last call.
         tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
     return tools
 
 
 def _truncate_for_storage(text, limit=MAX_STORED_TOOL_RESULT_CHARS):
-    """Caps what a tool result looks like once it's history (replayed to the
-    model on every future turn in this conversation) -- the current turn
-    still sees and reasons over the FULL result, only the stored copy is
-    capped."""
     if not isinstance(text, str) or len(text) <= limit:
         return text
     cut = len(text) - limit
@@ -252,12 +269,6 @@ def _truncate_for_storage(text, limit=MAX_STORED_TOOL_RESULT_CHARS):
 
 
 def _window_messages(messages, max_turns=MAX_HISTORY_TURNS):
-    """Keeps only the most recent `max_turns` user-initiated turns (a real
-    human message, not a tool_result handed back mid-turn) and everything
-    from that point on. Always cuts at a genuine turn boundary, so a
-    tool_use/tool_result pair is never split across the cut. Full history
-    stays in Supabase regardless -- this only bounds what gets resent to the
-    model as input tokens."""
     turn_starts = [
         i for i, m in enumerate(messages)
         if m["role"] == "user" and isinstance(m["content"], list)
@@ -269,11 +280,7 @@ def _window_messages(messages, max_turns=MAX_HISTORY_TURNS):
 
 
 def _content_to_blocks(resp_content):
-    blocks = []
-    for b in resp_content:
-        d = b.model_dump()
-        blocks.append(d)
-    return blocks
+    return [b.model_dump() for b in resp_content]
 
 
 def _extract_text(blocks):
@@ -281,9 +288,6 @@ def _extract_text(blocks):
 
 
 def _derive_title(user_text):
-    """Turns a user's first message into a short conversation title, so the
-    sidebar doesn't fill up with indistinguishable "New conversation" rows.
-    No extra model call -- just a cheap, deterministic truncation."""
     collapsed = " ".join(user_text.split())
     if len(collapsed) > 48:
         collapsed = collapsed[:45].rstrip() + "..."
@@ -304,42 +308,15 @@ async def _automation_summary(db):
     return "\n".join(lines)
 
 
-async def run_agent_turn(mcp_server, db, conversation_id, user_text):
-    """Runs one user turn through to a final assistant reply, executing any
-    tool calls Claude makes along the way. Persists every message (user,
-    assistant text/tool_use, and tool_result) so the conversation can be
-    reloaded and continued later exactly as Anthropic's API expects it."""
+async def _run_claude_loop(mcp_server, db, conversation_id, system_prompt, tools, messages):
+    """Runs the tool-calling loop against Claude. `messages` is mutated in
+    place (appended to as the loop progresses) so that if this raises
+    _ModelUnreachable partway through, whatever was already persisted/
+    appended is still there for the Gemini fallback to pick up from."""
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY is not set on the server -- add it on Render to use the agent.")
-
+        raise _ModelUnreachable("ANTHROPIC_API_KEY is not set on the server")
     client = AsyncAnthropic(api_key=api_key)
-    now_pkt = datetime.now(timezone.utc).astimezone(PKT).strftime("%Y-%m-%d %H:%M (%A)")
-    dynamic_context = (
-        f"Current date/time (Pakistan local, UTC+5): {now_pkt}.\n\n"
-        f"Current automation settings:\n{await _automation_summary(db)}"
-    )
-    # Two blocks: the big static instructions (cached -- reused across calls
-    # instead of rebilled every turn) and this small per-turn block (never
-    # cached, since it changes turn to turn).
-    system_prompt = [
-        {"type": "text", "text": SYSTEM_PROMPT_STATIC, "cache_control": {"type": "ephemeral"}},
-        {"type": "text", "text": dynamic_context},
-    ]
-
-    history_rows = await db.list_agent_messages(conversation_id)
-    full_messages = [{"role": r["role"], "content": r["content"]} for r in history_rows]
-    is_first_message = not history_rows
-
-    await db.add_agent_message(conversation_id, "user", [{"type": "text", "text": user_text}])
-    full_messages.append({"role": "user", "content": [{"type": "text", "text": user_text}]})
-
-    # Only the most recent MAX_HISTORY_TURNS get sent to the model -- bounds
-    # input-token cost for long-running conversations (the standing Telegram
-    # thread especially). Full history is still in Supabase regardless.
-    messages = _window_messages(full_messages)
-
-    tools = _mcp_tools_to_anthropic(await mcp_server.list_tools())
 
     total_in = total_out = total_cache_write = total_cache_read = 0
     final_text = ""
@@ -352,34 +329,7 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
                 tools=tools, messages=messages,
             )
         except (anthropic.APIStatusError, anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
-            # 1. Cheapest, most reliable fallback: a bare yes/no answering a
-            #    guardrail preview that already ran doesn't need an LLM at all.
-            bypass_text = await _try_confirm_bypass(mcp_server, db, conversation_id, history_rows, user_text)
-            if bypass_text is not None:
-                await db.add_agent_message(conversation_id, "assistant", [{"type": "text", "text": bypass_text}])
-                return {
-                    "text": bypass_text, "tokens_in": 0, "tokens_out": 0,
-                    "cache_write_tokens": 0, "cache_read_tokens": 0,
-                    "est_cost_usd": 0, "tool_calls": [], "bypass": True,
-                }
-            # 2. A brand-new instruction genuinely needs a model to interpret
-            #    it -- if a Gemini key is configured, hand this SAME turn
-            #    (same tools, same guardrails) to it instead of just failing.
-            if gemini_fallback.is_configured():
-                try:
-                    system_text = SYSTEM_PROMPT_STATIC + "\n\n" + dynamic_context
-                    mcp_tools = await mcp_server.list_tools()
-                    result = await gemini_fallback.run_gemini_turn(mcp_server, db, conversation_id, system_text, messages, mcp_tools)
-                    result["text"] = (
-                        "🔁 _(Anthropic is unavailable right now -- this reply came from the Gemini fallback instead.)_\n\n"
-                        + result["text"]
-                    )
-                    return result
-                except Exception:
-                    pass  # Gemini fallback itself failed -- fall through to the plain friendly error below
-            friendly = _friendly_api_error(e)
-            await db.add_agent_message(conversation_id, "assistant", [{"type": "text", "text": friendly}])
-            raise AgentUnavailableError(friendly) from e
+            raise _ModelUnreachable(str(e)) from e
         total_in += resp.usage.input_tokens
         total_out += resp.usage.output_tokens
         total_cache_write += getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
@@ -404,10 +354,6 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
             except Exception as e:
                 result_text = f"Error: {e}"
             tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": result_text})
-        # The live turn keeps the full-size results (messages/tools list) so
-        # its own answer this turn is accurate; only the copy written to
-        # history is capped, so a big read made now doesn't get rebilled at
-        # full size on every future turn in this conversation.
         messages.append({"role": "user", "content": tool_results})
         stored_tool_results = [
             {**tr, "content": _truncate_for_storage(tr["content"])} for tr in tool_results
@@ -415,6 +361,105 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
         await db.add_agent_message(conversation_id, "user", stored_tool_results)
     else:
         final_text = final_text or "I hit this turn's tool-call limit -- say \"continue\" and I'll pick back up."
+
+    return {
+        "text": final_text,
+        "tokens_in": total_in, "tokens_out": total_out,
+        "cache_write_tokens": total_cache_write, "cache_read_tokens": total_cache_read,
+        "tool_calls": tool_calls_made,
+        "provider": "claude",
+    }
+
+
+async def _run_gemini(mcp_server, db, conversation_id, system_text, messages, mcp_tools):
+    if not gemini_fallback.is_configured():
+        raise _ModelUnreachable("GEMINI_API_KEY is not set on the server")
+    try:
+        return await gemini_fallback.run_gemini_turn(mcp_server, db, conversation_id, system_text, messages, mcp_tools)
+    except Exception as e:
+        raise _ModelUnreachable(str(e)) from e
+
+
+async def run_agent_turn(mcp_server, db, conversation_id, user_text):
+    """Runs one user turn through to a final assistant reply. Persists every
+    message (user, assistant text/tool_use, and tool_result) so the
+    conversation can be reloaded and continued later exactly as the model
+    APIs expect it.
+
+    Routing order (see module docstring): Tier 1 rule-based bypass first
+    (zero LLM cost) -> Gemini by default -> Claude only if asked for by
+    keyword or Gemini can't be reached -> a clean error if neither works."""
+    history_rows = await db.list_agent_messages(conversation_id)
+
+    # Tier 1a: a bare yes/no closing out an already-open guardrail preview --
+    # whoever opened it (Claude, Gemini, or Tier 1b below), zero LLM cost.
+    bypass_text = await _try_confirm_bypass(mcp_server, db, conversation_id, history_rows, user_text)
+    if bypass_text is not None:
+        await db.add_agent_message(conversation_id, "user", [{"type": "text", "text": user_text}])
+        await db.add_agent_message(conversation_id, "assistant", [{"type": "text", "text": bypass_text}])
+        return {
+            "text": bypass_text, "tokens_in": 0, "tokens_out": 0,
+            "cache_write_tokens": 0, "cache_read_tokens": 0,
+            "est_cost_usd": 0, "tool_calls": [], "tier": "confirm_bypass",
+        }
+
+    # Tier 1b: a brand-new instruction matching a known routine pattern --
+    # also zero LLM cost. Conservative: returns None on anything ambiguous.
+    rule_text = await rules.try_handle(mcp_server, db, conversation_id, user_text)
+    if rule_text is not None:
+        await db.add_agent_message(conversation_id, "user", [{"type": "text", "text": user_text}])
+        await db.add_agent_message(conversation_id, "assistant", [{"type": "text", "text": rule_text}])
+        return {
+            "text": rule_text, "tokens_in": 0, "tokens_out": 0,
+            "cache_write_tokens": 0, "cache_read_tokens": 0,
+            "est_cost_usd": 0, "tool_calls": [], "tier": "rule",
+        }
+
+    # From here on, a real model is needed.
+    full_messages = [{"role": r["role"], "content": r["content"]} for r in history_rows]
+    is_first_message = not history_rows
+    await db.add_agent_message(conversation_id, "user", [{"type": "text", "text": user_text}])
+    full_messages.append({"role": "user", "content": [{"type": "text", "text": user_text}]})
+    messages = _window_messages(full_messages)
+
+    now_pkt = datetime.now(timezone.utc).astimezone(PKT).strftime("%Y-%m-%d %H:%M (%A)")
+    dynamic_context = (
+        f"Current date/time (Pakistan local, UTC+5): {now_pkt}.\n\n"
+        f"Current automation settings:\n{await _automation_summary(db)}"
+    )
+    system_prompt_claude = [
+        {"type": "text", "text": SYSTEM_PROMPT_STATIC, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": dynamic_context},
+    ]
+    system_text_gemini = SYSTEM_PROMPT_STATIC + "\n\n" + dynamic_context
+    mcp_tools = await mcp_server.list_tools()
+    anthropic_tools = _mcp_tools_to_anthropic(mcp_tools)
+
+    wants_claude = bool(CLAUDE_TRIGGER_RE.search(user_text))
+
+    async def _try_claude():
+        return await _run_claude_loop(mcp_server, db, conversation_id, system_prompt_claude, anthropic_tools, messages)
+
+    async def _try_gemini():
+        return await _run_gemini(mcp_server, db, conversation_id, system_text_gemini, messages, mcp_tools)
+
+    if wants_claude:
+        primary, secondary = (("claude", _try_claude), ("gemini", _try_gemini))
+    else:
+        primary, secondary = (("gemini", _try_gemini), ("claude", _try_claude))
+    (primary_name, primary_fn), (secondary_name, secondary_fn) = primary, secondary
+
+    try:
+        result = await primary_fn()
+    except _ModelUnreachable as e1:
+        try:
+            result = await secondary_fn()
+            tag = f"\U0001f501 _({primary_name.capitalize()} is unavailable right now -- this reply came from {secondary_name.capitalize()} instead.)_\n\n"
+            result["text"] = tag + result["text"]
+        except _ModelUnreachable as e2:
+            friendly = _friendly_unavailable_error(primary_name, e1, secondary_name, e2)
+            await db.add_agent_message(conversation_id, "assistant", [{"type": "text", "text": friendly}])
+            raise AgentUnavailableError(friendly) from e1
 
     title = None
     if is_first_message:
@@ -425,9 +470,10 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
         current_title = (conv or {}).get("title")
         if not current_title or current_title == "New conversation":
             title = _derive_title(user_text)
-    # total_in from the API already excludes cache_read tokens (counted
-    # separately), so this sums all four buckets at their own real price
-    # instead of treating a cheap cache-read token as a full-price one.
+    total_in = result.get("tokens_in", 0)
+    total_out = result.get("tokens_out", 0)
+    total_cache_write = result.get("cache_write_tokens", 0)
+    total_cache_read = result.get("cache_read_tokens", 0)
     await db.bump_agent_conversation_tokens(conversation_id, total_in, total_out, title=title)
     cost_usd = (
         (total_in / 1_000_000) * PRICING_PER_MTOK["in"]
@@ -435,10 +481,5 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
         + (total_cache_write / 1_000_000) * PRICING_PER_MTOK["cache_write"]
         + (total_cache_read / 1_000_000) * PRICING_PER_MTOK["cache_read"]
     )
-    return {
-        "text": final_text,
-        "tokens_in": total_in, "tokens_out": total_out,
-        "cache_write_tokens": total_cache_write, "cache_read_tokens": total_cache_read,
-        "est_cost_usd": round(cost_usd, 4),
-        "tool_calls": tool_calls_made,
-    }
+    result["est_cost_usd"] = round(cost_usd, 4)
+    return result

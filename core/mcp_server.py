@@ -197,6 +197,14 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
         return data.get("order", {})
 
     @mcp.tool()
+    async def get_product(product_id: int) -> dict:
+        """Full raw Shopify product detail (all variants with price/stock/id) for one product id. Use this
+        (after search_products to find the id) when you need the exact variant list -- search_products only
+        returns a trimmed single-variant price for a quick listing-health check."""
+        data = await shopify._get(f"/products/{product_id}.json")
+        return data.get("product", {})
+
+    @mcp.tool()
     async def search_products(
         search: Optional[str] = None, vendor: Optional[str] = None, product_type: Optional[str] = None,
         zero_stock: bool = False, zero_price: bool = False, no_image: bool = False, limit: int = 50,
@@ -277,8 +285,23 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
         return {"ok": True, "fulfillment": result, "filament": filament_result}
 
     @mcp.tool()
-    async def update_variant_price(product_id: int, variant_id: int, price: str) -> dict:
-        """Update a single Shopify product variant's price. WRITE action."""
+    async def update_variant_price(product_id: int, variant_id: int, price: str, confirm: bool = True) -> dict:
+        """Update a single Shopify product variant's price. WRITE action.
+
+        confirm defaults to TRUE -- unlike every other guardrailed tool in this
+        file -- deliberately, to preserve existing behaviour: a single,
+        explicitly-identified price change has always been treated as a routine
+        Tier-3 action Claude/Gemini can do directly, no confirm step. Pass
+        confirm=False to get a preview instead without changing anything; this
+        is what the Manager's rule-based Tier 1 uses for a name-matched price
+        change (e.g. "set price of X to Y"), where showing the exact
+        before/after first is safer than trusting a regex match blindly."""
+        if not confirm:
+            return {
+                "preview": True, "action": "Update variant price",
+                "details": {"product_id": product_id, "variant_id": variant_id, "new_price": price},
+                "note": "Nothing was changed. Call again with confirm=true to proceed.",
+            }
         result = await shopify.update_variant(product_id, variant_id, {"price": price})
         return {"ok": True, "variant": result}
 
