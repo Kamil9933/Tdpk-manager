@@ -257,8 +257,21 @@ class MetaClient:
         "custom_event_type": "PURCHASE"}, the standard setup for a Facebook
         Pixel tracking purchases, matching how "First Ad Set" (this account's
         known-working reference) is configured -- confirmed via meta_inspect
-        rather than assumed."""
-        targeting = {"geo_locations": {"countries": countries or ["PK"]}, "age_min": age_min, "age_max": age_max}
+        rather than assumed.
+
+        targeting_automation.advantage_audience is sent unconditionally
+        (always 1) because this account requires it the same way it requires
+        promoted_object -- "First Ad Set"'s own targeting (read live via
+        meta_inspect) carries it, and the account rejects ad-set creation
+        without it with a separate "Invalid parameter" (the next error after
+        promoted_object was fixed). This is Meta's "Advantage+ Audience"
+        (formerly Detailed Targeting Expansion), letting Meta expand beyond
+        the explicit age/geo targeting when it predicts better performance --
+        not something this account lets a new ad set opt out of."""
+        targeting = {
+            "geo_locations": {"countries": countries or ["PK"]}, "age_min": age_min, "age_max": age_max,
+            "targeting_automation": {"advantage_audience": 1},
+        }
         if genders:
             targeting["genders"] = genders
         params = {
