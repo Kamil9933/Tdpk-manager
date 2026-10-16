@@ -51,20 +51,35 @@ def _base():
     return f"https://graph.facebook.com/{_version()}"
 
 
+def _clean_env(name):
+    """Plain os.getenv, but defensively strips whitespace and a stray pair of
+    wrapping quote characters -- a common copy/paste mistake when setting a
+    value in Render's dashboard (e.g. pasting `"17841471831509961"` literally,
+    quotes included, instead of just the digits). A value like that reads back
+    as a non-empty string so no .get() default kicks in, but Meta then rejects
+    it outright (e.g. "must be a valid Instagram account id") with no hint
+    that the quotes themselves were the problem."""
+    v = os.getenv(name, "") or ""
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+        v = v[1:-1].strip()
+    return v
+
+
 class MetaClient:
     def __init__(self):
-        self.token = os.getenv("META_ACCESS_TOKEN", "")
-        self.page_id = os.getenv("META_PAGE_ID", "")
-        self.business_id = os.getenv("META_BUSINESS_ID", "")
-        ad_account = os.getenv("META_AD_ACCOUNT_ID", "")
+        self.token = _clean_env("META_ACCESS_TOKEN")
+        self.page_id = _clean_env("META_PAGE_ID")
+        self.business_id = _clean_env("META_BUSINESS_ID")
+        ad_account = _clean_env("META_AD_ACCOUNT_ID")
         self.ad_account_id = ad_account if ad_account.startswith("act_") else f"act_{ad_account}" if ad_account else ""
-        self.ig_user_id = os.getenv("META_IG_USER_ID", "")
+        self.ig_user_id = _clean_env("META_IG_USER_ID")
         # Needed on the ad set for an OUTCOME_SALES/OFFSITE_CONVERSIONS campaign
         # -- without it Meta rejects ad-set creation with "needs a promoted
         # object" (the pixel/event that tracks purchases). Find it via
         # meta_inspect on a known-working ad set (e.g. "First Ad Set")'s
         # promoted_object field if it's ever unset and this starts failing again.
-        self.pixel_id = os.getenv("META_PIXEL_ID", "")
+        self.pixel_id = _clean_env("META_PIXEL_ID")
 
     def _require(self, value, name):
         if not value:
@@ -283,18 +298,38 @@ class MetaClient:
             params["promoted_object"] = json.dumps(promoted_object)
         return await self._call("POST", f"{self._require(self.ad_account_id, 'META_AD_ACCOUNT_ID')}/adsets", params)
 
-    async def create_ad_creative(self, name, message, link, image_url=None, cta="SHOP_NOW", page_id=None, instagram_actor_id=None):
-        """instagram_actor_id lets the ad serve on Instagram placements using
-        that IG account's identity, not just Facebook -- previously missing
-        entirely. Defaults to META_IG_USER_ID (self.ig_user_id) so existing
-        callers get it for free without passing anything new."""
+    async def create_ad_creative(self, name, message, link, image_url=None, cta="SHOP_NOW", page_id=None, instagram_user_id=None):
+        """instagram_user_id lets the ad serve on Instagram placements using
+        that IG account's identity, not just Facebook. Defaults to
+        META_IG_USER_ID (self.ig_user_id) so existing callers get it for free
+        without passing anything new.
+
+        NOTE: this field used to be called `instagram_actor_id`. Meta
+        deprecated that name on exactly this endpoint (POST
+        /act_<id>/adcreatives) -- confirmed live against Meta's current
+        object_story_spec reference docs and their Jan 2025 Instagram/
+        Marketing API changelog, which states instagram_actor_id (and
+        instagram_story_id) were REPLACED by instagram_user_id (and
+        instagram_media_id) on the adcreatives/ads endpoints, with legacy
+        support ending Sept 9, 2025 -- well before this code runs. Sending
+        the old field name is exactly what produced "(#100) Param
+        instagram_actor_id must be a valid Instagram account id", even with a
+        verified-valid IG account id, because Meta no longer recognizes that
+        field on this endpoint at all. Do not revert this to
+        instagram_actor_id -- that is the deprecated name, not a style
+        choice."""
         link_data = {"message": message, "link": link, "call_to_action": {"type": cta, "value": {"link": link}}}
         if image_url:
             link_data["picture"] = image_url
         object_story_spec = {"page_id": page_id or self._require(self.page_id, "META_PAGE_ID"), "link_data": link_data}
-        ig_actor = instagram_actor_id or self.ig_user_id
+        ig_actor = instagram_user_id or self.ig_user_id
+        # Logged so a retry's exact outgoing value is visible in Render's
+        # logs -- if this is ever wrong again (e.g. a stray quote/space an
+        # env var edit reintroduces), repr() makes that visible immediately
+        # instead of looking like a plain correct-looking id.
+        print(f"[meta.create_ad_creative] resolved instagram_user_id = {ig_actor!r} (len={len(ig_actor) if ig_actor else 0})")
         if ig_actor:
-            object_story_spec["instagram_actor_id"] = ig_actor
+            object_story_spec["instagram_user_id"] = ig_actor
         return await self._call("POST", f"{self._require(self.ad_account_id, 'META_AD_ACCOUNT_ID')}/adcreatives", {
             "name": name, "object_story_spec": json.dumps(object_story_spec),
         })
