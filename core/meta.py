@@ -59,6 +59,12 @@ class MetaClient:
         ad_account = os.getenv("META_AD_ACCOUNT_ID", "")
         self.ad_account_id = ad_account if ad_account.startswith("act_") else f"act_{ad_account}" if ad_account else ""
         self.ig_user_id = os.getenv("META_IG_USER_ID", "")
+        # Needed on the ad set for an OUTCOME_SALES/OFFSITE_CONVERSIONS campaign
+        # -- without it Meta rejects ad-set creation with "needs a promoted
+        # object" (the pixel/event that tracks purchases). Find it via
+        # meta_inspect on a known-working ad set (e.g. "First Ad Set")'s
+        # promoted_object field if it's ever unset and this starts failing again.
+        self.pixel_id = os.getenv("META_PIXEL_ID", "")
 
     def _require(self, value, name):
         if not value:
@@ -173,6 +179,14 @@ class MetaClient:
             "date_preset": date_preset, "level": level, "limit": 100,
         })
 
+    async def get_object_fields(self, object_id, fields):
+        """Generic read of ANY Graph API object by id with whatever
+        comma-separated fields are asked for -- e.g. an ad set's
+        promoted_object, an ad's tracking_specs. For live debugging (what
+        does a known-working object actually have configured) without
+        needing a new purpose-built method every time a new field matters."""
+        return await self._call("GET", object_id, {"fields": fields})
+
     # ---------- ads: write ----------
 
     async def set_status(self, object_id, status):
@@ -221,7 +235,8 @@ class MetaClient:
         })
 
     async def create_adset(self, campaign_id, name, optimization_goal,
-                            countries, age_min=18, age_max=65, genders=None, status="PAUSED"):
+                            countries, age_min=18, age_max=65, genders=None, status="PAUSED",
+                            promoted_object=None):
         """No daily_budget/lifetime_budget here on purpose -- see create_campaign's
         docstring. An ad set under an Advantage-Campaign-Budget campaign (this
         account's convention) MUST NOT carry its own budget field; Meta rejects
@@ -233,15 +248,27 @@ class MetaClient:
         omitted entirely, not sent as "all" or [1,2], when not specified --
         Meta treats an absent genders field as unrestricted/all genders; the
         string "all" some logs show is only this app's own preview label, never
-        sent to Meta's API.)"""
+        sent to Meta's API.)
+
+        promoted_object: required by Meta for an OFFSITE_CONVERSIONS
+        optimization goal (the OUTCOME_SALES default) -- the pixel/event that
+        tracks purchases. Omitting it is exactly what produced the "ad set
+        needs a promoted object" error. Shape: {"pixel_id": "...",
+        "custom_event_type": "PURCHASE"}, the standard setup for a Facebook
+        Pixel tracking purchases, matching how "First Ad Set" (this account's
+        known-working reference) is configured -- confirmed via meta_inspect
+        rather than assumed."""
         targeting = {"geo_locations": {"countries": countries or ["PK"]}, "age_min": age_min, "age_max": age_max}
         if genders:
             targeting["genders"] = genders
-        return await self._call("POST", f"{self._require(self.ad_account_id, 'META_AD_ACCOUNT_ID')}/adsets", {
+        params = {
             "name": name, "campaign_id": campaign_id,
             "billing_event": "IMPRESSIONS", "optimization_goal": optimization_goal,
             "targeting": json.dumps(targeting), "status": status,
-        })
+        }
+        if promoted_object:
+            params["promoted_object"] = json.dumps(promoted_object)
+        return await self._call("POST", f"{self._require(self.ad_account_id, 'META_AD_ACCOUNT_ID')}/adsets", params)
 
     async def create_ad_creative(self, name, message, link, image_url=None, cta="SHOP_NOW", page_id=None, instagram_actor_id=None):
         """instagram_actor_id lets the ad serve on Instagram placements using
@@ -273,6 +300,13 @@ class MetaClient:
         resumed from the Ads tab, same as any other ad."""
         status = "ACTIVE" if launch_active else "PAUSED"
         optimization_goal = self.OBJECTIVE_OPTIMIZATION_DEFAULTS.get(objective, "LINK_CLICKS")
+        # OFFSITE_CONVERSIONS (the OUTCOME_SALES default) needs a promoted_object
+        # -- the pixel/event tracking purchases -- or Meta rejects ad-set
+        # creation with "needs a promoted object". META_PIXEL_ID mirrors how
+        # "First Ad Set" (this account's known-working reference) is set up.
+        promoted_object = None
+        if optimization_goal == "OFFSITE_CONVERSIONS" and self.pixel_id:
+            promoted_object = {"pixel_id": self.pixel_id, "custom_event_type": "PURCHASE"}
         progress = {}
         try:
             # Budget goes on the CAMPAIGN, not the ad set -- see create_campaign's
@@ -283,7 +317,8 @@ class MetaClient:
             camp = await self.create_campaign(campaign_name, objective, daily_budget_minor, status=status)
             progress["campaign_id"] = camp["id"]
             adset = await self.create_adset(camp["id"], f"{campaign_name} - Ad Set",
-                                             optimization_goal, countries, age_min, age_max, genders, status=status)
+                                             optimization_goal, countries, age_min, age_max, genders, status=status,
+                                             promoted_object=promoted_object)
             progress["adset_id"] = adset["id"]
             creative = await self.create_ad_creative(f"{campaign_name} - Creative", message, link, image_url, cta)
             progress["creative_id"] = creative["id"]

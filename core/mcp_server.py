@@ -567,6 +567,20 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
             return {"error": str(e)}
 
     @mcp.tool()
+    async def meta_inspect(object_id: str, fields: str) -> dict:
+        """Generic read-only lookup of any Meta Graph API object (campaign, ad
+        set, ad, creative) by id, with whatever comma-separated fields you ask
+        for -- e.g. fields="promoted_object,optimization_goal,billing_event"
+        on an ad set. For diagnosing an API error with little detail, or
+        checking exactly how an existing working object is configured so a new
+        one can mirror it (e.g. "First Ad Set"'s promoted_object), without
+        needing a new purpose-built tool every time a different field matters."""
+        try:
+            return await meta.get_object_fields(object_id, fields)
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
     async def list_ad_campaigns(limit: int = 25) -> dict:
         """List campaigns in the configured ad account with status and budget."""
         try:
