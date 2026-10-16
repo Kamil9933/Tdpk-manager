@@ -26,10 +26,21 @@ import httpx
 
 
 class MetaError(Exception):
-    def __init__(self, message, status=None, body=None):
+    def __init__(self, message, status=None, body=None, user_msg=None, subcode=None, field=None):
         super().__init__(message)
         self.status = status
         self.body = body
+        # Meta's error object carries much more than `message` -- error_user_msg
+        # is usually the actually-useful, human-readable explanation (e.g. "This
+        # ad set belongs to a campaign using campaign budget optimization...");
+        # error_subcode and the blamed field name pin down exactly what Meta
+        # rejected. All three used to be silently dropped by _call(), which made
+        # every failure look like a bare "Invalid parameter" with no way to tell
+        # WHY. Kept as attributes (not just folded into the message) so a caller
+        # can act on them programmatically if needed, as well as display them.
+        self.user_msg = user_msg
+        self.subcode = subcode
+        self.field = field
 
 
 def _version():
@@ -74,8 +85,29 @@ class MetaClient:
         except Exception:
             body = {}
         if r.status_code >= 400 or (isinstance(body, dict) and body.get("error")):
-            msg = (body.get("error") or {}).get("message") if isinstance(body, dict) else None
-            raise MetaError(f"Meta API error: {msg or f'HTTP {r.status_code}'}", status=r.status_code, body=body)
+            err = (body.get("error") or {}) if isinstance(body, dict) else {}
+            msg = err.get("message")
+            user_msg = err.get("error_user_msg")
+            user_title = err.get("error_user_title")
+            subcode = err.get("error_subcode")
+            # Meta sometimes names the offending field under error_data.blame_field_specs
+            # (a list of field-path lists, e.g. [["adset", "daily_budget"]]) -- surface
+            # it when present instead of making the caller go dig through the raw body.
+            blame = ((err.get("error_data") or {}).get("blame_field_specs") or [])
+            field = ", ".join(".".join(spec) for spec in blame) if blame else None
+            parts = [msg or f"HTTP {r.status_code}"]
+            if user_title:
+                parts.append(user_title)
+            if user_msg:
+                parts.append(user_msg)
+            if field:
+                parts.append(f"field: {field}")
+            if subcode:
+                parts.append(f"subcode: {subcode}")
+            raise MetaError(
+                "Meta API error: " + " -- ".join(parts),
+                status=r.status_code, body=body, user_msg=user_msg, subcode=subcode, field=field,
+            )
         return body
 
     # ---------- discovery / connection check ----------
@@ -170,28 +202,59 @@ class MetaClient:
         "OUTCOME_APP_PROMOTION": "APP_INSTALLS",
     }
 
-    async def create_campaign(self, name, objective, status="PAUSED"):
+    async def create_campaign(self, name, objective, daily_budget_minor, status="PAUSED", bid_strategy="LOWEST_COST_WITHOUT_CAP"):
+        """Budget lives HERE, at the campaign, not on the ad set -- this is
+        Advantage Campaign Budget (Meta's current name for what used to be
+        called CBO). Verified against this ad account's own existing campaigns
+        (via list_ad_campaigns/list_ad_sets): every campaign that works --
+        including "First", the one known-good reference -- carries daily_budget
+        at the campaign level with NO budget field on its ad set at all. A
+        campaign created without a budget here is rejected outright by this
+        account with a bare "Invalid parameter" (no budget = ad-set-budget mode,
+        which this account doesn't allow for new campaigns), which is exactly
+        the failure that prompted this fix. bid_strategy defaults to the
+        no-cap option so a bid cap isn't silently required too."""
         return await self._call("POST", f"{self._require(self.ad_account_id, 'META_AD_ACCOUNT_ID')}/campaigns", {
             "name": name, "objective": objective, "status": status,
             "special_ad_categories": "[]",
+            "daily_budget": daily_budget_minor, "bid_strategy": bid_strategy,
         })
 
-    async def create_adset(self, campaign_id, name, daily_budget_minor, optimization_goal,
+    async def create_adset(self, campaign_id, name, optimization_goal,
                             countries, age_min=18, age_max=65, genders=None, status="PAUSED"):
+        """No daily_budget/lifetime_budget here on purpose -- see create_campaign's
+        docstring. An ad set under an Advantage-Campaign-Budget campaign (this
+        account's convention) MUST NOT carry its own budget field; Meta rejects
+        it with "Invalid parameter" the same way it rejects a budget-less
+        campaign. This is also why set_ad_daily_budget fails on an EXISTING ad
+        set in this account: the campaign already owns the budget, so an
+        ad-set-level edit has nothing valid to change -- that's Meta correctly
+        refusing an invalid operation, not a bug in this client. (genders is
+        omitted entirely, not sent as "all" or [1,2], when not specified --
+        Meta treats an absent genders field as unrestricted/all genders; the
+        string "all" some logs show is only this app's own preview label, never
+        sent to Meta's API.)"""
         targeting = {"geo_locations": {"countries": countries or ["PK"]}, "age_min": age_min, "age_max": age_max}
         if genders:
             targeting["genders"] = genders
         return await self._call("POST", f"{self._require(self.ad_account_id, 'META_AD_ACCOUNT_ID')}/adsets", {
-            "name": name, "campaign_id": campaign_id, "daily_budget": daily_budget_minor,
+            "name": name, "campaign_id": campaign_id,
             "billing_event": "IMPRESSIONS", "optimization_goal": optimization_goal,
             "targeting": json.dumps(targeting), "status": status,
         })
 
-    async def create_ad_creative(self, name, message, link, image_url=None, cta="SHOP_NOW", page_id=None):
+    async def create_ad_creative(self, name, message, link, image_url=None, cta="SHOP_NOW", page_id=None, instagram_actor_id=None):
+        """instagram_actor_id lets the ad serve on Instagram placements using
+        that IG account's identity, not just Facebook -- previously missing
+        entirely. Defaults to META_IG_USER_ID (self.ig_user_id) so existing
+        callers get it for free without passing anything new."""
         link_data = {"message": message, "link": link, "call_to_action": {"type": cta, "value": {"link": link}}}
         if image_url:
             link_data["picture"] = image_url
         object_story_spec = {"page_id": page_id or self._require(self.page_id, "META_PAGE_ID"), "link_data": link_data}
+        ig_actor = instagram_actor_id or self.ig_user_id
+        if ig_actor:
+            object_story_spec["instagram_actor_id"] = ig_actor
         return await self._call("POST", f"{self._require(self.ad_account_id, 'META_AD_ACCOUNT_ID')}/adcreatives", {
             "name": name, "object_story_spec": json.dumps(object_story_spec),
         })
@@ -212,9 +275,14 @@ class MetaClient:
         optimization_goal = self.OBJECTIVE_OPTIMIZATION_DEFAULTS.get(objective, "LINK_CLICKS")
         progress = {}
         try:
-            camp = await self.create_campaign(campaign_name, objective, status=status)
+            # Budget goes on the CAMPAIGN, not the ad set -- see create_campaign's
+            # docstring. This is the actual fix for the "Invalid parameter" error:
+            # this ad account requires Advantage Campaign Budget (every existing
+            # campaign, including the known-working "First", carries its budget
+            # here with none on the ad set).
+            camp = await self.create_campaign(campaign_name, objective, daily_budget_minor, status=status)
             progress["campaign_id"] = camp["id"]
-            adset = await self.create_adset(camp["id"], f"{campaign_name} - Ad Set", daily_budget_minor,
+            adset = await self.create_adset(camp["id"], f"{campaign_name} - Ad Set",
                                              optimization_goal, countries, age_min, age_max, genders, status=status)
             progress["adset_id"] = adset["id"]
             creative = await self.create_ad_creative(f"{campaign_name} - Creative", message, link, image_url, cta)
