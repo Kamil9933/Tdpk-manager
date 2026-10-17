@@ -851,6 +851,25 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
         return {"payments": await db.list_employee_payments(employee_id, from_date, to_date)}
 
     @mcp.tool()
+    async def add_employee(
+        name: str, role: str = "", payment_type: str = "fixed_salary", rate: float = 0,
+        contact: str = "", start_date: Optional[str] = None,
+    ) -> dict:
+        """Add a new employee/contractor on record. payment_type is one of:
+        fixed_salary | hourly | per_job. `rate` is the fixed salary amount,
+        hourly rate, or per-job rate depending on payment_type -- it does not
+        itself create a payment, just sets the default so add_employee_payment
+        has something sensible to reference. WRITE action -- low risk (just a
+        roster entry), no confirm needed. db.create_employee already existed
+        (used nowhere until now); this exposes it as a tool, same pattern as
+        add_cash_account/update_printer."""
+        row = await db.create_employee({
+            "name": name, "role": role, "payment_type": payment_type, "rate": rate,
+            "contact": contact, "active": True, "start_date": start_date,
+        })
+        return {"ok": True, "employee": row}
+
+    @mcp.tool()
     async def list_cash_accounts() -> dict:
         """Cash/bank accounts with current computed balance (opening balance + logged transactions)."""
         accounts = await db.list_cash_accounts()

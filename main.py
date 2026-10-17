@@ -1688,6 +1688,81 @@ async def cron_tick(request: Request):
                 fired["ad_spend_sync_error"] = str(e)
             await db.mark_digest_sent(slot_key)
 
+    # ── Monthly Shopify subscription bill -> expense sync ─────────────────────
+    # User's ask (simplified from an earlier "check the bill" idea): just log
+    # the $25/mo Basic plan fee automatically each month, converted to PKR at
+    # whatever the live rate is that day, regardless of whether it's actually
+    # been paid yet ("bill generated should be logged in"). Fires once, on the
+    # 1st of each calendar month (we don't know Shopify's actual billing
+    # anniversary date, and the user said a monthly cadence is fine). Idempotent
+    # via slot "shopify_bill:<YYYY-MM>". SHOPIFY_BILL_USD lets the amount be
+    # changed later (e.g. if usage-based charges push the bill up) without a
+    # code change.
+    shopify_hh, shopify_mm = _parse_hhmm(os.getenv("SHOPIFY_SYNC_TIME", "03:00"))
+    if now_pkt.day == 1 and now_pkt.hour == shopify_hh and now_pkt.minute >= shopify_mm:
+        month_key = f"{now_pkt.year:04d}-{now_pkt.month:02d}"
+        slot_key = f"shopify_bill:{month_key}"
+        if not await db.digest_already_sent(slot_key):
+            try:
+                bill_usd = float(os.getenv("SHOPIFY_BILL_USD", "25"))
+                usd_pkr = 280.0  # fallback if the live-rate fetch below fails
+                try:
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        r = await client.get("https://open.er-api.com/v6/latest/USD")
+                        rate = (r.json() or {}).get("rates", {}).get("PKR")
+                        if rate:
+                            usd_pkr = float(rate)
+                except Exception:
+                    pass
+                amount_pkr = round(bill_usd * usd_pkr, 2)
+                await db.create_expense({
+                    "category": "software", "description": f"Shopify monthly subscription (${bill_usd:g} @ {usd_pkr:.2f} PKR/USD, auto-logged)",
+                    "amount": amount_pkr, "expense_date": now_pkt.date().isoformat(),
+                    "recurring": True, "recurrence_period": "monthly", "vendor_id": None,
+                })
+                fired["shopify_bill_synced"] = {"month": month_key, "usd": bill_usd, "pkr": amount_pkr, "rate": usd_pkr}
+            except Exception as e:
+                fired["shopify_bill_sync_error"] = str(e)
+            await db.mark_digest_sent(slot_key)
+
+    # ── Daily PostEx courier-fee ESTIMATE -> payout sync ──────────────────────
+    # PostEx's API doesn't expose real settlement/fee-deducted figures (only
+    # order-level status + COD value), so this can't log an exact fee the way
+    # the Meta ad-spend sync logs an exact spend. Per the user's correction,
+    # though, delivered-parcel counts ARE accessible and PostEx's standard fee
+    # is a known Rs 200-320/parcel range -- so this logs a defensible ESTIMATE
+    # (delivered count x rate) each day as a postex_payout row, clearly labeled
+    # as such in `notes` so it's obviously distinguishable later from a real
+    # statement entered via log_postex_payout. get_pnl's courier-fee line and
+    # get_postex_reconciliation both read from postex_payouts, so this makes
+    # the estimate flow into both automatically. POSTEX_FEE_PER_PARCEL (default
+    # 260, i.e. the midpoint of the 200-320 range) can be tuned via env without
+    # a code change once real statements show what the actual average is.
+    # Idempotent via slot "postex_fee_sync:<date>".
+    postex_hh, postex_mm = _parse_hhmm(os.getenv("POSTEX_SYNC_TIME", "02:00"))
+    if now_pkt.hour == postex_hh and now_pkt.minute >= postex_mm:
+        y = (now_pkt.date() - timedelta(days=1)).isoformat()
+        slot_key = f"postex_fee_sync:{y}"
+        if not await db.digest_already_sent(slot_key):
+            try:
+                rate = float(os.getenv("POSTEX_FEE_PER_PARCEL", "260"))
+                summary = await postex.get_dashboard_summary(from_date=y, to_date=y)
+                delivered = int(summary.get("delivered", 0) or 0)
+                gross = float(summary.get("delivered_cod", 0) or 0)
+                if delivered > 0:
+                    fee = round(delivered * rate, 2)
+                    await db.create_postex_payout({
+                        "payout_date": y, "gross_amount": gross, "fee_deducted": fee,
+                        "net_amount": round(gross - fee, 2), "order_count": delivered,
+                        "notes": f"ESTIMATED -- {delivered} delivered parcel(s) x Rs {rate:g}/parcel "
+                                 f"(standard PostEx range Rs 200-320), not a real settlement statement. "
+                                 f"Auto-logged; reconcile against actual PostEx payouts when available.",
+                    })
+                fired["postex_fee_synced"] = {"date": y, "delivered": delivered, "estimated_fee": delivered * rate if delivered else 0}
+            except Exception as e:
+                fired["postex_fee_sync_error"] = str(e)
+            await db.mark_digest_sent(slot_key)
+
     fired["printers_polled"] = await _poll_bambu_printers()
     fired["queue_synced"] = await _sync_queue_with_printers()
 
