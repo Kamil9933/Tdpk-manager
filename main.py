@@ -1625,6 +1625,13 @@ def _digest_slots():
             continue
     return slots or [(9, 0)]
 
+def _parse_hhmm(raw, default=(1, 0)):
+    try:
+        hh, mm = raw.strip().split(":")
+        return (int(hh), int(mm))
+    except Exception:
+        return default
+
 @app.post("/api/cron/tick")
 async def cron_tick(request: Request):
     if not CRON_SECRET or request.headers.get("X-Cron-Secret") != CRON_SECRET:
@@ -1651,6 +1658,35 @@ async def cron_tick(request: Request):
         await notify_all("TDPK Manager reminder", r["message"], db=db)
         await db.mark_reminder_sent(r["id"])
         fired["reminders"] += 1
+
+    # ── Daily Meta ad-spend -> expense sync ───────────────────────────────────
+    # Logs YESTERDAY's full ad spend once per day (not "today"'s, which is
+    # still accruing) as an operating expense (category "advertising"), so
+    # get_pnl's opex picks it up automatically without anyone manually
+    # transcribing numbers out of Ads Manager. Idempotent via the same
+    # digest_log slot mechanism the digest already uses (slot "ad_sync:<date>"),
+    # so a ping outage or extra-frequent pinging can't double-log a day.
+    # AD_SYNC_TIME defaults to 01:00 PKT -- well after midnight, so "yesterday"
+    # is a fully closed day in Meta's reporting by the time this fires.
+    ad_hh, ad_mm = _parse_hhmm(os.getenv("AD_SYNC_TIME", "01:00"))
+    if now_pkt.hour == ad_hh and now_pkt.minute >= ad_mm:
+        y = (now_pkt.date() - timedelta(days=1)).isoformat()
+        slot_key = f"ad_sync:{y}"
+        if not await db.digest_already_sent(slot_key):
+            try:
+                insights = await meta.get_insights(date_preset="yesterday", level="account")
+                rows = insights.get("data") or []
+                spend = round(sum(float(r.get("spend", 0) or 0) for r in rows), 2)
+                if spend > 0:
+                    await db.create_expense({
+                        "category": "advertising", "description": "Meta ads spend (auto-synced)",
+                        "amount": spend, "expense_date": y,
+                        "recurring": False, "recurrence_period": None, "vendor_id": None,
+                    })
+                fired["ad_spend_synced"] = {"date": y, "amount": spend}
+            except Exception as e:
+                fired["ad_spend_sync_error"] = str(e)
+            await db.mark_digest_sent(slot_key)
 
     fired["printers_polled"] = await _poll_bambu_printers()
     fired["queue_synced"] = await _sync_queue_with_printers()

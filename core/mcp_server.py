@@ -922,6 +922,32 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
         return {"ok": True, "printer": row}
 
     @mcp.tool()
+    async def update_printer(
+        printer_id: str, name: Optional[str] = None, model: Optional[str] = None,
+        vendor_id: Optional[str] = None, purchase_cost: Optional[float] = None,
+        purchase_date: Optional[str] = None, useful_life_years: Optional[float] = None,
+        salvage_value: Optional[float] = None, status: Optional[str] = None,
+    ) -> dict:
+        """Update an existing printer's record -- e.g. backfilling purchase_cost
+        and purchase_date on a printer that was added before its real cost was
+        known (depreciation in get_pnl is 0 until these are set). Only the
+        fields you pass are changed; everything else on the row is left as-is.
+        WRITE action -- but low risk (no spend/order side effects), no confirm
+        needed. db.update_printer already existed (used nowhere until now);
+        this just exposes it as a tool, same as add_cash_account."""
+        data = {k: v for k, v in {
+            "name": name, "model": model, "vendor_id": vendor_id, "purchase_cost": purchase_cost,
+            "purchase_date": purchase_date, "useful_life_years": useful_life_years,
+            "salvage_value": salvage_value, "status": status,
+        }.items() if v is not None}
+        if not data:
+            return {"ok": False, "error": "Nothing to update -- pass at least one field."}
+        await db.update_printer(printer_id, data)
+        printers = await db.list_printers()
+        updated = next((p for p in printers if p["id"] == printer_id), None)
+        return {"ok": True, "printer": updated}
+
+    @mcp.tool()
     async def log_printer_usage(printer_id: str, hours: float, log_date: Optional[str] = None, notes: str = "") -> dict:
         """Log printer running hours. WRITE action."""
         total = await db.log_printer_usage(printer_id, hours, log_date, notes)
