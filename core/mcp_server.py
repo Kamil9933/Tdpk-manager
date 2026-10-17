@@ -865,6 +865,17 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
         return {"transactions": await db.list_cash_transactions(account_id, from_date, to_date)}
 
     @mcp.tool()
+    async def add_cash_account(name: str, account_type: str = "cash", opening_balance: float = 0) -> dict:
+        """Add a new cash/bank account (e.g. 'Cash', 'Business Bank', 'JazzCash').
+        account_type is one of: bank | mobile_wallet | cash | courier_pending.
+        WRITE action -- but low risk, just a ledger account, no confirm needed.
+        db.create_cash_account already existed (used nowhere until now); this
+        just exposes it as a tool, same as every other list_cash_accounts/
+        add_cash_transaction pair already had."""
+        row = await db.create_cash_account({"name": name, "account_type": account_type, "opening_balance": opening_balance})
+        return {"ok": True, "account": row}
+
+    @mcp.tool()
     async def list_postex_payouts(from_date: Optional[str] = None, to_date: Optional[str] = None) -> dict:
         """Logged PostEx settlement/payout batches (gross, fee deducted, net) in a date range."""
         return {"payouts": await db.list_postex_payouts(from_date, to_date)}
