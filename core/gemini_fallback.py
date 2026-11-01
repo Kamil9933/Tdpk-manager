@@ -226,6 +226,21 @@ async def _generate(client, api_key, body, models):
     raise GeminiError(redact(f"{head} [tried: {tried}]"))
 
 
+async def generate_text(prompt):
+    """One plain text-in/text-out Gemini call (no tools, no history), with the
+    same model fallback as the chat. Asks for JSON output. Returns
+    (text, model_used)."""
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        raise GeminiError("GEMINI_API_KEY is not set -- can't use Gemini.")
+    body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json"}}
+    async with httpx.AsyncClient(timeout=60) as client:
+        data, model = await _generate(client, api_key, body, list(GEMINI_MODELS))
+    parts = (((data.get("candidates") or [{}])[0].get("content") or {}).get("parts")) or []
+    return "".join(p.get("text", "") for p in parts if not p.get("thought")), model
+
+
 async def run_gemini_turn(mcp_server, db, conversation_id, system_text, messages, mcp_tools):
     """Mirrors core.agent.run_agent_turn's tool-calling loop against Gemini
     instead of Anthropic. `messages` is the SAME Anthropic-shaped history

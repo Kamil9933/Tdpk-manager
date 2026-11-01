@@ -80,6 +80,11 @@ class ShopifyClient:
             r.raise_for_status()
             return r.json()
 
+    async def graphql(self, query, variables=None):
+        """Admin GraphQL, for reads REST doesn't cover well (e.g. a product's
+        SEO title by handle). Returns the full response body."""
+        return await self._post("/graphql.json", {"query": query, "variables": variables or {}})
+
     async def _delete(self, path):
         await self._ensure_token()
         async with httpx.AsyncClient(timeout=30) as client:

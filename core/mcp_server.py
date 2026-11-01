@@ -52,6 +52,7 @@ from core.operations import run_operation, REMOVE_COLOR_WARNING
 from core.filament import deduct_filament_for_order, compute_filament_status
 from core.returns import compute_product_return_breakdown
 from core.notify import notify_all
+from core import risk, costing
 
 PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time -- fixed UTC+5 offset, no DST
 
@@ -432,6 +433,18 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
         payload = {"refund": {"notify": False, "note": note, "refund_line_items": refund_line_items, "shipping": {"full_refund": False}}}
         result = await shopify._post(f"/orders/{order_id}/refunds.json", payload)
         return {"ok": True, "result": result}
+
+    @mcp.tool()
+    async def get_order_risk(order_id: int) -> dict:
+        """Cash-on-delivery risk for one Shopify order -- whether to call the
+        customer before booking the parcel. Scores from PostEx history (has
+        this phone refused before? does this city refuse a lot?) and the order
+        value, with a plain reason for every point. level: high / medium / low."""
+        order = (await shopify._get(f"/orders/{order_id}.json")).get("order", {})
+        today = datetime.now(PKT).date()
+        history_orders, _ = await postex.get_orders_classified(
+            status_id=0, from_date=(today - timedelta(days=90)).isoformat(), to_date=today.isoformat())
+        return risk.assess(order, risk.build_history(history_orders))
 
     # ── PostEx ───────────────────────────────────────────────────────────────
     @mcp.tool()
@@ -1152,6 +1165,35 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
                 grams if grams is not None else (item.get("grams") or 50),
             )
         return {"ok": True}
+
+    @mcp.tool()
+    async def set_product_filament_usage(product_id: int, grams: float, filament_type_id: str, variant_id: Optional[int] = None) -> dict:
+        """Record how many grams of filament ONE unit of a product (or one
+        specific variant) uses -- e.g. the slicer's figure from the
+        tdpk-print-pricing skill. Used for real per-product margin
+        (get_product_margin, the catalog's price-health badge) and for
+        filament deduction when the order ships. Leave variant_id empty to
+        set it for every variant of the product. WRITE action, no confirm
+        needed -- bookkeeping only, nothing changes on the store."""
+        types = {t["id"] for t in await db.list_filament_types()}
+        if filament_type_id not in types:
+            return {"error": "Unknown filament_type_id -- get one from list_filament_types."}
+        if grams <= 0:
+            return {"error": "grams must be more than 0."}
+        await db.upsert_product_filament_link(product_id, variant_id, filament_type_id, grams)
+        return {"ok": True, "product_id": product_id, "variant_id": variant_id, "grams_per_unit": grams}
+
+    @mcp.tool()
+    async def get_product_margin(product_id: int) -> dict:
+        """Per-variant cost and margin for one product: real filament cost
+        where grams are known (set_product_filament_usage), else the flat
+        estimate -- `basis` says which. Other costs (packaging/shipping, ads,
+        overhead) are the same flat per-order estimates the dashboard uses."""
+        product = (await shopify._get(f"/products/{product_id}.json")).get("product", {})
+        per_gram = costing.filament_cost_per_gram(await db.list_filament_purchases())
+        index = costing.links_index(await db.list_product_filament_links())
+        return {"product": product.get("title"), "filament_cost_per_gram": per_gram,
+                "variants": costing.variant_margins(product, index, per_gram, costing.COST_CONFIG)}
 
     # ── Reminders / follow-ups ───────────────────────────────────────────────
     @mcp.tool()

@@ -22,6 +22,8 @@
 #   - TDPK_CRON_SECRET    matching the CRON_SECRET env var set on Render
 #   - SUPABASE_URL        optional, for the keep-awake step below
 #   - SUPABASE_ANON_KEY   optional, the anon/publishable key (NOT the service key)
+#   - TELEGRAM_BOT_TOKEN  optional, same bot as the digest: alerts you if a run fails
+#   - TELEGRAM_CHAT_ID
 
 on:
   schedule:
@@ -58,3 +60,17 @@ jobs:
           curl -fsS --max-time 180 --retry 3 --retry-delay 20 --retry-all-errors \
             -X POST "$TDPK_APP_URL/api/cron/tick" \
             -H "X-Cron-Secret: $TDPK_CRON_SECRET"
+
+      # Failures used to be silent (that's how 10 days of 503s went unnoticed).
+      # Sent straight from GitHub, so it works even when Render is down.
+      - name: Alert on Telegram if this run failed
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then exit 0; fi
+          curl -sS -o /dev/null --max-time 30 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=TDPK: '${{ github.workflow }}' failed at $(date -u '+%Y-%m-%d %H:%M') UTC. Details: ${RUN_URL}"

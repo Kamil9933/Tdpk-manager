@@ -25,6 +25,7 @@ from core.filament import deduct_filament_for_order, compute_filament_status, sy
 from core.returns import compute_product_return_breakdown
 from core import bambu_cloud
 from core.gemini_fallback import redact
+from core import risk, costing, seo_queue
 
 shopify = ShopifyClient(
     store=os.getenv("SHOPIFY_STORE", "1gdih3-zv.myshopify.com"),
@@ -56,13 +57,7 @@ app = FastAPI(title="TD Shopify Manager v3", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-COST_CONFIG = {
-    "avg_filament_per_order": 400,
-    "avg_packaging_shipping": 400,
-    "ad_spend_per_order": 600,
-    "fixed_monthly": 55500,
-    "target_monthly_orders": 300,
-}
+COST_CONFIG = costing.COST_CONFIG
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -80,11 +75,18 @@ async def root(request: Request):
 @app.post("/api/auth/login")
 async def login(request: Request):
     data = await request.json()
-    from core.auth import verify_pin, verify_totp
+    from core.auth import verify_pin, verify_totp, client_ip, login_locked_for, record_failed_login, clear_failed_logins
+    ip = client_ip(request)
+    wait = login_locked_for(ip)
+    if wait:
+        raise HTTPException(status_code=429, detail=f"Too many failed attempts -- try again in {wait // 60 + 1} min")
     if not verify_pin(data.get("pin", "")):
+        record_failed_login(ip)
         raise HTTPException(status_code=401, detail="Invalid PIN")
     if not verify_totp(data.get("totp", "")):
+        record_failed_login(ip)
         raise HTTPException(status_code=401, detail="Invalid 2FA code")
+    clear_failed_logins(ip)
     token = await create_session()
     response = JSONResponse({"ok": True})
     response.set_cookie("session", token, httponly=True, secure=True, samesite="strict", max_age=60*60*8)
@@ -162,8 +164,9 @@ async def get_products(
     else:
         products.sort(key=lambda p: p.get("title","").lower(), reverse=reverse)
 
+    cost_data = await _load_costing()
     for p in products:
-        p["_price_health"] = _calc_price_health(p)
+        p["_price_health"] = _calc_price_health(p, cost_data)
         p["_completeness"] = _calc_completeness(p)
 
     total = len(products)
@@ -174,7 +177,7 @@ async def get_products(
 async def get_product(product_id: int, session=Depends(verify_session)):
     data = await shopify._get(f"/products/{product_id}.json")
     p = data.get("product", {})
-    p["_price_health"] = _calc_price_health(p)
+    p["_price_health"] = _calc_price_health(p, await _load_costing())
     p["_completeness"] = _calc_completeness(p)
     return p
 
@@ -610,6 +613,81 @@ async def agent_send_message(conversation_id: str, request: Request, session=Dep
         raise HTTPException(status_code=400, detail=redact(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=redact(f"Agent error: {e}"))
+
+# ── SEO approval queue ───────────────────────────────────────────────────────
+# Draft suggestions come from the GitHub Actions SEO report. Nothing here
+# touches Shopify except /approve with confirm=true, which writes one SEO
+# title/description to one product or collection (see core/seo_queue.py).
+@app.get("/api/seo/suggestions")
+async def seo_suggestions(status: str = "draft", session=Depends(verify_session)):
+    targets = seo_queue.load_targets()
+    rows = await db.list_seo_suggestions(status=None if status == "all" else status)
+    for r in rows:
+        res = seo_queue.resource_for(r["page_key"], targets)
+        r["_page_name"] = res["name"] if res else r["page_key"]
+        r["_page_url"] = res["url"] if res else None
+        r["_can_apply"] = seo_queue.can_apply(r, res)
+    return {"suggestions": rows, "last_run": await db.latest_seo_run()}
+
+async def _seo_open(suggestion_id):
+    s = await db.get_seo_suggestion(suggestion_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Suggestion not found")
+    return s, seo_queue.resource_for(s["page_key"])
+
+@app.post("/api/seo/suggestions/{suggestion_id}/draft")
+async def seo_draft(suggestion_id: str, session=Depends(verify_session)):
+    s, res = await _seo_open(suggestion_id)
+    if not seo_queue.can_apply(s, res):
+        raise HTTPException(status_code=400, detail="This suggestion needs a manual fix, not new copy")
+    try:
+        current = await seo_queue.current_seo(shopify, res)
+        copy = await seo_queue.draft_copy(s, res, current)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=redact(e))
+    await db.update_seo_suggestion(suggestion_id, {"proposed_title": copy["title"], "proposed_description": copy["description"]})
+    return {"current": current, "proposed": copy}
+
+@app.post("/api/seo/suggestions/{suggestion_id}/approve")
+async def seo_approve(suggestion_id: str, request: Request, session=Depends(verify_session)):
+    """Without confirm: preview (current vs new). With confirm: apply to
+    Shopify (copy suggestions) or just mark done (manual ones)."""
+    data = await request.json()
+    s, res = await _seo_open(suggestion_id)
+    if s["status"] != "draft":
+        raise HTTPException(status_code=400, detail=f"Already {s['status']}")
+    if not seo_queue.can_apply(s, res):
+        await db.update_seo_suggestion(suggestion_id, {"status": "done", "decided_at": seo_queue.now_iso()})
+        return {"ok": True, "applied": False}
+    title = (data.get("title") or s.get("proposed_title") or "").strip()
+    description = (data.get("description") or s.get("proposed_description") or "").strip()
+    if not title or not description:
+        raise HTTPException(status_code=400, detail="Draft the copy first (or type a title and description)")
+    if len(title) > seo_queue.TITLE_MAX or len(description) > seo_queue.DESCRIPTION_MAX:
+        raise HTTPException(status_code=400, detail=f"Keep the title to {seo_queue.TITLE_MAX} and the description to {seo_queue.DESCRIPTION_MAX} characters")
+    try:
+        current = await seo_queue.current_seo(shopify, res)
+        if not data.get("confirm"):
+            return {"preview": True, "page": res["url"], "current": current, "new": {"title": title, "description": description},
+                    "note": "Nothing was changed. Confirm to update this page on the live store."}
+        await seo_queue.apply_copy(shopify, res, current["id"], title, description)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=redact(e))
+    now = seo_queue.now_iso()
+    await db.update_seo_suggestion(suggestion_id, {
+        "status": "done", "proposed_title": title, "proposed_description": description,
+        "previous_title": current["title"], "previous_description": current["description"],
+        "decided_at": now, "applied_at": now})
+    await db.add_notification("seo", f"SEO updated: {res['name']}", f"{title} | {description}")
+    return {"ok": True, "applied": True, "previous": current}
+
+@app.post("/api/seo/suggestions/{suggestion_id}/reject")
+async def seo_reject(suggestion_id: str, session=Depends(verify_session)):
+    await _seo_open(suggestion_id)
+    await db.update_seo_suggestion(suggestion_id, {"status": "rejected", "decided_at": seo_queue.now_iso()})
+    return {"ok": True}
 
 # ── Operations ────────────────────────────────────────────────────────────────
 @app.post("/api/operations/preview")
@@ -1809,6 +1887,14 @@ async def cron_tick(request: Request):
             except Exception as e:
                 fired["postex_fee_sync_error"] = str(e)
 
+    # COD risk alert: each new unfulfilled order that looks risky (refused
+    # before, high-refusal city, high value) is pushed to Telegram ONCE
+    # (slot "risk:<order id>"), so you can call before booking the parcel.
+    try:
+        fired["risk_alerts"] = await _risk_alerts()
+    except Exception as e:
+        fired["risk_alert_error"] = redact(e)
+
     # Filament used by orders fulfilled anywhere (Shopify admin, PostEx app,
     # TDPK) since the last tick. Never blocks the rest of the tick.
     try:
@@ -1820,6 +1906,28 @@ async def cron_tick(request: Request):
     fired["queue_synced"] = await _sync_queue_with_printers()
 
     return {"ok": True, "now_pkt": now_pkt.isoformat(), "fired": fired}
+
+RISK_ALERT_MAX_AGE_DAYS = 3
+
+async def _risk_alerts() -> int:
+    today = datetime.now(PKT).date()
+    history_orders, _ = await postex.get_orders_classified(
+        status_id=0, from_date=(today - timedelta(days=90)).isoformat(), to_date=today.isoformat())
+    if not history_orders:
+        return 0
+    history = risk.build_history(history_orders)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=RISK_ALERT_MAX_AGE_DAYS)
+    flagged = []
+    for o in risk.awaiting_booking(await shopify.get_orders(status="open")):
+        created = datetime.fromisoformat((o.get("created_at") or "1970-01-01T00:00:00+00:00").replace("Z", "+00:00"))
+        if created < cutoff:
+            continue
+        a = risk.assess(o, history)
+        if a["level"] != "low" and await db.claim_slot(f"risk:{o['id']}"):
+            flagged.append(a)
+    if flagged:
+        await notify_all("TDPK: call before booking", "\n".join(risk.format_flags(flagged)), db=db)
+    return len(flagged)
 
 async def _poll_bambu_printers() -> int:
     """Refreshes the live_status snapshot on every printer row that has a
@@ -1992,18 +2100,30 @@ def _price_in_range(p, min_p, max_p):
     if max_p is not None and avg > max_p: return False
     return True
 
-def _calc_price_health(product):
-    prices = [float(v.get("price",0)) for v in product.get("variants",[]) if float(v.get("price",0))>0]
-    if not prices: return {"status":"red","label":"No price","margin":0}
-    avg = sum(prices)/len(prices)
-    total_cost = COST_CONFIG["avg_filament_per_order"] + COST_CONFIG["avg_packaging_shipping"] + COST_CONFIG["ad_spend_per_order"] + (COST_CONFIG["fixed_monthly"]/COST_CONFIG["target_monthly_orders"])
-    if avg == 0: return {"status":"red","label":"Zero price","margin":0}
-    margin = ((avg - total_cost) / avg) * 100
-    if margin < 0: return {"status":"red","label":f"Loss ({margin:.0f}%)","margin":round(margin,1)}
-    elif margin < 20: return {"status":"orange","label":f"Thin ({margin:.0f}%)","margin":round(margin,1)}
-    elif margin < 35: return {"status":"yellow","label":f"OK ({margin:.0f}%)","margin":round(margin,1)}
-    elif margin < 50: return {"status":"green","label":f"Good ({margin:.0f}%)","margin":round(margin,1)}
-    else: return {"status":"blue","label":f"Excellent ({margin:.0f}%)","margin":round(margin,1)}
+async def _load_costing():
+    """(grams index, filament cost per gram) for _calc_price_health -- loaded
+    once per request, not once per product."""
+    links = await db.list_product_filament_links()
+    purchases = await db.list_filament_purchases()
+    return costing.links_index(links), costing.filament_cost_per_gram(purchases)
+
+def _calc_price_health(product, cost_data=None):
+    """Average margin over the priced variants. Uses each variant's real
+    filament grams when known (core/costing.py), else the flat
+    COST_CONFIG filament estimate; `basis` says which, and estimated labels
+    get a "~"."""
+    index, per_gram = cost_data or ({}, costing.FALLBACK_COST_PER_GRAM)
+    rows = [r for r in costing.variant_margins(product, index, per_gram, COST_CONFIG) if r["price"] > 0]
+    if not rows: return {"status":"red","label":"No price","margin":0,"basis":"estimate"}
+    margin = sum(r["margin_pct"] for r in rows) / len(rows)
+    basis = "real grams" if all(r["basis"] == "real grams" for r in rows) else "estimate"
+    approx = "" if basis == "real grams" else "~"
+    out = {"margin": round(margin, 1), "basis": basis}
+    if margin < 0: return {**out, "status":"red","label":f"Loss ({approx}{margin:.0f}%)"}
+    elif margin < 20: return {**out, "status":"orange","label":f"Thin ({approx}{margin:.0f}%)"}
+    elif margin < 35: return {**out, "status":"yellow","label":f"OK ({approx}{margin:.0f}%)"}
+    elif margin < 50: return {**out, "status":"green","label":f"Good ({approx}{margin:.0f}%)"}
+    else: return {**out, "status":"blue","label":f"Excellent ({approx}{margin:.0f}%)"}
 
 def _calc_completeness(product):
     checks = {

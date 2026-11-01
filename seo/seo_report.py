@@ -433,8 +433,14 @@ def run(env=None, client=None, token_fn=google_token, today=None, targets_path=N
                                            for k, v in speed.items()])
             store.insert("seo_index_status", [{"run_id": run_id, "page_key": k, "url": url_of[k], **v}
                                               for k, v in index.items()])
-            open_drafts = store.select("seo_suggestions", {"status": "eq.draft", "select": "page_key,kind,detail"})
-            seen = {_suggestion_id(s) for s in open_drafts}
+            # Don't re-suggest: anything still in the queue, anything you
+            # rejected, or anything applied in the last 30 days (Search
+            # Console lags, so the old numbers would re-trigger it at once).
+            recent = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)).isoformat()
+            previous = store.select("seo_suggestions", {"select": "page_key,kind,detail,status,decided_at"})
+            seen = {_suggestion_id(s) for s in previous
+                    if s.get("status") in ("draft", "rejected", "approved")
+                    or (s.get("status") == "done" and (s.get("decided_at") or "") >= recent)}
             new_suggestions = [s for s in suggestions if _suggestion_id(s) not in seen]
             store.insert("seo_suggestions", [{**s, "status": "draft"} for s in new_suggestions])
         except StepError as e:

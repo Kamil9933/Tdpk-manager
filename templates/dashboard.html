@@ -416,6 +416,7 @@ textarea.field-input{min-height:80px;resize:vertical}
     <div class="sbi" onclick="showView('accounts')" id="nav-accounts"><span class="ic">💰</span>Accounts</div>
     <div class="sb-sec">Marketing</div>
     <div class="sbi" onclick="showView('marketing')" id="nav-marketing"><span class="ic">📣</span>Ads &amp; Social</div>
+    <div class="sbi" onclick="showView('seo')" id="nav-seo"><span class="ic">🔎</span>SEO Approvals</div>
     <div class="sb-sec">Colour Ops</div>
     <div class="sbi" onclick="openOp('remove_color')"><span class="ic">🗑</span>Remove colour</div>
     <div class="sbi" onclick="openOp('add_color')"><span class="ic">➕</span>Add colour</div>
@@ -567,6 +568,14 @@ textarea.field-input{min-height:80px;resize:vertical}
   <!-- ABANDONED -->
   <div class="view" id="view-abandoned">
     <div class="scroll-wrap" id="abandoned-wrap"></div>
+  </div>
+
+  <!-- SEO APPROVALS -->
+  <div class="view" id="view-seo">
+    <div class="filters">
+      <select id="seo-status" onchange="loadSeo()"><option value="draft" selected>Waiting for approval</option><option value="done">Done</option><option value="rejected">Rejected</option><option value="all">All</option></select>
+    </div>
+    <div class="scroll-wrap" id="seo-wrap"></div>
   </div>
 
   <!-- POSTEX -->
@@ -1182,6 +1191,90 @@ async function loadAbandoned() {
       <div style="font-weight:600">PKR ${parseFloat(c.total_price||0).toLocaleString()}</div>
     </div>`).join('')}
   `;
+}
+
+// ── SEO approvals ─────────────────────────────────────────────────────────────
+// Draft suggestions from the GitHub Actions SEO report. Only "Apply to store"
+// (after a preview + confirm) changes Shopify, and only that one page's SEO
+// title/description. Everything shown is escaped: it comes from the DB/Gemini.
+const seoEsc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const SEO_KIND={not_live:'Not live',not_indexed:'Not indexed',low_ctr:'Low click rate',striking_distance:'Almost page 1',slow:'Slow on mobile'};
+async function seoFetch(url,body){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(d.detail||`HTTP ${r.status}`);
+  return d;
+}
+async function loadSeo(){
+  const wrap=document.getElementById('seo-wrap');
+  wrap.innerHTML='<div style="text-align:center;padding:3rem;color:var(--muted)">Loading...</div>';
+  const status=document.getElementById('seo-status').value;
+  let d;
+  try{const r=await fetch(`/api/seo/suggestions?status=${status}`);d=await r.json();}
+  catch(e){wrap.innerHTML='<div style="padding:2rem;color:var(--red)">Could not load suggestions.</div>';return;}
+  const run=d.last_run;
+  const head=run?`<div style="font-size:11px;color:var(--muted);margin-bottom:10px">Last SEO report: ${seoEsc(String(run.started_at).slice(0,16).replace('T',' '))} UTC (${seoEsc(run.status)})</div>`
+                :'<div style="font-size:11px;color:var(--muted);margin-bottom:10px">No SEO report has run yet -- see .github/workflows/seo-report.yml for setup.</div>';
+  const rows=d.suggestions||[];
+  wrap.innerHTML=head+(!rows.length?'<div style="text-align:center;padding:2rem;color:var(--muted)">Nothing here.</div>':rows.map(seoCard).join(''));
+}
+function seoCard(s){
+  const id=seoEsc(s.id), open=s.status==='draft';
+  const copy=s._can_apply?`
+    <div id="seo-copy-${id}" style="margin-top:8px;${s.proposed_title?'':'display:none'}">
+      <label style="font-size:11px;color:var(--muted)">SEO title (<span id="seo-tl-${id}">${(s.proposed_title||'').length}</span>/60)</label>
+      <input class="field-input" id="seo-t-${id}" maxlength="60" value="${seoEsc(s.proposed_title)}" oninput="document.getElementById('seo-tl-${id}').textContent=this.value.length" ${open?'':'disabled'}>
+      <label style="font-size:11px;color:var(--muted)">Meta description (<span id="seo-dl-${id}">${(s.proposed_description||'').length}</span>/155)</label>
+      <textarea class="field-input" id="seo-d-${id}" maxlength="155" style="min-height:60px" oninput="document.getElementById('seo-dl-${id}').textContent=this.value.length" ${open?'':'disabled'}>${seoEsc(s.proposed_description)}</textarea>
+      ${s.previous_title?`<div style="font-size:11px;color:var(--muted);margin-top:4px">Before: ${seoEsc(s.previous_title)} | ${seoEsc(s.previous_description)}</div>`:''}
+    </div>`:'';
+  const btns=!open?`<span style="font-size:11px;color:var(--muted)">${seoEsc(s.status)}${s.applied_at?' -- applied '+seoEsc(String(s.applied_at).slice(0,10)):''}</span>`
+    :s._can_apply?`<button class="btn sm" onclick="seoDraft('${id}')">✍️ Draft copy</button>
+                   <button class="btn sm primary" onclick="seoApply('${id}')">Apply to store</button>
+                   <button class="btn sm danger" onclick="seoReject('${id}')">Reject</button>`
+    :`<button class="btn sm primary" onclick="seoDone('${id}')">Mark done</button>
+      <button class="btn sm danger" onclick="seoReject('${id}')">Reject</button>`;
+  return `<div class="row-card" style="cursor:default;display:block">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <b style="font-size:13px">${seoEsc(s._page_name)}</b>
+      <span class="btn sm" style="cursor:default">${seoEsc(SEO_KIND[s.kind]||s.kind)}</span>
+      ${s._page_url?`<a href="${seoEsc(s._page_url)}" target="_blank" rel="noopener" style="font-size:11px">open page ↗</a>`:''}
+      <span style="font-size:11px;color:var(--muted);margin-left:auto">${seoEsc(String(s.created_at).slice(0,10))}</span>
+    </div>
+    <div style="font-size:12.5px;margin-top:6px">${seoEsc(s.suggestion)}</div>
+    ${copy}
+    <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap">${btns}</div>
+  </div>`;
+}
+async function seoDraft(id){
+  const box=document.getElementById(`seo-copy-${id}`);
+  box.style.display='';
+  document.getElementById(`seo-t-${id}`).value='Drafting...';
+  try{
+    const d=await seoFetch(`/api/seo/suggestions/${id}/draft`);
+    const t=document.getElementById(`seo-t-${id}`), ds=document.getElementById(`seo-d-${id}`);
+    t.value=d.proposed.title; ds.value=d.proposed.description;
+    t.dispatchEvent(new Event('input')); ds.dispatchEvent(new Event('input'));
+  }catch(e){document.getElementById(`seo-t-${id}`).value='';alert('Draft failed: '+e.message);}
+}
+async function seoApply(id){
+  const t=document.getElementById(`seo-t-${id}`), ds=document.getElementById(`seo-d-${id}`);
+  const body={title:(t?.value||'').trim(),description:(ds?.value||'').trim()};
+  try{
+    const p=await seoFetch(`/api/seo/suggestions/${id}/approve`,body);
+    const msg=`Update this page on the LIVE store?\n\n${p.page}\n\nNow:\n${p.current.title}\n${p.current.description}\n\nNew:\n${p.new.title}\n${p.new.description}`;
+    if(!confirm(msg))return;
+    await seoFetch(`/api/seo/suggestions/${id}/approve`,{...body,confirm:true});
+    loadSeo();
+  }catch(e){alert('Not applied: '+e.message);}
+}
+async function seoDone(id){
+  if(!confirm('Mark this as done? (Nothing is changed on the store.)'))return;
+  try{await seoFetch(`/api/seo/suggestions/${id}/approve`,{confirm:true});loadSeo();}catch(e){alert(e.message);}
+}
+async function seoReject(id){
+  if(!confirm('Reject this suggestion? It will not be suggested again.'))return;
+  try{await seoFetch(`/api/seo/suggestions/${id}/reject`);loadSeo();}catch(e){alert(e.message);}
 }
 
 // ── PostEx ────────────────────────────────────────────────────────────────────
@@ -2709,7 +2802,7 @@ function showView(v){
   document.querySelectorAll('.sbi').forEach(el=>el.classList.remove('active'));
   document.getElementById(`view-${v}`)?.classList.add('active');
   document.getElementById(`nav-${v}`)?.classList.add('active');
-  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',queue:'Print Queue',automation:'Automation',history:'Operation History',accounts:'Accounts',marketing:'Ads & Social',agent:'Manager Chat'};
+  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',queue:'Print Queue',automation:'Automation',history:'Operation History',accounts:'Accounts',marketing:'Ads & Social',agent:'Manager Chat',seo:'SEO Approvals'};
   document.getElementById('view-title').textContent=titles[v]||v;
   if(v==='orders')loadOrders();
   if(v==='analytics')loadAnalytics();
@@ -2722,6 +2815,7 @@ function showView(v){
   if(v==='accounts')showAccTab(ACC_TAB);
   if(v==='marketing')showMktTab(MKT_TAB);
   if(v==='agent')loadAgentConversations();
+  if(v==='seo')loadSeo();
   if(window.innerWidth<768)document.getElementById('sb').classList.remove('open');
 }
 

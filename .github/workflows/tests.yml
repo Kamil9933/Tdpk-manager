@@ -1,0 +1,24 @@
+name: Tests
+
+# Runs the test suite (tests/, all against fakes -- no real Shopify, Supabase,
+# Google or Telegram calls) on every push and pull request. main deploys to
+# Render automatically, so to stop a failing commit from going live set the
+# Render service's Auto-Deploy to "After CI checks pass"
+# (Render dashboard -> Tdpk-manager -> Settings -> Build & Deploy).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest tests -q

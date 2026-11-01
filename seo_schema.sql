@@ -91,6 +91,16 @@ create table if not exists seo_suggestions (
   status text not null default 'draft' check (status in ('draft','approved','rejected','done'))
 );
 
+-- Approval queue (core/seo_queue.py): Gemini's proposed copy, what was on
+-- the page before it was applied (for a manual revert), and when.
+alter table seo_suggestions
+  add column if not exists proposed_title text,
+  add column if not exists proposed_description text,
+  add column if not exists previous_title text,
+  add column if not exists previous_description text,
+  add column if not exists decided_at timestamptz,
+  add column if not exists applied_at timestamptz;
+
 create index if not exists seo_page_metrics_page_idx on seo_page_metrics(page_key, window_end);
 create index if not exists seo_query_metrics_query_idx on seo_query_metrics(query, window_end);
 create index if not exists seo_pagespeed_page_idx on seo_pagespeed(page_key, captured_at);

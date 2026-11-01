@@ -1,8 +1,14 @@
-import os, json
+import os, json, asyncio
 from datetime import datetime, timedelta
 from supabase import create_client, Client
 
 _client: Client = None
+
+
+async def _run(query):
+    """The supabase-py client is synchronous; running .execute() in a worker
+    thread keeps one slow database call from freezing every other request."""
+    return await asyncio.to_thread(query.execute)
 
 def get_client() -> Client:
     global _client
@@ -15,49 +21,52 @@ def get_client() -> Client:
 class Database:
     # ── Sessions ──────────────────────────────────────────────────────────────
     async def create_session(self, token, expires_at):
-        get_client().table("sessions").insert({"token":token,"expires_at":expires_at.isoformat()}).execute()
+        await _run(get_client().table("sessions").insert({"token":token,"expires_at":expires_at.isoformat()}))
 
     async def verify_session(self, token):
-        res = get_client().table("sessions").select("id,expires_at").eq("token",token).execute()
+        res = await _run(get_client().table("sessions").select("id,expires_at").eq("token",token))
         if not res.data: return False
         expires = datetime.fromisoformat(res.data[0]["expires_at"].replace("Z","+00:00"))
         return expires > datetime.utcnow().replace(tzinfo=expires.tzinfo)
 
     async def touch_session(self, token):
-        get_client().table("sessions").update({"last_active":datetime.utcnow().isoformat()}).eq("token",token).execute()
+        await _run(get_client().table("sessions").update({"last_active":datetime.utcnow().isoformat()}).eq("token",token))
 
     async def delete_session(self, token):
-        get_client().table("sessions").delete().eq("token",token).execute()
+        await _run(get_client().table("sessions").delete().eq("token",token))
+
+    async def purge_expired_sessions(self):
+        await _run(get_client().table("sessions").delete().lt("expires_at", datetime.utcnow().isoformat()))
 
     # ── Operation logs ────────────────────────────────────────────────────────
     async def create_operation_log(self, operation_name, scope, details, product_count):
-        res = get_client().table("operation_log").insert({
+        res = await _run(get_client().table("operation_log").insert({
             "operation_name":operation_name,
             "scope":json.dumps(scope),
             "details":json.dumps(details),
             "product_count":product_count,
             "performed_by":"admin"
-        }).execute()
+        }))
         return res.data[0]["id"]
 
     async def complete_operation_log(self, log_id, result):
-        get_client().table("operation_log").update({"details":json.dumps(result)}).eq("id",log_id).execute()
+        await _run(get_client().table("operation_log").update({"details":json.dumps(result)}).eq("id",log_id))
 
     async def get_operation_logs(self, page=1, per_page=30):
         start = (page-1)*per_page
-        res = get_client().table("operation_log").select("id,operation_name,scope,product_count,performed_at,performed_by,details").order("performed_at",desc=True).range(start,start+per_page-1).execute()
+        res = await _run(get_client().table("operation_log").select("id,operation_name,scope,product_count,performed_at,performed_by,details").order("performed_at",desc=True).range(start,start+per_page-1))
         return {"logs":res.data,"page":page}
 
     async def get_operation_log(self, log_id):
-        res = get_client().table("operation_log").select("*").eq("id", log_id).execute()
+        res = await _run(get_client().table("operation_log").select("*").eq("id", log_id))
         return res.data[0] if res.data else None
 
     # ── Snapshots ─────────────────────────────────────────────────────────────
     async def save_snapshot(self, log_id, products):
-        get_client().table("product_snapshots").insert({"operation_log_id":log_id,"snapshot_data":json.dumps(products)}).execute()
+        await _run(get_client().table("product_snapshots").insert({"operation_log_id":log_id,"snapshot_data":json.dumps(products)}))
 
     async def get_snapshot(self, log_id):
-        res = get_client().table("product_snapshots").select("snapshot_data,created_at").eq("operation_log_id",log_id).execute()
+        res = await _run(get_client().table("product_snapshots").select("snapshot_data,created_at").eq("operation_log_id",log_id))
         if not res.data: return None
         row = res.data[0]
         created = datetime.fromisoformat(row["created_at"].replace("Z","+00:00"))
@@ -68,29 +77,29 @@ class Database:
     # ── Automation rules ──────────────────────────────────────────────────────
     async def get_automation_rules(self):
         try:
-            res = get_client().table("automation_rules").select("*").order("created_at",desc=True).execute()
+            res = await _run(get_client().table("automation_rules").select("*").order("created_at",desc=True))
             return {"rules": res.data}
         except:
             return {"rules": []}
 
     async def create_automation_rule(self, data):
-        res = get_client().table("automation_rules").insert({
+        res = await _run(get_client().table("automation_rules").insert({
             "name": data.get("name","Unnamed rule"),
             "condition": data.get("condition"),
             "condition_value": data.get("condition_value",""),
             "action": data.get("action"),
             "action_params": json.dumps(data.get("action_params",{})),
             "enabled": True,
-        }).execute()
+        }))
         return res.data[0]["id"]
 
     async def delete_automation_rule(self, rule_id):
-        get_client().table("automation_rules").delete().eq("id",rule_id).execute()
+        await _run(get_client().table("automation_rules").delete().eq("id",rule_id))
 
     # ── Notifications ─────────────────────────────────────────────────────────
     async def get_notifications(self):
         try:
-            res = get_client().table("notifications").select("*").order("created_at",desc=True).limit(20).execute()
+            res = await _run(get_client().table("notifications").select("*").order("created_at",desc=True).limit(20))
             unread = sum(1 for n in res.data if not n.get("read"))
             return {"notifications": res.data, "unread": unread}
         except:
@@ -98,38 +107,38 @@ class Database:
 
     async def add_notification(self, type: str, title: str, message: str = ""):
         try:
-            get_client().table("notifications").insert({"type":type,"title":title,"message":message}).execute()
+            await _run(get_client().table("notifications").insert({"type":type,"title":title,"message":message}))
         except:
             pass
 
     async def mark_notifications_read(self):
         try:
-            get_client().table("notifications").update({"read":True}).eq("read",False).execute()
+            await _run(get_client().table("notifications").update({"read":True}).eq("read",False))
         except:
             pass
 
     # ── Saved views ───────────────────────────────────────────────────────────
     async def get_saved_views(self):
         try:
-            res = get_client().table("saved_views").select("*").order("created_at",desc=True).execute()
+            res = await _run(get_client().table("saved_views").select("*").order("created_at",desc=True))
             return {"views": res.data}
         except:
             return {"views": []}
 
     async def create_saved_view(self, data):
-        res = get_client().table("saved_views").insert({
+        res = await _run(get_client().table("saved_views").insert({
             "name": data.get("name","My View"),
             "filters": json.dumps(data.get("filters",{})),
-        }).execute()
+        }))
         return res.data[0]["id"]
 
     async def delete_saved_view(self, view_id):
-        get_client().table("saved_views").delete().eq("id",view_id).execute()
+        await _run(get_client().table("saved_views").delete().eq("id",view_id))
 
     # ── Cost settings ─────────────────────────────────────────────────────────
     async def get_cost_settings(self):
         try:
-            res = get_client().table("cost_settings").select("key,value").execute()
+            res = await _run(get_client().table("cost_settings").select("key,value"))
             return {row["key"]: row["value"] for row in res.data}
         except:
             return {}
@@ -137,21 +146,21 @@ class Database:
     async def update_cost_settings(self, settings: dict):
         for key, value in settings.items():
             try:
-                get_client().table("cost_settings").upsert({"key":key,"value":str(value),"updated_at":datetime.utcnow().isoformat()}).execute()
+                await _run(get_client().table("cost_settings").upsert({"key":key,"value":str(value),"updated_at":datetime.utcnow().isoformat()}))
             except:
                 pass
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     async def purge_old_snapshots(self):
         cutoff = (datetime.utcnow()-timedelta(days=30)).isoformat()
-        get_client().table("product_snapshots").delete().lt("created_at",cutoff).execute()
+        await _run(get_client().table("product_snapshots").delete().lt("created_at",cutoff))
 
     # ── Accounting: generic helpers ──────────────────────────────────────────────
     # These tables only exist once accounting_schema.sql has been run, so every
     # read is defensive (returns empty rather than 500ing) in case it hasn't yet.
     async def _list(self, table, order_col="created_at", desc=True):
         try:
-            res = get_client().table(table).select("*").order(order_col, desc=desc).execute()
+            res = await _run(get_client().table(table).select("*").order(order_col, desc=desc))
             return res.data
         except Exception:
             return []
@@ -164,19 +173,19 @@ class Database:
             if eq:
                 for k, v in eq.items():
                     q = q.eq(k, v)
-            return q.execute().data
+            return await _run(q).data
         except Exception:
             return []
 
     async def _insert(self, table, data):
-        res = get_client().table(table).insert(data).execute()
+        res = await _run(get_client().table(table).insert(data))
         return res.data[0] if res.data else None
 
     async def _update(self, table, row_id, data):
-        get_client().table(table).update(data).eq("id", row_id).execute()
+        await _run(get_client().table(table).update(data).eq("id", row_id))
 
     async def _delete(self, table, row_id):
-        get_client().table(table).delete().eq("id", row_id).execute()
+        await _run(get_client().table(table).delete().eq("id", row_id))
 
     # ── Vendors ───────────────────────────────────────────────────────────────
     async def list_vendors(self): return await self._list("vendors", order_col="name", desc=False)
@@ -202,11 +211,11 @@ class Database:
             "printer_id": printer_id, "hours": hours,
             "log_date": log_date or datetime.utcnow().date().isoformat(), "notes": notes,
         }
-        get_client().table("printer_usage_logs").insert(row).execute()
+        await _run(get_client().table("printer_usage_logs").insert(row))
         # keep the cached running total on the printer row in sync
-        current = get_client().table("printers").select("total_hours").eq("id", printer_id).execute()
+        current = await _run(get_client().table("printers").select("total_hours").eq("id", printer_id))
         total = float((current.data[0]["total_hours"] if current.data else 0) or 0) + float(hours)
-        get_client().table("printers").update({"total_hours": total}).eq("id", printer_id).execute()
+        await _run(get_client().table("printers").update({"total_hours": total}).eq("id", printer_id))
         return total
 
     async def list_printer_usage(self, printer_id):
@@ -216,10 +225,10 @@ class Database:
         """Overwrites the printer row's current-state snapshot (not a log --
         see the add_bambu_live_status_to_printers migration). Called from the
         cron-tick poll (and the queue tab refresh), once per printer."""
-        get_client().table("printers").update({
+        await _run(get_client().table("printers").update({
             "live_status": json.dumps(status),
             "live_status_updated_at": datetime.utcnow().isoformat(),
-        }).eq("id", printer_id).execute()
+        }).eq("id", printer_id))
 
     # ── Print queue ───────────────────────────────────────────────────────────
     # Backs the dashboard's "Print Queue" tab -- the single source of truth
@@ -234,18 +243,18 @@ class Database:
                 q = q.in_("status", statuses if isinstance(statuses, list) else statuses.split(","))
             if printer:
                 q = q.eq("printer", printer)
-            return q.execute().data
+            return await _run(q).data
         except Exception:
             return []
 
     async def get_queue_job(self, job_id):
-        res = get_client().table("print_queue").select("*").eq("id", job_id).execute()
+        res = await _run(get_client().table("print_queue").select("*").eq("id", job_id))
         return res.data[0] if res.data else None
 
     async def find_queue_job_by_line_item(self, shopify_order_id, shopify_item_id):
-        res = (get_client().table("print_queue").select("id")
+        res = (await _run(get_client().table("print_queue").select("id")
                .eq("shopify_order_id", str(shopify_order_id))
-               .eq("shopify_item_id", str(shopify_item_id)).execute())
+               .eq("shopify_item_id", str(shopify_item_id))))
         return res.data[0] if res.data else None
 
     async def create_queue_job(self, data): return await self._insert("print_queue", data)
@@ -256,15 +265,15 @@ class Database:
         """Oldest-first -- used by the auto-sync job to pick which queued job
         a printer should pick up next, and to find the job currently printing
         on a given printer."""
-        res = (get_client().table("print_queue").select("*")
+        res = (await _run(get_client().table("print_queue").select("*")
                .eq("printer", printer).eq("status", status)
-               .order("created_at", desc=False).execute())
+               .order("created_at", desc=False)))
         return res.data
 
     async def list_queue_by_phone(self, phone):
         try:
-            res = (get_client().table("print_queue").select("*")
-                   .eq("phone", phone).order("created_at", desc=True).execute())
+            res = (await _run(get_client().table("print_queue").select("*")
+                   .eq("phone", phone).order("created_at", desc=True)))
             return res.data
         except Exception:
             return []
@@ -337,7 +346,7 @@ class Database:
 
     async def get_automation_settings(self):
         try:
-            res = get_client().table("automation_settings").select("*").execute()
+            res = await _run(get_client().table("automation_settings").select("*"))
             found = {row["key"]: row for row in res.data}
         except Exception:
             found = {}
@@ -358,48 +367,48 @@ class Database:
             data["enabled"] = enabled
         if config is not None:
             data["config"] = config
-        get_client().table("automation_settings").upsert(data).execute()
+        await _run(get_client().table("automation_settings").upsert(data))
         settings = await self.get_automation_settings()
         return settings[key]
 
     # ── In-app agent (Phase 3) ───────────────────────────────────────────────
     async def create_agent_conversation(self, title=None):
-        res = get_client().table("agent_conversations").insert({"title": title or "New conversation"}).execute()
+        res = await _run(get_client().table("agent_conversations").insert({"title": title or "New conversation"}))
         return res.data[0]
 
     async def list_agent_conversations(self, limit=30):
         try:
-            res = (get_client().table("agent_conversations").select("*")
-                   .order("updated_at", desc=True).limit(limit).execute())
+            res = (await _run(get_client().table("agent_conversations").select("*")
+                   .order("updated_at", desc=True).limit(limit)))
             return res.data
         except Exception:
             return []
 
     async def get_agent_conversation(self, conversation_id):
-        res = get_client().table("agent_conversations").select("*").eq("id", conversation_id).execute()
+        res = await _run(get_client().table("agent_conversations").select("*").eq("id", conversation_id))
         return res.data[0] if res.data else None
 
     async def delete_agent_conversation(self, conversation_id):
-        get_client().table("agent_conversations").delete().eq("id", conversation_id).execute()
+        await _run(get_client().table("agent_conversations").delete().eq("id", conversation_id))
 
     async def rename_agent_conversation(self, conversation_id, title):
-        get_client().table("agent_conversations").update({
+        await _run(get_client().table("agent_conversations").update({
             "title": title, "updated_at": datetime.utcnow().isoformat(),
-        }).eq("id", conversation_id).execute()
+        }).eq("id", conversation_id))
 
     async def list_agent_messages(self, conversation_id):
         try:
-            res = (get_client().table("agent_messages").select("*")
-                   .eq("conversation_id", conversation_id).order("created_at").execute())
+            res = (await _run(get_client().table("agent_messages").select("*")
+                   .eq("conversation_id", conversation_id).order("created_at")))
             return res.data
         except Exception:
             return []
 
     async def add_agent_message(self, conversation_id, role, content, tokens_in=0, tokens_out=0):
-        res = get_client().table("agent_messages").insert({
+        res = await _run(get_client().table("agent_messages").insert({
             "conversation_id": conversation_id, "role": role, "content": content,
             "tokens_in": tokens_in, "tokens_out": tokens_out,
-        }).execute()
+        }))
         return res.data[0] if res.data else None
 
     async def bump_agent_conversation_tokens(self, conversation_id, tokens_in, tokens_out, title=None):
@@ -413,7 +422,7 @@ class Database:
         }
         if title:
             data["title"] = title
-        get_client().table("agent_conversations").update(data).eq("id", conversation_id).execute()
+        await _run(get_client().table("agent_conversations").update(data).eq("id", conversation_id))
 
     # ── Filament inventory ────────────────────────────────────────────────────
     async def list_filament_types(self): return await self._list("filament_types", order_col="color", desc=False)
@@ -429,16 +438,16 @@ class Database:
     async def list_filament_consumption(self, days=90):
         try:
             since = (datetime.utcnow() - timedelta(days=days)).isoformat()
-            res = (get_client().table("filament_consumption").select("*")
-                   .gte("created_at", since).order("created_at", desc=True).execute())
+            res = (await _run(get_client().table("filament_consumption").select("*")
+                   .gte("created_at", since).order("created_at", desc=True)))
             return res.data
         except Exception:
             return []
 
     async def list_filament_needs_review(self, limit=50):
         try:
-            res = (get_client().table("filament_consumption").select("*")
-                   .eq("matched", "needs_review").order("created_at", desc=False).limit(limit).execute())
+            res = (await _run(get_client().table("filament_consumption").select("*")
+                   .eq("matched", "needs_review").order("created_at", desc=False).limit(limit)))
             return res.data
         except Exception:
             return []
@@ -453,8 +462,8 @@ class Database:
 
     async def order_has_filament_consumption(self, shopify_order_id):
         try:
-            res = (get_client().table("filament_consumption").select("id")
-                   .eq("shopify_order_id", shopify_order_id).limit(1).execute())
+            res = (await _run(get_client().table("filament_consumption").select("id")
+                   .eq("shopify_order_id", shopify_order_id).limit(1)))
             return bool(res.data)
         except Exception:
             return False
@@ -463,18 +472,21 @@ class Database:
         try:
             q = get_client().table("product_filament_links").select("*").eq("product_id", product_id)
             q = q.eq("variant_id", variant_id) if variant_id is not None else q.is_("variant_id", "null")
-            res = q.execute()
+            res = await _run(q)
             return res.data[0] if res.data else None
         except Exception:
             return None
 
+    async def list_product_filament_links(self):
+        return await self._list("product_filament_links", order_col="product_id", desc=False)
+
     async def upsert_product_filament_link(self, product_id, variant_id, filament_type_id, grams_per_unit):
         try:
-            get_client().table("product_filament_links").upsert({
+            await _run(get_client().table("product_filament_links").upsert({
                 "product_id": product_id, "variant_id": variant_id,
                 "filament_type_id": filament_type_id, "grams_per_unit": grams_per_unit,
                 "updated_at": datetime.utcnow().isoformat(),
-            }, on_conflict="product_id,variant_id").execute()
+            }, on_conflict="product_id,variant_id"))
         except Exception:
             pass
 
@@ -489,15 +501,15 @@ class Database:
             q = get_client().table("agent_reminders").select("*").order("due_at")
             if status:
                 q = q.eq("status", status)
-            return q.execute().data
+            return await _run(q).data
         except Exception:
             return []
 
     async def list_due_reminders(self):
         try:
             now = datetime.utcnow().isoformat()
-            res = (get_client().table("agent_reminders").select("*")
-                   .eq("status", "pending").lte("due_at", now).execute())
+            res = (await _run(get_client().table("agent_reminders").select("*")
+                   .eq("status", "pending").lte("due_at", now)))
             return res.data
         except Exception:
             return []
@@ -516,9 +528,40 @@ class Database:
         unreachable) returns False: skipping a run is safer than sending a
         digest twice or logging an expense twice."""
         try:
-            res = get_client().table("digest_log").insert({"slot": slot}).execute()
+            res = await _run(get_client().table("digest_log").insert({"slot": slot}))
             return bool(res.data)
         except Exception:
             return False
+
+    # ── SEO (tables from seo_schema.sql, written by seo/seo_report.py) ──────
+    async def latest_seo_run(self):
+        try:
+            res = await _run(get_client().table("seo_runs").select("*").order("started_at", desc=True).limit(1))
+            return res.data[0] if res.data else None
+        except Exception:
+            return None
+
+    async def count_seo_suggestions(self, status="draft"):
+        try:
+            res = await _run(get_client().table("seo_suggestions").select("id", count="exact").eq("status", status))
+            return res.count or 0
+        except Exception:
+            return 0
+
+    async def list_seo_suggestions(self, status=None):
+        try:
+            q = get_client().table("seo_suggestions").select("*").order("created_at", desc=True)
+            if status:
+                q = q.eq("status", status)
+            return await _run(q).data
+        except Exception:
+            return []
+
+    async def get_seo_suggestion(self, suggestion_id):
+        res = await _run(get_client().table("seo_suggestions").select("*").eq("id", suggestion_id))
+        return res.data[0] if res.data else None
+
+    async def update_seo_suggestion(self, suggestion_id, data):
+        await self._update("seo_suggestions", suggestion_id, data)
 
 db = Database()

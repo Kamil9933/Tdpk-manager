@@ -1,0 +1,4 @@
+# Test-only dependencies (GitHub Actions tests.yml). Not installed on Render.
+-r requirements.txt
+-r seo/requirements.txt
+pytest>=8.0,<10.0
