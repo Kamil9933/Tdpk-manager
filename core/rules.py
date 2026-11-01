@@ -192,12 +192,12 @@ async def _h_pnl(m, mcp_server, db):
     rev = data.get("revenue") or {}
     return (
         f"P&L (last 30 days):\n"
-        f"  Revenue: {_money(rev.get('total'))} (Shopify {_money(rev.get('shopify'))}, custom {_money(rev.get('custom_orders'))})\n"
-        f"  COGS: {_money((data.get('cogs') or {}).get('total'))}\n"
-        f"  Opex: {_money((data.get('opex') or {}).get('total'))}\n"
-        f"  Courier fees: {_money(data.get('courier_fees'))}\n"
-        f"  Labor: {_money(data.get('labor_cost'))}\n"
-        f"  Net profit: {_money(data.get('net_profit'))} ({data.get('margin_pct','?')}% margin)"
+        f"- Revenue: {_money(rev.get('total'))} (Shopify {_money(rev.get('shopify'))}, custom {_money(rev.get('custom_orders'))})\n"
+        f"- COGS: {_money((data.get('cogs') or {}).get('total'))}\n"
+        f"- Opex: {_money((data.get('opex') or {}).get('total'))}\n"
+        f"- Courier fees: {_money(data.get('courier_fees'))}\n"
+        f"- Labor: {_money(data.get('labor_cost'))}\n"
+        f"- Net profit: {_money(data.get('net_profit'))} ({data.get('margin_pct','?')}% margin)"
     )
 
 
@@ -207,11 +207,11 @@ async def _h_postex(m, mcp_server, db):
         return f"Couldn't load PostEx: {data['error']}"
     return (
         f"PostEx (last 30 days): {data.get('total_orders', 0)} orders\n"
-        f"  Delivered: {data.get('delivered', 0)} ({data.get('delivery_rate', 0)}%)\n"
-        f"  Returned: {data.get('returned', 0)} ({data.get('return_rate', 0)}%)\n"
-        f"  In transit: {data.get('in_transit', 0)}\n"
-        f"  Total COD value: {_money(data.get('total_cod_value'))}\n"
-        f"  Pending COD: {_money(data.get('pending_cod'))}"
+        f"- Delivered: {data.get('delivered', 0)} ({data.get('delivery_rate', 0)}%)\n"
+        f"- Returned: {data.get('returned', 0)} ({data.get('return_rate', 0)}%)\n"
+        f"- In transit: {data.get('in_transit', 0)}\n"
+        f"- Total COD value: {_money(data.get('total_cod_value'))}\n"
+        f"- Pending COD: {_money(data.get('pending_cod'))}"
     )
 
 
