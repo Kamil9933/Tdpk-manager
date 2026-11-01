@@ -14,7 +14,7 @@ from core.shopify import ShopifyClient
 from core.supabase_client import db
 from core.operations import run_operation, REMOVE_COLOR_WARNING
 from core.intelligence import generate_briefing
-from core.postex import PostexClient
+from core.postex import PostexClient, sync_real_fees
 from core.accounting import generate_pnl, straight_line_depreciation, calc_cash_balance, reconcile_postex
 from core.meta import MetaClient, MetaError
 from core.mcp_server import build_mcp_server, MCPAuthMiddleware
@@ -1850,42 +1850,16 @@ async def cron_tick(request: Request):
             except Exception as e:
                 fired["shopify_bill_sync_error"] = str(e)
 
-    # ── Daily PostEx courier-fee ESTIMATE -> payout sync ──────────────────────
-    # PostEx's API doesn't expose real settlement/fee-deducted figures (only
-    # order-level status + COD value), so this can't log an exact fee the way
-    # the Meta ad-spend sync logs an exact spend. Per the user's correction,
-    # though, delivered-parcel counts ARE accessible and PostEx's standard fee
-    # is a known Rs 200-320/parcel range -- so this logs a defensible ESTIMATE
-    # (delivered count x rate) each day as a postex_payout row, clearly labeled
-    # as such in `notes` so it's obviously distinguishable later from a real
-    # statement entered via log_postex_payout. get_pnl's courier-fee line and
-    # get_postex_reconciliation both read from postex_payouts, so this makes
-    # the estimate flow into both automatically. POSTEX_FEE_PER_PARCEL (default
-    # 260, i.e. the midpoint of the 200-320 range) can be tuned via env without
-    # a code change once real statements show what the actual average is.
-    # Idempotent via slot "postex_fee_sync:<date>".
-    postex_hh, postex_mm = _parse_hhmm(os.getenv("POSTEX_SYNC_TIME", "02:00"))
-    if _reached(now_pkt, postex_hh, postex_mm):
-        y = (now_pkt.date() - timedelta(days=1)).isoformat()
-        slot_key = f"postex_fee_sync:{y}"
-        if await db.claim_slot(slot_key):
-            try:
-                rate = float(os.getenv("POSTEX_FEE_PER_PARCEL", "260"))
-                summary = await postex.get_dashboard_summary(from_date=y, to_date=y)
-                delivered = int(summary.get("delivered", 0) or 0)
-                gross = float(summary.get("delivered_cod", 0) or 0)
-                if delivered > 0:
-                    fee = round(delivered * rate, 2)
-                    await db.create_postex_payout({
-                        "payout_date": y, "gross_amount": gross, "fee_deducted": fee,
-                        "net_amount": round(gross - fee, 2), "order_count": delivered,
-                        "notes": f"ESTIMATED -- {delivered} delivered parcel(s) x Rs {rate:g}/parcel "
-                                 f"(standard PostEx range Rs 200-320), not a real settlement statement. "
-                                 f"Auto-logged; reconcile against actual PostEx payouts when available.",
-                    })
-                fired["postex_fee_synced"] = {"date": y, "delivered": delivered, "estimated_fee": delivered * rate if delivered else 0}
-            except Exception as e:
-                fired["postex_fee_sync_error"] = str(e)
+    # ── PostEx courier fees (real, per parcel) -> postex_payouts ──────────────
+    # PostEx's order data carries the actual fee on every parcel (delivery
+    # fee/tax, or reversal fee/tax on a return), so this replaced the old
+    # Rs 260/parcel estimate. See postex.sync_real_fees: each parcel is logged
+    # once, when its fee appears, grouped by booking date. get_pnl's
+    # courier-fee line and get_postex_reconciliation read these rows.
+    try:
+        fired["postex_fees"] = await sync_real_fees(db, postex, now_pkt.date())
+    except Exception as e:
+        fired["postex_fee_sync_error"] = redact(e)
 
     # COD risk alert: each new unfulfilled order that looks risky (refused
     # before, high-refusal city, high value) is pushed to Telegram ONCE

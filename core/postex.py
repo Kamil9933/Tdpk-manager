@@ -244,3 +244,59 @@ class PostexClient:
             "api_code": orders_data.get("statusCode", ""),
             "error": orders_data.get("error", ""),
         }
+
+
+# ── Real courier fees -> postex_payouts ──────────────────────────────────────
+# Every PostEx order carries its actual charges: transactionFee/Tax for a
+# delivery, reversalFee/Tax for a return. A parcel is logged once (slot
+# "postex_fee:<tracking number>"), and only once its fee is actually there
+# -- a return still on its way back shows a 0 reversal fee, and logging it
+# then would lock in Rs 0. Rows are grouped by booking date so fees land in
+# the right month of the P&L. Gross is the COD value of the delivered
+# parcels; this comes from PostEx's order data, not a bank statement.
+FEE_FIELDS = ("transactionFee", "transactionTax", "reversalFee", "reversalTax")
+# Parcels booked before this were covered by the old Rs 260/parcel estimate
+# row (Oct 1-16), so they're skipped to avoid counting them twice.
+POSTEX_REAL_FEES_FROM = os.getenv("POSTEX_REAL_FEES_FROM", "2026-10-17")
+FEE_LOOKBACK_DAYS = 90
+
+
+def parcel_fee(o):
+    """(fee, is_final) for one classified PostEx order."""
+    bucket = o.get("_bucket")
+    if bucket == "delivered":
+        known = float(o.get("transactionFee") or 0) > 0
+    elif bucket == "returned":
+        known = float(o.get("reversalFee") or 0) > 0
+    else:
+        return 0.0, False
+    return round(sum(float(o.get(f) or 0) for f in FEE_FIELDS), 2), known
+
+
+async def sync_real_fees(db, postex, today, start_date=None):
+    start = max(start_date or POSTEX_REAL_FEES_FROM, (today - timedelta(days=FEE_LOOKBACK_DAYS)).isoformat())
+    orders, _ = await postex.get_orders_classified(status_id=0, from_date=start, to_date=today.isoformat())
+    by_day = {}
+    for o in orders:
+        fee, final = parcel_fee(o)
+        booked = (o.get("transactionDate") or "")[:10]
+        if not final or not o.get("trackingNumber") or not booked or booked < start:
+            continue
+        if not await db.claim_slot(f"postex_fee:{o['trackingNumber']}"):
+            continue  # already logged
+        d = by_day.setdefault(booked, {"gross": 0.0, "fee": 0.0, "delivered": 0, "returned": 0})
+        d["fee"] += fee
+        if o["_bucket"] == "delivered":
+            d["gross"] += float(o.get("invoicePayment") or 0)
+            d["delivered"] += 1
+        else:
+            d["returned"] += 1
+    for day, d in sorted(by_day.items()):
+        await db.create_postex_payout({
+            "payout_date": day, "gross_amount": round(d["gross"], 2), "fee_deducted": round(d["fee"], 2),
+            "net_amount": round(d["gross"] - d["fee"], 2), "order_count": d["delivered"] + d["returned"],
+            "notes": f"Real PostEx fees for parcels booked {day}: {d['delivered']} delivered, {d['returned']} returned "
+                     f"(from PostEx order data, auto-synced).",
+        })
+    return {"days": len(by_day), "parcels": sum(d["delivered"] + d["returned"] for d in by_day.values()),
+            "fees": round(sum(d["fee"] for d in by_day.values()), 2)}
