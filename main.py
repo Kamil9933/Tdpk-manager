@@ -21,7 +21,7 @@ from core.mcp_server import build_mcp_server, MCPAuthMiddleware
 from core.agent import run_agent_turn, AgentUnavailableError
 from core.notify import notify_all, send_telegram, format_for_telegram, TELEGRAM_WEBHOOK_SECRET, TELEGRAM_CHAT_ID
 from core.digest import generate_digest
-from core.filament import deduct_filament_for_order, compute_filament_status
+from core.filament import deduct_filament_for_order, compute_filament_status, sync_fulfilled_orders
 from core.returns import compute_product_return_breakdown
 from core import bambu_cloud
 from core.gemini_fallback import redact
@@ -1808,6 +1808,13 @@ async def cron_tick(request: Request):
                 fired["postex_fee_synced"] = {"date": y, "delivered": delivered, "estimated_fee": delivered * rate if delivered else 0}
             except Exception as e:
                 fired["postex_fee_sync_error"] = str(e)
+
+    # Filament used by orders fulfilled anywhere (Shopify admin, PostEx app,
+    # TDPK) since the last tick. Never blocks the rest of the tick.
+    try:
+        fired["filament_synced"] = await sync_fulfilled_orders(db, shopify)
+    except Exception as e:
+        fired["filament_sync_error"] = redact(e)
 
     fired["printers_polled"] = await _poll_bambu_printers()
     fired["queue_synced"] = await _sync_queue_with_printers()

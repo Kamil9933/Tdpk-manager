@@ -288,6 +288,22 @@ class ShopifyClient:
         await asyncio.sleep(0.3)
         return result
 
+    async def get_shipped_orders_updated_since(self, updated_at_min: str):
+        """Fully fulfilled orders whose last change is at/after updated_at_min
+        (ISO timestamp) -- fulfilling an order bumps its updated_at, so this
+        catches orders fulfilled anywhere: Shopify admin, the PostEx app, or
+        TDPK itself."""
+        orders = []
+        params = {"limit": 250, "status": "any", "fulfillment_status": "shipped", "updated_at_min": updated_at_min}
+        while True:
+            data = await self._get("/orders.json", params)
+            batch = data.get("orders", [])
+            orders.extend(batch)
+            if len(batch) < 250:
+                break
+            params["since_id"] = batch[-1]["id"]
+        return orders
+
     async def get_all_orders_range(self, from_date: str, to_date: str, status: str = "any"):
         """Get orders within a custom date range (whole Pakistan-time days)."""
         orders = []

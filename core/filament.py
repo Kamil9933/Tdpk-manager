@@ -13,10 +13,11 @@ Matching an order line item to a filament type, in priority order:
      a manual override the user set (directly, or by "remember this" when
      resolving a past needs-review item).
   2. A product-level default (product_id, variant_id=NULL) row.
-  3. Auto-match: the variant's colour (read off variant_title, e.g. "Black /
-     Large" -> "Black") against a stocked filament type's `color`, using the
-     store-wide default grams-per-unit. Only applied when exactly one active
-     filament type matches that colour -- an ambiguous match (e.g. two
+  3. Auto-match: any "/"-separated part of variant_title (this store puts
+     the colour first in some products, "White / Large", and last in
+     others, "Medium / Green") against a stocked filament type's `color`,
+     using the store-wide default grams-per-unit. Only applied when exactly
+     one active filament type matches -- an ambiguous match (e.g. two
      materials both stocked in "Black") is treated as unresolved rather than
      guessing.
   4. Anything still unresolved (no colour on the variant at all, a multi-
@@ -31,16 +32,13 @@ from datetime import datetime, timedelta, timezone
 from math import ceil
 
 
-def _variant_color(line_item):
+def _variant_parts(line_item):
     # Shopify order line items don't carry selected-option names directly --
-    # just `variant_title` (e.g. "Black / Large" for a multi-option variant,
-    # or just "Black" for a colour-only variant). Taking the first "/"
-    # segment is a reliable colour guess for how this store's variants are
-    # named (colour first), without needing an extra API call per line item.
+    # just `variant_title` (e.g. "Black / Large", "Medium / Green", or just
+    # "Black"). Every "/" part is a colour candidate; matching against the
+    # stocked colours below decides which one (if any) is the colour.
     vt = (line_item.get("variant_title") or "").strip()
-    if not vt:
-        return None
-    return vt.split("/")[0].strip() or None
+    return [p.strip().lower() for p in vt.split("/") if p.strip()]
 
 
 async def _default_grams_per_unit(db):
@@ -66,28 +64,31 @@ async def match_filament_for_line_item(db, line_item):
         if link:
             return link["filament_type_id"], float(link["grams_per_unit"]), "manual"
 
-    color_guess = _variant_color(line_item)
-    if color_guess:
+    parts = _variant_parts(line_item)
+    if parts:
         types = await db.list_filament_types()
         matches = [t for t in types if t.get("active", True)
-                   and (t.get("color") or "").strip().lower() == color_guess.lower()]
+                   and (t.get("color") or "").strip().lower() in parts]
         if len(matches) == 1:
             return matches[0]["id"], default_grams, "auto"
 
     return None, default_grams, "needs_review"
 
 
-async def deduct_filament_for_order(db, shopify, order_id):
-    """Call right after an order is fulfilled -- idempotent per order (checks
-    order_has_filament_consumption first), so a retried fulfillment call or a
-    double-click never double-deducts stock. Both fulfill_order call sites
-    (the dashboard REST route and the MCP/agent tool) call this."""
+async def deduct_filament_for_order(db, shopify, order_id, order=None):
+    """Logs filament used by a fulfilled order -- idempotent per order (checks
+    order_has_filament_consumption first), so a retry, a double-click, or the
+    cron sync seeing an order TDPK already fulfilled never double-deducts.
+    Called by both TDPK fulfill paths and by sync_fulfilled_orders below
+    (which passes `order` to save a refetch)."""
     try:
         if await db.order_has_filament_consumption(order_id):
             return {"ok": True, "skipped": True, "reason": "already logged for this order"}
 
-        order_data = await shopify._get(f"/orders/{order_id}.json")
-        o = order_data.get("order", order_data)
+        if order is None:
+            order_data = await shopify._get(f"/orders/{order_id}.json")
+            order = order_data.get("order", order_data)
+        o = order
         line_items = o.get("line_items", [])
 
         logged = 0
@@ -115,6 +116,48 @@ async def deduct_filament_for_order(db, shopify, order_id):
         # fulfillment -- that's the real-world action that matters. Log and
         # move on; the order stays fulfilled either way.
         return {"ok": False, "error": str(e)}
+
+
+async def sync_fulfilled_orders(db, shopify):
+    """Cron hook: deducts filament for every order fulfilled since the last
+    sync, wherever it was fulfilled (most orders here are fulfilled in
+    Shopify admin or the PostEx app, never through TDPK, so before this
+    nothing was ever deducted).
+
+    Two markers in cost_settings:
+      - filament_tracking_start: set once, to when the filament purchases
+        (the stock count) were last logged. Orders fulfilled before it are
+        already reflected in that count, so they're never deducted.
+      - filament_sync_since: cursor, moved forward every run. Taken BEFORE
+        fetching, so an order fulfilled mid-run is caught next time
+        (idempotency makes the overlap harmless)."""
+    settings = await db.get_cost_settings()
+    start = settings.get("filament_tracking_start")
+    if not start:
+        purchases = await db.list_filament_purchases()
+        if not purchases:
+            return {"skipped": "no filament purchases logged yet"}
+        start = max(p["created_at"] for p in purchases if p.get("created_at"))
+        await db.update_cost_settings({"filament_tracking_start": start})
+    since = settings.get("filament_sync_since") or start
+    run_started = datetime.now(timezone.utc).isoformat()
+    start_dt = _parse_dt(start)
+
+    logged = needs_review = skipped = 0
+    for o in await shopify.get_shipped_orders_updated_since(since):
+        if o.get("cancelled_at"):
+            continue
+        fulfilled_at = [_parse_dt(f.get("created_at")) for f in o.get("fulfillments") or []]
+        fulfilled_at = [d for d in fulfilled_at if d]
+        if start_dt and fulfilled_at and max(fulfilled_at) < start_dt:
+            skipped += 1  # shipped before the stock count -- already in it
+            continue
+        r = await deduct_filament_for_order(db, shopify, o["id"], order=o)
+        if r.get("ok") and not r.get("skipped"):
+            logged += 1
+            needs_review += r.get("needs_review", 0)
+    await db.update_cost_settings({"filament_sync_since": run_started})
+    return {"orders_logged": logged, "items_needing_review": needs_review, "before_stock_count": skipped}
 
 
 def _parse_dt(s):
