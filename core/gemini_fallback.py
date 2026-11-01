@@ -33,9 +33,22 @@ Known limitations -- this is a cheaper default, not a Claude-parity guarantee:
 import os
 import re
 import json
+import asyncio
 import httpx
 
-GEMINI_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite")
+# GEMINI_FALLBACK_MODEL may be one model or a comma-separated list; the
+# defaults below are appended after it as backups. Google returns 503 "high
+# demand" for a single model fairly often, so one turn tries each model in
+# order and sticks with the first that answers.
+_DEFAULT_MODELS = ["gemini-3.1-flash-lite", "gemini-flash-lite-latest", "gemini-flash-latest", "gemini-3.5-flash-lite"]
+GEMINI_MODELS = list(dict.fromkeys(
+    [m.strip() for m in os.getenv("GEMINI_FALLBACK_MODEL", "").split(",") if m.strip()] + _DEFAULT_MODELS
+))
+GEMINI_MODEL = GEMINI_MODELS[0]
+# Overloaded / rate-limited / server-side: worth trying the next model.
+# 404 too, since a model can be unavailable for a given key.
+GEMINI_RETRYABLE_STATUSES = {404, 429, 500, 502, 503, 504}
+GEMINI_RETRY_PAUSE_SECONDS = 3
 GEMINI_MAX_TOOL_ITERS = 6
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_ERROR_BODY_CHARS = 300
@@ -173,6 +186,40 @@ def _anthropic_messages_to_gemini(messages):
     return contents
 
 
+async def _generate(client, api_key, body, models):
+    """POSTs one generateContent call, walking `models` until one answers.
+    Retryable failures (overload, rate limit, 5xx, unknown model) move on to
+    the next model; after a full pass with nothing but retryable failures it
+    pauses once and tries the whole list again. Anything else (bad request,
+    bad key) raises straight away. Returns (response_json, model_used)."""
+    failures, last_detail = [], ""
+    for attempt in range(2):
+        if attempt:
+            await asyncio.sleep(GEMINI_RETRY_PAUSE_SECONDS)
+        for model in models:
+            # Key goes in a header, not the URL, so httpx errors can't echo it.
+            try:
+                resp = await client.post(
+                    f"{GEMINI_API_BASE}/models/{model}:generateContent",
+                    headers={"x-goog-api-key": api_key}, json=body,
+                )
+            except httpx.HTTPError as e:
+                failures.append(f"{model}: {type(e).__name__}")
+                continue
+            if resp.status_code < 400:
+                return resp.json(), model
+            detail = f"Gemini HTTP {resp.status_code} ({model}): {resp.text[:GEMINI_ERROR_BODY_CHARS]}"
+            if resp.status_code not in GEMINI_RETRYABLE_STATUSES:
+                raise GeminiError(redact(detail))
+            failures.append(f"{model}: HTTP {resp.status_code}")
+            last_detail = detail
+    # Last real error first: the chat message is truncated, and Google's own
+    # text is the useful part. Then which models were tried.
+    tried = "; ".join(dict.fromkeys(failures))
+    head = f"every Gemini model failed, last error: {last_detail}" if last_detail else "every Gemini model failed"
+    raise GeminiError(redact(f"{head} [tried: {tried}]"))
+
+
 async def run_gemini_turn(mcp_server, db, conversation_id, system_text, messages, mcp_tools):
     """Mirrors core.agent.run_agent_turn's tool-calling loop against Gemini
     instead of Anthropic. `messages` is the SAME Anthropic-shaped history
@@ -186,6 +233,7 @@ async def run_gemini_turn(mcp_server, db, conversation_id, system_text, messages
         raise GeminiError("GEMINI_API_KEY is not set -- can't use Gemini.")
 
     tools = _mcp_tools_to_gemini(mcp_tools)
+    models = list(GEMINI_MODELS)
     final_text = ""
     tool_calls_made = []
     local_messages = list(messages)  # Anthropic-shaped; translated to Gemini's wire format fresh each call
@@ -198,19 +246,9 @@ async def run_gemini_turn(mcp_server, db, conversation_id, system_text, messages
             }
             if tools:
                 body["tools"] = tools
-            # Key goes in a header, not the URL, so httpx errors can't echo it.
-            try:
-                resp = await client.post(
-                    f"{GEMINI_API_BASE}/models/{GEMINI_MODEL}:generateContent",
-                    headers={"x-goog-api-key": api_key}, json=body,
-                )
-            except httpx.HTTPError as e:
-                raise GeminiError(redact(f"Gemini request failed ({GEMINI_MODEL}): {type(e).__name__}: {e}")) from None
-            if resp.status_code >= 400:
-                raise GeminiError(redact(
-                    f"Gemini HTTP {resp.status_code} ({GEMINI_MODEL}): {resp.text[:GEMINI_ERROR_BODY_CHARS]}"
-                ))
-            data = resp.json()
+            data, model_used = await _generate(client, api_key, body, models)
+            # Stick with whichever model answered for the rest of this turn.
+            models = [model_used] + [m for m in models if m != model_used]
             candidates = data.get("candidates") or []
             if not candidates:
                 final_text = "Gemini returned no response (possibly blocked by its own safety filters)."
@@ -259,5 +297,5 @@ async def run_gemini_turn(mcp_server, db, conversation_id, system_text, messages
         "text": final_text, "tokens_in": 0, "tokens_out": 0,
         "cache_write_tokens": 0, "cache_read_tokens": 0,
         "est_cost_usd": 0, "tool_calls": tool_calls_made,
-        "provider": "gemini",
+        "provider": "gemini", "model": models[0],
     }
