@@ -1,29 +1,58 @@
 ﻿name: TDPK cron tick
 
 # Render's free plan has no built-in scheduler and the web service spins down
-# when idle, so this workflow pings the app's /api/cron/tick endpoint every
-# 30 minutes -- that both wakes it up and drives anything time-based (the
-# twice-daily digest, due reminders). The endpoint is idempotent per digest
-# slot/reminder, so pinging this often is always safe.
+# when idle, so this workflow pings the app's /api/cron/tick endpoint twice a
+# day -- 04:00 and 16:00 UTC (09:00 and 21:00 Pakistan time, the digest
+# slots). That wakes the service and drives everything time-based: the
+# digest, due reminders, the Meta/PostEx/Shopify expense syncs, the printer
+# poll and the queue sync. It used to run every 15 min, which kept Render
+# awake 24/7 and used up the free instance hours.
 #
-# Setup (one-time):
-#   1. In the repo's GitHub Settings -> Secrets and variables -> Actions, add:
-#      - TDPK_APP_URL     e.g. https://tdpk-manager.onrender.com
-#      - TDPK_CRON_SECRET matching the CRON_SECRET env var set on Render
-#   2. That's it -- this runs automatically on the schedule below. Use the
-#      "Run workflow" button on the Actions tab to fire it manually and check
-#      it's wired up correctly.
+# Trade-off of twice a day: reminders fire at the next tick (up to ~12h late),
+# and printer status / queue sync only refresh at the ticks. Use "Run workflow"
+# on the Actions tab for an extra tick.
+#
+# The endpoint is idempotent per digest slot / reminder / sync day, so extra
+# manual runs are always safe.
+#
+# Setup (one-time), repo Settings -> Secrets and variables -> Actions:
+#   - TDPK_APP_URL        e.g. https://tdpk-manager.onrender.com
+#   - TDPK_CRON_SECRET    matching the CRON_SECRET env var set on Render
+#   - SUPABASE_URL        optional, for the keep-awake step below
+#   - SUPABASE_ANON_KEY   optional, the anon/publishable key (NOT the service key)
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '0 4,16 * * *'
   workflow_dispatch: {}
 
 jobs:
   tick:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping TDPK cron tick endpoint
+      # Supabase free projects pause after ~7 days without activity. The tick
+      # below touches the DB too, but this keeps Supabase awake even if Render
+      # is down. With RLS on, the anon key gets an empty list, which is fine:
+      # the query still reaches the database.
+      - name: Keep Supabase awake
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
-          curl -fsS -X POST "${{ secrets.TDPK_APP_URL }}/api/cron/tick" \
-            -H "X-Cron-Secret: ${{ secrets.TDPK_CRON_SECRET }}"
+          if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "Supabase secrets not set, skipping keep-awake."; exit 0
+          fi
+          curl -sS -o /dev/null -w "Supabase HTTP %{http_code}\n" --max-time 30 \
+            "$SUPABASE_URL/rest/v1/digest_log?select=id&limit=1" \
+            -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $SUPABASE_ANON_KEY"
+
+      # A sleeping Render free instance takes ~30-60s to boot, hence the long
+      # timeout and retries.
+      - name: Ping TDPK cron tick endpoint
+        env:
+          TDPK_APP_URL: ${{ secrets.TDPK_APP_URL }}
+          TDPK_CRON_SECRET: ${{ secrets.TDPK_CRON_SECRET }}
+        run: |
+          curl -fsS --max-time 180 --retry 3 --retry-delay 20 --retry-all-errors \
+            -X POST "$TDPK_APP_URL/api/cron/tick" \
+            -H "X-Cron-Secret: $TDPK_CRON_SECRET"

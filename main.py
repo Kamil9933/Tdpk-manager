@@ -1603,8 +1603,11 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 # Render's free plan has no built-in scheduler and the web service spins down
 # when idle, so an external pinger (a GitHub Actions workflow in this repo --
 # see .github/workflows/cron-tick.yml -- or any free cron-ping service) hits
-# this endpoint periodically (every 30 min recommended) to both wake the
-# service up and drive anything time-based: the digest and due reminders.
+# this endpoint periodically (twice a day, 09:00 and 21:00 PKT, to stay inside
+# Render's free hours) to both wake the service up and drive anything
+# time-based: the digest, due reminders and the daily/monthly syncs below.
+# Every job checks "at or after its time, not yet done" rather than "inside
+# its exact hour", so a sparse or late ping still runs it once.
 # Idempotent per digest slot (digest_log) and per reminder (status flips to
 # 'sent'), so pinging more often than needed is always safe, never causes a
 # duplicate send.
@@ -1625,6 +1628,13 @@ def _digest_slots():
             continue
     return slots or [(9, 0)]
 
+# GitHub Actions cron routinely starts runs 10-60+ min late, so the digest
+# accepts a ping up to this many hours after its slot.
+DIGEST_WINDOW_HOURS = int(os.getenv("DIGEST_WINDOW_HOURS", "3") or 3)
+
+def _reached(now_pkt, hh, mm):
+    return (now_pkt.hour, now_pkt.minute) >= (hh, mm)
+
 def _parse_hhmm(raw, default=(1, 0)):
     try:
         hh, mm = raw.strip().split(":")
@@ -1641,11 +1651,12 @@ async def cron_tick(request: Request):
     now_pkt = datetime.now(timezone.utc).astimezone(PKT)
 
     for hh, mm in _digest_slots():
-        # Fires once current PKT time has reached-or-passed the slot within
-        # the SAME hour (so a ping cadence that isn't exactly on the minute
-        # still catches it), but a ping outage of several hours doesn't fire
-        # a stale digest hours late once service resumes.
-        if now_pkt.hour == hh and now_pkt.minute >= mm:
+        # Fires once current PKT time has reached-or-passed the slot, within
+        # DIGEST_WINDOW_HOURS (covers late GitHub cron starts), but a ping
+        # outage longer than that doesn't fire a stale digest once service
+        # resumes.
+        slot_start = now_pkt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if slot_start <= now_pkt < slot_start + timedelta(hours=DIGEST_WINDOW_HOURS):
             slot_key = f"{now_pkt.date().isoformat()}:{hh:02d}:{mm:02d}"
             if not await db.digest_already_sent(slot_key):
                 text = await generate_digest(db, shopify, postex)
@@ -1667,9 +1678,10 @@ async def cron_tick(request: Request):
     # digest_log slot mechanism the digest already uses (slot "ad_sync:<date>"),
     # so a ping outage or extra-frequent pinging can't double-log a day.
     # AD_SYNC_TIME defaults to 01:00 PKT -- well after midnight, so "yesterday"
-    # is a fully closed day in Meta's reporting by the time this fires.
+    # is a fully closed day in Meta's reporting. Runs on the first tick at or
+    # after that time (the 09:00 one with the twice-daily schedule).
     ad_hh, ad_mm = _parse_hhmm(os.getenv("AD_SYNC_TIME", "01:00"))
-    if now_pkt.hour == ad_hh and now_pkt.minute >= ad_mm:
+    if _reached(now_pkt, ad_hh, ad_mm):
         y = (now_pkt.date() - timedelta(days=1)).isoformat()
         slot_key = f"ad_sync:{y}"
         if not await db.digest_already_sent(slot_key):
@@ -1699,7 +1711,9 @@ async def cron_tick(request: Request):
     # changed later (e.g. if usage-based charges push the bill up) without a
     # code change.
     shopify_hh, shopify_mm = _parse_hhmm(os.getenv("SHOPIFY_SYNC_TIME", "03:00"))
-    if now_pkt.day == 1 and now_pkt.hour == shopify_hh and now_pkt.minute >= shopify_mm:
+    # Any tick from the 1st at SHOPIFY_SYNC_TIME onward logs the month once,
+    # so a missed ping on the 1st doesn't skip the month.
+    if now_pkt.day > 1 or _reached(now_pkt, shopify_hh, shopify_mm):
         month_key = f"{now_pkt.year:04d}-{now_pkt.month:02d}"
         slot_key = f"shopify_bill:{month_key}"
         if not await db.digest_already_sent(slot_key):
@@ -1740,7 +1754,7 @@ async def cron_tick(request: Request):
     # a code change once real statements show what the actual average is.
     # Idempotent via slot "postex_fee_sync:<date>".
     postex_hh, postex_mm = _parse_hhmm(os.getenv("POSTEX_SYNC_TIME", "02:00"))
-    if now_pkt.hour == postex_hh and now_pkt.minute >= postex_mm:
+    if _reached(now_pkt, postex_hh, postex_mm):
         y = (now_pkt.date() - timedelta(days=1)).isoformat()
         slot_key = f"postex_fee_sync:{y}"
         if not await db.digest_already_sent(slot_key):

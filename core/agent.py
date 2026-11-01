@@ -160,21 +160,45 @@ def _friendly_unavailable_error(primary_name, primary_err, secondary_name, secon
     """Builds a plain-language message when BOTH the primary and secondary
     model in this turn's routing order failed. Named per-provider so the
     message is accurate regardless of which one was tried first (Gemini by
-    default, Claude if you asked for it or Gemini wasn't reachable)."""
-    msg = str(primary_err).lower()
+    default, Claude if you asked for it or Gemini wasn't reachable). Every
+    error string is passed through gemini_fallback.redact first, since this
+    text is shown in chat AND stored in Supabase."""
+    primary_text = gemini_fallback.redact(primary_err)
+    secondary_text = gemini_fallback.redact(secondary_err)
+    msg = primary_text.lower()
     if primary_name == "claude" and ("credit balance" in msg or "insufficient_quota" in msg):
         claude_note = "the Anthropic account is out of credit (top up at console.anthropic.com -> Settings -> Billing)"
     elif primary_name == "claude" and ("overloaded" in msg or "529" in msg or "503" in msg):
         claude_note = "Anthropic's API is temporarily overloaded"
     elif primary_name == "gemini":
-        claude_note = "Gemini couldn't be reached (check GEMINI_API_KEY on Render, or it may be rate-limited)"
+        claude_note = f"Gemini couldn't be reached ({primary_text[:400]})"
     else:
-        claude_note = f"{primary_name.capitalize()} couldn't be reached ({str(primary_err)[:150]})"
+        claude_note = f"{primary_name.capitalize()} couldn't be reached ({primary_text[:150]})"
     return (
         f"⚠️ Couldn't get a reply -- {claude_note}, and the {secondary_name} fallback didn't work "
-        f"either ({str(secondary_err)[:150]}). Your message is saved -- try again shortly, or check the "
+        f"either ({secondary_text[:400] if secondary_name == 'gemini' else secondary_text[:150]}). "
+        f"Your message is saved -- try again shortly, or check the "
         f"dashboard's direct panels (Orders/Catalog/Inventory) which don't need any model at all."
     )
+
+
+# Keys we add to stored tool_use blocks for Gemini's benefit that Anthropic's
+# API would reject as unknown fields.
+_NON_ANTHROPIC_BLOCK_KEYS = ("thought_signature",)
+
+
+def _for_anthropic(messages):
+    """Copy of the stored history with Gemini-only block fields stripped."""
+    out = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            content = [
+                {k: v for k, v in b.items() if k not in _NON_ANTHROPIC_BLOCK_KEYS} if isinstance(b, dict) else b
+                for b in content
+            ]
+        out.append({**m, "content": content})
+    return out
 
 
 MAX_HISTORY_TURNS = int(os.getenv("AGENT_HISTORY_TURNS", "15") or 15)
@@ -326,7 +350,7 @@ async def _run_claude_loop(mcp_server, db, conversation_id, system_prompt, tools
         try:
             resp = await client.messages.create(
                 model=AGENT_MODEL, max_tokens=MAX_TOKENS, system=system_prompt,
-                tools=tools, messages=messages,
+                tools=tools, messages=_for_anthropic(messages),
             )
         except (anthropic.APIStatusError, anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
             raise _ModelUnreachable(str(e)) from e
@@ -377,7 +401,10 @@ async def _run_gemini(mcp_server, db, conversation_id, system_text, messages, mc
     try:
         return await gemini_fallback.run_gemini_turn(mcp_server, db, conversation_id, system_text, messages, mcp_tools)
     except Exception as e:
-        raise _ModelUnreachable(str(e)) from e
+        # GeminiError is already redacted with status + body; anything else
+        # (a bug, a JSON decode error) gets its type name so it's diagnosable.
+        detail = str(e) if isinstance(e, gemini_fallback.GeminiError) else f"{type(e).__name__}: {e}"
+        raise _ModelUnreachable(gemini_fallback.redact(detail)) from e
 
 
 async def run_agent_turn(mcp_server, db, conversation_id, user_text):

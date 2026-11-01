@@ -31,12 +31,46 @@ Known limitations -- this is a cheaper default, not a Claude-parity guarantee:
     format on the fly here, never stored natively in Gemini's shape.
 """
 import os
+import re
 import json
 import httpx
 
-GEMINI_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite")
 GEMINI_MAX_TOOL_ITERS = 6
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_ERROR_BODY_CHARS = 300
+
+# Gemini 3 models attach a thoughtSignature to functionCall parts and reject
+# (HTTP 400) a replayed history whose function calls are missing it. We keep
+# Gemini's own signature on the stored tool_use block ("thought_signature") and
+# send it back as received. Function calls Gemini never produced (Claude- or
+# rules.py-authored tool_use blocks) have no real signature, so they get
+# Google's documented placeholder instead.
+SKIP_SIGNATURE = "skip_thought_signature_validator"
+
+_KEY_PATTERNS = [
+    re.compile(r"AIza[0-9A-Za-z_\-]{20,}"),           # Google API key shape
+    re.compile(r"([?&]key=)[^&\s\"']+", re.I),         # key in a query string
+]
+
+
+class GeminiError(RuntimeError):
+    """Gemini call failed. Message is already redacted and safe to show in
+    the chat or store in Supabase (HTTP status + start of the response body,
+    never the request URL)."""
+    pass
+
+
+def redact(text) -> str:
+    """Strips GEMINI_API_KEY (and anything shaped like a Google API key) from
+    error text before it reaches the chat UI or the database."""
+    text = str(text)
+    key = os.getenv("GEMINI_API_KEY", "")
+    if key:
+        text = text.replace(key, "[REDACTED]")
+    text = _KEY_PATTERNS[0].sub("[REDACTED]", text)
+    text = _KEY_PATTERNS[1].sub(r"\1[REDACTED]", text)
+    return text
 
 
 def is_configured() -> bool:
@@ -109,12 +143,21 @@ def _anthropic_messages_to_gemini(messages):
         content = m.get("content")
         if not isinstance(content, list):
             content = [{"type": "text", "text": content}]
+        first_call_in_turn = True
         for b in content:
             t = b.get("type")
             if t == "text" and b.get("text"):
                 parts.append({"text": b["text"]})
             elif t == "tool_use":
-                parts.append({"functionCall": {"name": b["name"], "args": b.get("input") or {}}})
+                part = {"functionCall": {"name": b["name"], "args": b.get("input") or {}}}
+                sig = b.get("thought_signature")
+                if sig:
+                    part["thoughtSignature"] = sig
+                elif first_call_in_turn:
+                    # Only the first call of a parallel batch carries a signature.
+                    part["thoughtSignature"] = SKIP_SIGNATURE
+                first_call_in_turn = False
+                parts.append(part)
             elif t == "tool_result":
                 raw = b.get("content")
                 try:
@@ -140,7 +183,7 @@ async def run_gemini_turn(mcp_server, db, conversation_id, system_text, messages
     "provider": "gemini" so it's visible which model actually answered."""
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set -- can't use the Gemini fallback.")
+        raise GeminiError("GEMINI_API_KEY is not set -- can't use Gemini.")
 
     tools = _mcp_tools_to_gemini(mcp_tools)
     final_text = ""
@@ -155,11 +198,18 @@ async def run_gemini_turn(mcp_server, db, conversation_id, system_text, messages
             }
             if tools:
                 body["tools"] = tools
-            resp = await client.post(
-                f"{GEMINI_API_BASE}/models/{GEMINI_MODEL}:generateContent",
-                params={"key": api_key}, json=body,
-            )
-            resp.raise_for_status()
+            # Key goes in a header, not the URL, so httpx errors can't echo it.
+            try:
+                resp = await client.post(
+                    f"{GEMINI_API_BASE}/models/{GEMINI_MODEL}:generateContent",
+                    headers={"x-goog-api-key": api_key}, json=body,
+                )
+            except httpx.HTTPError as e:
+                raise GeminiError(redact(f"Gemini request failed ({GEMINI_MODEL}): {type(e).__name__}: {e}")) from None
+            if resp.status_code >= 400:
+                raise GeminiError(redact(
+                    f"Gemini HTTP {resp.status_code} ({GEMINI_MODEL}): {resp.text[:GEMINI_ERROR_BODY_CHARS]}"
+                ))
             data = resp.json()
             candidates = data.get("candidates") or []
             if not candidates:
@@ -172,12 +222,17 @@ async def run_gemini_turn(mcp_server, db, conversation_id, system_text, messages
             blocks = []
             function_calls = []
             for p in parts:
+                if p.get("thought"):
+                    continue  # thought summaries, if ever enabled, aren't part of the reply
                 if "text" in p and p["text"]:
                     blocks.append({"type": "text", "text": p["text"]})
                 elif "functionCall" in p:
                     fc = p["functionCall"]
                     call_id = f"gemini_{len(function_calls)}_{fc['name']}"
-                    blocks.append({"type": "tool_use", "id": call_id, "name": fc["name"], "input": fc.get("args") or {}})
+                    block = {"type": "tool_use", "id": call_id, "name": fc["name"], "input": fc.get("args") or {}}
+                    if p.get("thoughtSignature"):
+                        block["thought_signature"] = p["thoughtSignature"]
+                    blocks.append(block)
                     function_calls.append((call_id, fc["name"], fc.get("args") or {}))
             local_messages.append({"role": "assistant", "content": blocks})
             await db.add_agent_message(conversation_id, "assistant", blocks)
