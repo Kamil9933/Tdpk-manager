@@ -48,7 +48,7 @@ from starlette.responses import JSONResponse
 
 from core.accounting import generate_pnl, straight_line_depreciation, calc_cash_balance, reconcile_postex
 from core.meta import MetaError
-from core.operations import run_operation
+from core.operations import run_operation, REMOVE_COLOR_WARNING
 from core.filament import deduct_filament_for_order, compute_filament_status
 from core.returns import compute_product_return_breakdown
 from core.notify import notify_all
@@ -165,17 +165,22 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
 
     @mcp.tool()
     async def list_orders(
-        days: int = 30, from_date: Optional[str] = None, to_date: Optional[str] = None,
+        days: Optional[int] = None, from_date: Optional[str] = None, to_date: Optional[str] = None,
         status: str = "any", city: Optional[str] = None, min_amount: Optional[float] = None, limit: int = 50,
     ) -> dict:
-        """List Shopify orders. Use from_date/to_date (YYYY-MM-DD) for an exact
-        range, or `days` for a trailing window. Filter by shipping city
+        """List Shopify orders, newest first. Use from_date/to_date (YYYY-MM-DD,
+        Pakistan-time days) for an exact range, or `days` for a trailing
+        window. With neither, returns the most recent `limit` orders however
+        old they are (e.g. "last 10 orders"). Filter by shipping city
         (substring match) or a minimum order total. Returns trimmed order info
         (id, name, date, total, financial/fulfillment status, city, customer)."""
         if from_date and to_date:
             orders = await shopify.get_all_orders_range(from_date, to_date, status)
-        else:
+        elif days:
             orders = await shopify.get_all_orders(status=status, days=days)
+        else:
+            orders = await shopify.get_orders(status=status, limit=min(max(int(limit), 1), 250))
+        orders = sorted(orders, key=lambda o: o.get("created_at") or "", reverse=True)
         if city:
             orders = [o for o in orders if city.lower() in str(o.get("shipping_address", {}).get("city", "")).lower()]
         if min_amount:
@@ -347,7 +352,10 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
                 "product_count": len(products),
                 "sample": [{"id": p["id"], "title": p["title"]} for p in products[:5]],
                 "params": params or {},
-                "warning": "This will affect ALL products in the store" if scope_type == "all" else None,
+                "warning": " ".join(w for w in [
+                    "This will affect ALL products in the store." if scope_type == "all" else "",
+                    REMOVE_COLOR_WARNING if operation == "remove_color" else "",
+                ] if w) or None,
                 "note": "Nothing was changed. Call again with confirm=true to proceed.",
             }
         if not products:
@@ -622,7 +630,14 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
     @mcp.tool()
     async def set_ad_daily_budget(adset_id: str, amount_minor: int, confirm: bool = False) -> dict:
         """Change an ad set's daily budget. amount_minor is in the smallest
-        currency unit (cents for USD, so 1000 = $10.00). Requires confirm=true to execute."""
+        currency unit (cents for USD, so 1000 = $10.00). Requires confirm=true to execute.
+        Refused outright if it exceeds the ads_budget_change ceiling set in the
+        dashboard -- same check the dashboard's own budget route applies."""
+        settings = await db.get_automation_settings()
+        ceiling = (settings.get("ads_budget_change", {}).get("config") or {}).get("ceiling_minor")
+        if ceiling and int(amount_minor) > int(ceiling):
+            return {"error": f"Requested budget ({amount_minor}) exceeds your configured ceiling ({ceiling}). "
+                             f"Raise the ceiling from the dashboard first if this is intended."}
         if not confirm:
             return _meta_preview("Change daily budget", {"adset_id": adset_id, "new_daily_budget_major_units": amount_minor / 100})
         try:
@@ -759,10 +774,22 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
         return await db.get_automation_settings()
 
     @mcp.tool()
-    async def set_automation_setting(key: str, enabled: Optional[bool] = None, config: Optional[dict] = None) -> dict:
+    async def set_automation_setting(key: str, enabled: Optional[bool] = None, config: Optional[dict] = None, confirm: bool = False) -> dict:
         """Turn an autonomy toggle on/off, or update its config (e.g. a budget
         ceiling). key: ads_pause_resume, ads_budget_change, social_publish, or
-        comment_reply. WRITE action -- changes what future automation is allowed to do."""
+        comment_reply. WRITE action -- changes what future automation is allowed to do.
+
+        GUARDRAIL: ALWAYS requires confirm=true after explicit human approval
+        of the preview -- this decides what other actions may skip approval,
+        so it must never be flipped on a model's own initiative. (The in-app
+        Manager chat doesn't get this tool at all; see core/agent.py.)"""
+        if not confirm:
+            current = (await db.get_automation_settings()).get(key)
+            return {
+                "preview": True, "action": "Change automation setting",
+                "details": {"key": key, "current": current, "new_enabled": enabled, "new_config": config},
+                "note": "Nothing was changed. Call again with confirm=true to proceed.",
+            }
         try:
             return await db.set_automation_setting(key, enabled=enabled, config=config)
         except ValueError as e:

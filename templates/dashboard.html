@@ -337,6 +337,10 @@ textarea.field-input{min-height:80px;resize:vertical}
 .msg-bubble li{margin-bottom:2px}
 .msg-bubble code{background:rgba(255,255,255,0.08);border-radius:4px;padding:1px 5px;font-size:11.5px;font-family:monospace}
 .msg-bubble strong{font-weight:700}
+.msg-bubble .md-table{overflow-x:auto;margin:4px 0 8px;white-space:normal}
+.msg-bubble table{border-collapse:collapse;font-size:12.5px;min-width:100%}
+.msg-bubble th,.msg-bubble td{border:1px solid var(--border);padding:4px 8px;text-align:left;white-space:nowrap}
+.msg-bubble th{background:rgba(255,255,255,0.05);font-weight:600}
 
 /* Floating manager chat bubble */
 .mgr-fab{position:fixed;bottom:24px;right:24px;width:52px;height:52px;border-radius:50%;background:var(--accent);color:white;border:none;font-size:22px;cursor:pointer;box-shadow:var(--shadow-lg);z-index:280;display:flex;align-items:center;justify-content:center;transition:transform 0.15s var(--ease)}
@@ -1434,7 +1438,7 @@ async function delPurchase(id){if(!confirm('Delete purchase?'))return;await fetc
 
 function liveStatusTile(p){
   let s; try{ s = typeof p.live_status==='string' ? JSON.parse(p.live_status) : (p.live_status||null); }catch(e){ s = null; }
-  if(!s) return '<div style="font-size:11px;color:var(--muted);padding:4px 0 10px">No live status yet — next cron tick (~15 min) will pick it up.</div>';
+  if(!s) return '<div style="font-size:11px;color:var(--muted);padding:4px 0 10px">No live status yet — it refreshes at the 9am/9pm cron tick, or when you open the Print Queue tab.</div>';
   if(s.online===false) return '<div style="font-size:11px;color:var(--muted);padding:4px 0 10px">⚪ Offline / not reachable right now</div>';
 
   const state = s.gcode_state || 'UNKNOWN';
@@ -2287,12 +2291,27 @@ async function selectAgentConversation(id){
 function mdToHtml(text){
   const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const lines=esc(text).split('\n');
-  let html='', inList=null, para=[];
+  let html='', inList=null, para=[], tbl=[];
   const flushPara=()=>{if(para.length){html+=`<p>${para.join(' ')}</p>`;para=[];}};
   const closeList=()=>{if(inList){html+=`</${inList}>`;inList=null;}};
   const inline=s=>s.replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/(?<!\*)\*([^*]+)\*(?!\*)/g,'<em>$1</em>');
+  // Pipe tables (Gemini answers list-type questions with them). A "| --- |"
+  // separator row after the first row makes that row the header; without one
+  // every row is a plain body row.
+  const cells=r=>r.replace(/^\|/,'').replace(/\|$/,'').split('|').map(c=>c.trim());
+  const isSep=r=>/^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?$/.test(r);
+  const flushTable=()=>{
+    if(!tbl.length)return;
+    const hasHead=tbl.length>1&&isSep(tbl[1]);
+    const head=hasHead?`<thead><tr>${cells(tbl[0]).map(c=>`<th>${inline(c)}</th>`).join('')}</tr></thead>`:'';
+    const body=(hasHead?tbl.slice(2):tbl).filter(r=>!isSep(r)).map(r=>`<tr>${cells(r).map(c=>`<td>${inline(c)}</td>`).join('')}</tr>`).join('');
+    html+=`<div class="md-table"><table>${head}<tbody>${body}</tbody></table></div>`;
+    tbl=[];
+  };
   for(let raw of lines){
     const line=raw.trim();
+    if(line.startsWith('|')&&line.endsWith('|')&&line.length>1){flushPara();closeList();tbl.push(line);continue;}
+    flushTable();
     // A blank line alone must NOT close an open list -- models often separate
     // consecutive numbered/bulleted items with a blank line, and closing the
     // list there would fragment it into several single-item lists (each
@@ -2308,7 +2327,7 @@ function mdToHtml(text){
     closeList();
     para.push(inline(line));
   }
-  flushPara();closeList();
+  flushTable();flushPara();closeList();
   return html||esc(text);
 }
 function agentMsgBlocksToHtml(content,role){

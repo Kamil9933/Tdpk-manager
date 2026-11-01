@@ -198,11 +198,6 @@ class PostexClient:
 
         orders, orders_data = await self.get_orders_classified(status_id=0, from_date=from_date, to_date=to_date)
 
-        # TEMP DEBUG: log to Render logs so we can see exactly what came back (or
-        # didn't) when the dashboard shows unexpected data. Safe to remove once
-        # the integration is confirmed working end-to-end across a few windows.
-        print(f"[postex] window={from_date}..{to_date} order_count={len(orders)} api_error={orders_data.get('error','')}")
-
         total = len(orders)
         delivered = sum(1 for o in orders if o["_bucket"] == "delivered")
         returned = sum(1 for o in orders if o["_bucket"] == "returned")

@@ -2,7 +2,14 @@ import asyncio
 import time
 import httpx
 
-API_VERSION = "2024-04"
+import os
+
+# Shopify retires API versions about 12 months after release and then silently
+# serves the oldest supported one instead -- pin a current one explicitly.
+API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-01")
+# Date-only ranges are interpreted as Pakistan calendar days, not UTC ones,
+# so "today" means midnight-to-midnight PKT.
+STORE_UTC_OFFSET = "+05:00"
 
 class ShopifyClient:
     """
@@ -207,7 +214,25 @@ class ShopifyClient:
         levels = data.get("inventory_levels", [])
         return levels[0] if levels else None
 
-    async def restore_product(self, product_snapshot: dict):
+    async def _primary_location_id(self):
+        locations = [l for l in await self.get_locations() if l.get("active", True)]
+        return locations[0]["id"] if locations else None
+
+    async def set_inventory_level(self, location_id, inventory_item_id, available):
+        return await self._post("/inventory_levels/set.json", {
+            "location_id": location_id, "inventory_item_id": inventory_item_id, "available": int(available),
+        })
+
+    async def restore_product(self, product_snapshot: dict, operation: str = ""):
+        """Puts a product back to its snapshot. Existing variants get their
+        fields reset; variants deleted since the snapshot (remove_color) are
+        recreated -- with NEW ids, Shopify can't revive the old ones -- and
+        given their old stock. Stock on surviving variants is only reset when
+        the operation itself changed stock (set_stock), otherwise sales made
+        since the snapshot would be wiped out. Variants added since the
+        snapshot are only deleted when the operation was add_color, so a
+        variant created by hand later is never touched. Stock is restored at
+        the store's first active location (fine for a single-location store)."""
         pid = product_snapshot["id"]
         await self.update_product(pid, {
             "title": product_snapshot.get("title"),
@@ -217,8 +242,21 @@ class ShopifyClient:
             "tags": product_snapshot.get("tags"),
             "status": product_snapshot.get("status"),
         })
+        current = (await self._get(f"/products/{pid}.json")).get("product", {})
+        current_ids = {v["id"] for v in current.get("variants", [])}
+        snapshot_ids = {v["id"] for v in product_snapshot.get("variants", [])}
+        result = {"recreated": 0, "removed": 0, "stock_restored": 0, "errors": 0}
+
+        if operation == "add_color":
+            for vid in current_ids - snapshot_ids:
+                if await self.delete_variant(pid, vid) < 400:
+                    result["removed"] += 1
+                else:
+                    result["errors"] += 1
+
+        location_id = None
         for v in product_snapshot.get("variants", []):
-            await self.update_variant(pid, v["id"], {
+            fields = {
                 "price": v.get("price"),
                 "compare_at_price": v.get("compare_at_price"),
                 "taxable": v.get("taxable"),
@@ -226,13 +264,36 @@ class ShopifyClient:
                 "inventory_management": v.get("inventory_management"),
                 "weight": v.get("weight"),
                 "weight_unit": v.get("weight_unit"),
-            })
+            }
+            try:
+                if v["id"] in current_ids:
+                    await self.update_variant(pid, v["id"], fields)
+                    inventory_item_id = v.get("inventory_item_id")
+                    restore_stock = operation == "set_stock"
+                else:
+                    payload = {**fields, "option1": v.get("option1"), "option2": v.get("option2"),
+                               "option3": v.get("option3"), "sku": v.get("sku"), "barcode": v.get("barcode")}
+                    created = await self.add_variant(pid, {k: val for k, val in payload.items() if val is not None})
+                    inventory_item_id = (created.get("variant") or {}).get("inventory_item_id")
+                    result["recreated"] += 1
+                    restore_stock = True
+                if (restore_stock and inventory_item_id and v.get("inventory_management") == "shopify"
+                        and v.get("inventory_quantity") is not None):
+                    location_id = location_id or await self._primary_location_id()
+                    if location_id:
+                        await self.set_inventory_level(location_id, inventory_item_id, v["inventory_quantity"])
+                        result["stock_restored"] += 1
+            except Exception:
+                result["errors"] += 1
         await asyncio.sleep(0.3)
+        return result
 
     async def get_all_orders_range(self, from_date: str, to_date: str, status: str = "any"):
-        """Get orders within a custom date range."""
+        """Get orders within a custom date range (whole Pakistan-time days)."""
         orders = []
-        params = {"limit": 250, "status": status, "created_at_min": f"{from_date}T00:00:00Z", "created_at_max": f"{to_date}T23:59:59Z"}
+        params = {"limit": 250, "status": status,
+                  "created_at_min": f"{from_date}T00:00:00{STORE_UTC_OFFSET}",
+                  "created_at_max": f"{to_date}T23:59:59{STORE_UTC_OFFSET}"}
         while True:
             data = await self._get("/orders.json", params)
             batch = data.get("orders", [])

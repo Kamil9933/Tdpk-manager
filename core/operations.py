@@ -1,6 +1,14 @@
 import asyncio
 from typing import List, Dict, Any
 
+# Shown in the bulk-operation preview (dashboard and MCP tool) before a
+# remove_color run, since it's the one operation rollback can't fully undo.
+REMOVE_COLOR_WARNING = (
+    "remove_color DELETES variants. Rollback recreates them with the same options, "
+    "price and stock, but as NEW variants (new IDs) -- old order line items and any "
+    "variant-specific images won't link to them."
+)
+
 # Shared progress store — operation_id → progress dict
 progress_store: Dict[str, Any] = {}
 
@@ -65,8 +73,12 @@ async def op_remove_color(products, params, shopify):
                      if v.get(pos_key, "").lower() == color]
         for v in to_delete:
             try:
-                await shopify.delete_variant(p["id"], v["id"])
-                changed += 1
+                # delete_variant returns the HTTP status rather than raising
+                status = await shopify.delete_variant(p["id"], v["id"])
+                if status >= 400:
+                    errors += 1
+                else:
+                    changed += 1
             except Exception:
                 errors += 1
         await asyncio.sleep(0.3)

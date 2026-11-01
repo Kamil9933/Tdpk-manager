@@ -201,6 +201,29 @@ def _for_anthropic(messages):
     return out
 
 
+# Tools the in-app chat (Gemini/Claude driving on their own) never gets.
+# set_automation_setting decides which actions may skip human approval, so a
+# model must not be able to grant itself that -- change it from the
+# dashboard's Automation tab (or the MCP connector, where it's confirm-gated).
+AGENT_EXCLUDED_TOOLS = {"set_automation_setting"}
+
+
+class _GuardedTools:
+    """Wraps the MCP server for model-driven turns: hides AGENT_EXCLUDED_TOOLS
+    from the tool list AND refuses them at call time, so a model that invents
+    the tool name anyway still can't run it."""
+
+    def __init__(self, mcp_server):
+        self._server = mcp_server
+
+    async def list_tools(self):
+        return [t for t in await self._server.list_tools() if t.name not in AGENT_EXCLUDED_TOOLS]
+
+    async def call_tool(self, name, args):
+        if name in AGENT_EXCLUDED_TOOLS:
+            raise PermissionError(f"{name} can't be used from the chat -- change it from the dashboard.")
+        return await self._server.call_tool(name, args)
+
 MAX_HISTORY_TURNS = int(os.getenv("AGENT_HISTORY_TURNS", "15") or 15)
 MAX_STORED_TOOL_RESULT_CHARS = 4000
 
@@ -459,6 +482,7 @@ async def run_agent_turn(mcp_server, db, conversation_id, user_text):
         {"type": "text", "text": dynamic_context},
     ]
     system_text_gemini = SYSTEM_PROMPT_STATIC + "\n\n" + dynamic_context
+    mcp_server = _GuardedTools(mcp_server)
     mcp_tools = await mcp_server.list_tools()
     anthropic_tools = _mcp_tools_to_anthropic(mcp_tools)
 

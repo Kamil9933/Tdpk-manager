@@ -113,7 +113,13 @@ def format_for_telegram(text: str) -> str:
     sent with no parse_mode, so this is cosmetic stripping, not structural
     HTML/MarkdownV2 formatting (which would risk Telegram rejecting the
     message over an unescaped special character)."""
-    text = re.sub(r'^#{1,4}\s*', '', text, flags=re.MULTILINE)
+    # Markdown tables: drop the "| --- |" separator row and turn each
+    # "| a | b |" row into "a · b" so it reads cleanly as plain text.
+    # [ \t] rather than \s so a pattern never reaches across lines.
+    text = re.sub(r'^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*(\|[ \t]*:?-{3,}:?[ \t]*)*\|?[ \t]*\n?', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^[ \t]*\|(.*)\|[ \t]*$', lambda m: ' · '.join(c.strip() for c in m.group(1).split('|')), text, flags=re.MULTILINE)
+    # Headings need a space after the #s, so "#1844" (an order number) survives.
+    text = re.sub(r'^#{1,4}[ \t]+', '', text, flags=re.MULTILINE)
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
     text = re.sub(r'(?<!\*)\*(?!\*)([^\n*]+?)(?<!\*)\*(?!\*)', r'\1', text)
     return text.strip()

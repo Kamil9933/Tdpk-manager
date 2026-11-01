@@ -48,6 +48,10 @@ class Database:
         res = get_client().table("operation_log").select("id,operation_name,scope,product_count,performed_at,performed_by,details").order("performed_at",desc=True).range(start,start+per_page-1).execute()
         return {"logs":res.data,"page":page}
 
+    async def get_operation_log(self, log_id):
+        res = get_client().table("operation_log").select("*").eq("id", log_id).execute()
+        return res.data[0] if res.data else None
+
     # ── Snapshots ─────────────────────────────────────────────────────────────
     async def save_snapshot(self, log_id, products):
         get_client().table("product_snapshots").insert({"operation_log_id":log_id,"snapshot_data":json.dumps(products)}).execute()
@@ -211,7 +215,7 @@ class Database:
     async def update_printer_live_status(self, printer_id, status: dict):
         """Overwrites the printer row's current-state snapshot (not a log --
         see the add_bambu_live_status_to_printers migration). Called from the
-        cron-tick poll, once per printer, every ~15 minutes."""
+        cron-tick poll (and the queue tab refresh), once per printer."""
         get_client().table("printers").update({
             "live_status": json.dumps(status),
             "live_status_updated_at": datetime.utcnow().isoformat(),
@@ -505,17 +509,16 @@ class Database:
         await self._update("agent_reminders", reminder_id, {"status": "cancelled"})
 
     # ── Digest send-log (idempotency for the twice-daily digest) ─────────────
-    async def digest_already_sent(self, slot):
+    async def claim_slot(self, slot):
+        """Atomically claims a cron job slot (digest, ad-spend sync, ...) by
+        inserting its digest_log row -- `slot` is unique, so only one caller
+        ever gets True. Any failure (duplicate, or the database being
+        unreachable) returns False: skipping a run is safer than sending a
+        digest twice or logging an expense twice."""
         try:
-            res = get_client().table("digest_log").select("id").eq("slot", slot).limit(1).execute()
+            res = get_client().table("digest_log").insert({"slot": slot}).execute()
             return bool(res.data)
         except Exception:
             return False
-
-    async def mark_digest_sent(self, slot):
-        try:
-            get_client().table("digest_log").insert({"slot": slot}).execute()
-        except Exception:
-            pass
 
 db = Database()

@@ -64,6 +64,8 @@ SKIP_SIGNATURE = "skip_thought_signature_validator"
 _KEY_PATTERNS = [
     re.compile(r"AIza[0-9A-Za-z_\-]{20,}"),           # Google API key shape
     re.compile(r"([?&]key=)[^&\s\"']+", re.I),         # key in a query string
+    re.compile(r"(access_token=)[^&\s\"']+", re.I),    # Meta Graph API token in a URL
+    re.compile(r"bot\d{6,}:[A-Za-z0-9_\-]{20,}"),       # Telegram bot token in a URL
 ]
 
 
@@ -75,14 +77,18 @@ class GeminiError(RuntimeError):
 
 
 def redact(text) -> str:
-    """Strips GEMINI_API_KEY (and anything shaped like a Google API key) from
-    error text before it reaches the chat UI or the database."""
+    """Strips secrets (GEMINI_API_KEY, anything shaped like a Google API key,
+    Meta access tokens, Telegram bot tokens) from error text before it
+    reaches the chat UI, Telegram, or the database. Used app-wide, not just
+    for Gemini errors."""
     text = str(text)
     key = os.getenv("GEMINI_API_KEY", "")
     if key:
         text = text.replace(key, "[REDACTED]")
     text = _KEY_PATTERNS[0].sub("[REDACTED]", text)
     text = _KEY_PATTERNS[1].sub(r"\1[REDACTED]", text)
+    text = _KEY_PATTERNS[2].sub(r"\1[REDACTED]", text)
+    text = _KEY_PATTERNS[3].sub("bot[REDACTED]", text)
     return text
 
 

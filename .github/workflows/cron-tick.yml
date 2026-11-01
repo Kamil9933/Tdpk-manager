@@ -2,15 +2,17 @@
 
 # Render's free plan has no built-in scheduler and the web service spins down
 # when idle, so this workflow pings the app's /api/cron/tick endpoint twice a
-# day -- 04:00 and 16:00 UTC (09:00 and 21:00 Pakistan time, the digest
-# slots). That wakes the service and drives everything time-based: the
-# digest, due reminders, the Meta/PostEx/Shopify expense syncs, the printer
-# poll and the queue sync. It used to run every 15 min, which kept Render
-# awake 24/7 and used up the free instance hours.
+# day -- 04:07 and 16:07 UTC (09:07 and 21:07 Pakistan time, just after the
+# digest slots; GitHub delays runs scheduled exactly on the hour the most).
+# That wakes the service and drives everything time-based: the digest, due
+# reminders, the Meta/PostEx/Shopify expense syncs, the printer poll and the
+# queue sync. It used to be scheduled every 15 min, but GitHub
+# only actually ran it 4-8 times a day, so it was not what used up Render's
+# free hours (another free service shares them).
 #
 # Trade-off of twice a day: reminders fire at the next tick (up to ~12h late),
-# and printer status / queue sync only refresh at the ticks. Use "Run workflow"
-# on the Actions tab for an extra tick.
+# and printer status / queue sync refresh at the ticks or when the Print Queue
+# tab is opened. Use "Run workflow" on the Actions tab for an extra tick.
 #
 # The endpoint is idempotent per digest slot / reminder / sync day, so extra
 # manual runs are always safe.
@@ -23,7 +25,7 @@
 
 on:
   schedule:
-    - cron: '0 4,16 * * *'
+    - cron: '7 4,16 * * *'
   workflow_dispatch: {}
 
 jobs:

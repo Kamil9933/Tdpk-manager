@@ -12,7 +12,7 @@ load_dotenv()
 from core.auth import verify_session, create_session, delete_session
 from core.shopify import ShopifyClient
 from core.supabase_client import db
-from core.operations import run_operation
+from core.operations import run_operation, REMOVE_COLOR_WARNING
 from core.intelligence import generate_briefing
 from core.postex import PostexClient
 from core.accounting import generate_pnl, straight_line_depreciation, calc_cash_balance, reconcile_postex
@@ -24,6 +24,7 @@ from core.digest import generate_digest
 from core.filament import deduct_filament_for_order, compute_filament_status
 from core.returns import compute_product_return_breakdown
 from core import bambu_cloud
+from core.gemini_fallback import redact
 
 shopify = ShopifyClient(
     store=os.getenv("SHOPIFY_STORE", "1gdih3-zv.myshopify.com"),
@@ -606,19 +607,24 @@ async def agent_send_message(conversation_id: str, request: Request, session=Dep
             "est_cost_usd": 0, "tool_calls": [], "unavailable": True,
         }
     except RuntimeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=redact(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Agent error: {e}")
+        raise HTTPException(status_code=500, detail=redact(f"Agent error: {e}"))
 
 # ── Operations ────────────────────────────────────────────────────────────────
 @app.post("/api/operations/preview")
 async def preview_operation(request: Request, session=Depends(verify_session)):
     data = await request.json()
     products = await _resolve_scope(data.get("scope", {}))
+    warnings = []
+    if data.get("scope", {}).get("type") == "all":
+        warnings.append("This will affect ALL products")
+    if data.get("operation") == "remove_color":
+        warnings.append(REMOVE_COLOR_WARNING)
     return {
         "product_count": len(products),
         "sample": [{"id": p["id"], "title": p["title"]} for p in products[:5]],
-        "warning": "This will affect ALL products" if data.get("scope", {}).get("type") == "all" else None
+        "warning": " ".join(warnings) or None
     }
 
 @app.post("/api/operations/run")
@@ -678,15 +684,21 @@ async def rollback(log_id: str, session=Depends(verify_session)):
     if not snapshot:
         raise HTTPException(status_code=404, detail="Snapshot not found or expired (30 day limit)")
     products = snapshot["snapshot_data"]
+    log = await db.get_operation_log(log_id) or {}
+    operation = log.get("operation_name", "")
     restored = errors = 0
+    totals = {"recreated": 0, "removed": 0, "stock_restored": 0}
     for product in products:
         try:
-            await shopify.restore_product(product)
+            r = await shopify.restore_product(product, operation=operation)
+            for k in totals:
+                totals[k] += r.get(k, 0)
+            errors += r.get("errors", 0)
             restored += 1
-        except:
+        except Exception:
             errors += 1
-    await db.create_operation_log(f"ROLLBACK of {log_id}", {"type":"rollback"}, {}, restored)
-    return {"ok": True, "restored": restored, "errors": errors}
+    await db.create_operation_log(f"ROLLBACK of {log_id}", {"type":"rollback"}, totals, restored)
+    return {"ok": True, "restored": restored, "errors": errors, **totals}
 
 # ── Notifications ─────────────────────────────────────────────────────────────
 @app.get("/api/notifications")
@@ -1363,9 +1375,30 @@ async def bambu_mqtt_status_test_route(request: Request, session=Depends(verify_
 # person (the owner) manages the queue, so q.tdpk's PIN/staff-role layer was
 # deliberately not rebuilt here.
 QUEUE_STATUSES = ("queued", "printing", "paused", "done", "shipped", "archived")
+# The cron only ticks twice a day, so opening the queue tab also refreshes
+# printer status + queue sync in the background, at most this often.
+QUEUE_REFRESH_MINUTES = 10
+
+def _printers_stale(printers) -> bool:
+    stamps = [p.get("live_status_updated_at") for p in printers if p.get("bambu_dev_id")]
+    if not stamps:
+        return False
+    if not all(stamps):
+        return True
+    newest = max(datetime.fromisoformat(s.replace("Z", "+00:00")) for s in stamps)
+    return datetime.now(timezone.utc) - newest > timedelta(minutes=QUEUE_REFRESH_MINUTES)
+
+async def _refresh_printers_and_queue():
+    await _poll_bambu_printers()
+    await _sync_queue_with_printers()
 
 @app.get("/api/queue")
-async def list_queue(status: str = None, printer: str = None, session=Depends(verify_session)):
+async def list_queue(background_tasks: BackgroundTasks, status: str = None, printer: str = None, session=Depends(verify_session)):
+    try:
+        if _printers_stale(await db.list_printers()):
+            background_tasks.add_task(_refresh_printers_and_queue)
+    except Exception:
+        pass  # a refresh problem must never stop the queue from loading
     statuses = [s.strip() for s in status.split(",")] if status else None
     jobs = await db.list_queue(statuses=statuses, printer=printer)
     return {"jobs": jobs}
@@ -1583,7 +1616,7 @@ async def _process_telegram_message(text: str):
         # which may have already gone through via the rule-based bypass).
         await send_telegram(format_for_telegram(str(e)))
     except Exception as e:
-        await send_telegram(f"Something went wrong processing that: {e}")
+        await send_telegram(redact(f"Something went wrong processing that: {e}"))
 
 @app.post("/api/telegram/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
@@ -1610,7 +1643,10 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 # its exact hour", so a sparse or late ping still runs it once.
 # Idempotent per digest slot (digest_log) and per reminder (status flips to
 # 'sent'), so pinging more often than needed is always safe, never causes a
-# duplicate send.
+# duplicate send. Each job CLAIMS its slot (inserts the digest_log row, which
+# is unique) before doing the work, so two overlapping ticks can't both send
+# or both log an expense; the trade-off is that a job that fails after
+# claiming is not retried for that slot.
 CRON_SECRET = os.getenv("CRON_SECRET", "")
 PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time -- fixed UTC+5 offset, no DST
 
@@ -1658,10 +1694,9 @@ async def cron_tick(request: Request):
         slot_start = now_pkt.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if slot_start <= now_pkt < slot_start + timedelta(hours=DIGEST_WINDOW_HOURS):
             slot_key = f"{now_pkt.date().isoformat()}:{hh:02d}:{mm:02d}"
-            if not await db.digest_already_sent(slot_key):
+            if await db.claim_slot(slot_key):
                 text = await generate_digest(db, shopify, postex)
                 await notify_all(f"TDPK daily digest ({hh:02d}:{mm:02d})", text, db=db)
-                await db.mark_digest_sent(slot_key)
                 fired["digests"].append(slot_key)
 
     due = await db.list_due_reminders()
@@ -1684,7 +1719,7 @@ async def cron_tick(request: Request):
     if _reached(now_pkt, ad_hh, ad_mm):
         y = (now_pkt.date() - timedelta(days=1)).isoformat()
         slot_key = f"ad_sync:{y}"
-        if not await db.digest_already_sent(slot_key):
+        if await db.claim_slot(slot_key):
             try:
                 insights = await meta.get_insights(date_preset="yesterday", level="account")
                 rows = insights.get("data") or []
@@ -1698,7 +1733,6 @@ async def cron_tick(request: Request):
                 fired["ad_spend_synced"] = {"date": y, "amount": spend}
             except Exception as e:
                 fired["ad_spend_sync_error"] = str(e)
-            await db.mark_digest_sent(slot_key)
 
     # ── Monthly Shopify subscription bill -> expense sync ─────────────────────
     # User's ask (simplified from an earlier "check the bill" idea): just log
@@ -1716,7 +1750,7 @@ async def cron_tick(request: Request):
     if now_pkt.day > 1 or _reached(now_pkt, shopify_hh, shopify_mm):
         month_key = f"{now_pkt.year:04d}-{now_pkt.month:02d}"
         slot_key = f"shopify_bill:{month_key}"
-        if not await db.digest_already_sent(slot_key):
+        if await db.claim_slot(slot_key):
             try:
                 bill_usd = float(os.getenv("SHOPIFY_BILL_USD", "25"))
                 usd_pkr = 280.0  # fallback if the live-rate fetch below fails
@@ -1737,7 +1771,6 @@ async def cron_tick(request: Request):
                 fired["shopify_bill_synced"] = {"month": month_key, "usd": bill_usd, "pkr": amount_pkr, "rate": usd_pkr}
             except Exception as e:
                 fired["shopify_bill_sync_error"] = str(e)
-            await db.mark_digest_sent(slot_key)
 
     # ── Daily PostEx courier-fee ESTIMATE -> payout sync ──────────────────────
     # PostEx's API doesn't expose real settlement/fee-deducted figures (only
@@ -1757,7 +1790,7 @@ async def cron_tick(request: Request):
     if _reached(now_pkt, postex_hh, postex_mm):
         y = (now_pkt.date() - timedelta(days=1)).isoformat()
         slot_key = f"postex_fee_sync:{y}"
-        if not await db.digest_already_sent(slot_key):
+        if await db.claim_slot(slot_key):
             try:
                 rate = float(os.getenv("POSTEX_FEE_PER_PARCEL", "260"))
                 summary = await postex.get_dashboard_summary(from_date=y, to_date=y)
@@ -1775,7 +1808,6 @@ async def cron_tick(request: Request):
                 fired["postex_fee_synced"] = {"date": y, "delivered": delivered, "estimated_fee": delivered * rate if delivered else 0}
             except Exception as e:
                 fired["postex_fee_sync_error"] = str(e)
-            await db.mark_digest_sent(slot_key)
 
     fired["printers_polled"] = await _poll_bambu_printers()
     fired["queue_synced"] = await _sync_queue_with_printers()
@@ -1784,7 +1816,7 @@ async def cron_tick(request: Request):
 
 async def _poll_bambu_printers() -> int:
     """Refreshes the live_status snapshot on every printer row that has a
-    bambu_dev_id, every cron tick (~15 min). Dashboard-tile use only, no
+    bambu_dev_id, every cron tick (twice a day) and when the queue tab is opened. Dashboard-tile use only, no
     notifications -- just overwrites "what's it doing right now" so the
     accounting > Printers tab can show it without the user having to check
     Bambu's own app. Entirely best-effort: any failure here (Bambu's API
@@ -1819,6 +1851,11 @@ async def _poll_bambu_printers() -> int:
         polled = 0
         for p in printers:
             dev_id = p["bambu_dev_id"]
+            prev = p.get("live_status")
+            try:
+                prev = json.loads(prev) if isinstance(prev, str) else (prev or {})
+            except Exception:
+                prev = {}
             try:
                 if not online_by_dev_id.get(dev_id, False):
                     await db.update_printer_live_status(p["id"], {"online": False})
@@ -1839,6 +1876,10 @@ async def _poll_bambu_printers() -> int:
                     "nozzle_temper": merged.get("nozzle_temper"),
                     "bed_temper": merged.get("bed_temper"),
                     "mqtt_ok": live.get("ok", False),
+                    # What the previous poll saw, so the queue sync can tell a
+                    # finished-and-replaced job apart from the same job still running.
+                    "prev_gcode_state": prev.get("gcode_state"),
+                    "prev_subtask_name": prev.get("subtask_name"),
                 }
                 await db.update_printer_live_status(p["id"], status)
                 polled += 1
@@ -1879,6 +1920,16 @@ async def _sync_queue_with_printers() -> int:
                 state = live.get("gcode_state")
                 printer_name = p["name"]
                 if state == "RUNNING":
+                    # Same printer, different file than last poll while it was
+                    # running: the job we had as 'printing' finished in between.
+                    prev_task, task = live.get("prev_subtask_name"), live.get("subtask_name")
+                    if live.get("prev_gcode_state") == "RUNNING" and prev_task and task and prev_task != task:
+                        for job in await db.list_queue_by_printer_status(printer_name, "printing"):
+                            await db.update_queue_job(job["id"], {
+                                "status": "done",
+                                "completed_at": datetime.utcnow().isoformat(),
+                            })
+                            transitioned += 1
                     if not await db.list_queue_by_printer_status(printer_name, "printing"):
                         queued = await db.list_queue_by_printer_status(printer_name, "queued")
                         if queued:

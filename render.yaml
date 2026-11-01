@@ -43,6 +43,16 @@ services:
         sync: false
       - key: ANTHROPIC_API_KEY
         sync: false
+      # Gemini drives the chat by default (see core/agent.py). GEMINI_FALLBACK_MODEL
+      # is optional: one model or a comma-separated list, tried before the
+      # built-in defaults in core/gemini_fallback.py.
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_FALLBACK_MODEL
+        sync: false
+      # Optional: Shopify Admin API version (default in core/shopify.py).
+      - key: SHOPIFY_API_VERSION
+        sync: false
       - key: AGENT_MODEL
         sync: false
       # Phone notifications -- Telegram (free, no approval needed) and/or

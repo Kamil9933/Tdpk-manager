@@ -323,11 +323,6 @@ class MetaClient:
             link_data["picture"] = image_url
         object_story_spec = {"page_id": page_id or self._require(self.page_id, "META_PAGE_ID"), "link_data": link_data}
         ig_actor = instagram_user_id or self.ig_user_id
-        # Logged so a retry's exact outgoing value is visible in Render's
-        # logs -- if this is ever wrong again (e.g. a stray quote/space an
-        # env var edit reintroduces), repr() makes that visible immediately
-        # instead of looking like a plain correct-looking id.
-        print(f"[meta.create_ad_creative] resolved instagram_user_id = {ig_actor!r} (len={len(ig_actor) if ig_actor else 0})")
         if ig_actor:
             object_story_spec["instagram_user_id"] = ig_actor
         return await self._call("POST", f"{self._require(self.ad_account_id, 'META_AD_ACCOUNT_ID')}/adcreatives", {

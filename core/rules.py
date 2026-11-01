@@ -25,6 +25,7 @@ same bypass, same zero LLM cost, regardless of which layer opened it.
 import json
 import re
 from datetime import datetime, timedelta, timezone
+from core.gemini_fallback import redact
 
 PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time, fixed UTC+5
 
@@ -132,11 +133,18 @@ async def _h_filament(m, mcp_server, db):
         return "No filament types registered yet."
     lines = []
     for s in status:
-        lines.append(
-            f"  - {s.get('color','?')} {s.get('material','?')}: {s.get('stock_grams','?')}g, "
-            f"~{s.get('days_left','?')} days left, suggest {s.get('suggested_spools','?')} spool(s)"
-        )
-    return "Filament status:\n" + "\n".join(lines)
+        days = s.get("projected_days_left")
+        line = f"  - {s.get('material','?')} {s.get('color','?')}: {s.get('in_stock_grams', 0):,.0f}g"
+        line += f", ~{days:.0f} days left" if days is not None else ", no recent usage"
+        if s.get("needs_reorder"):
+            line += f" -- reorder {s.get('suggested_purchase_spools', 1)} spool(s)"
+        lines.append(line)
+    try:
+        review = await db.list_filament_needs_review()
+    except Exception:
+        review = []
+    tail = f"\n\n{len(review)} order item(s) still need manual filament review, so these numbers are incomplete." if review else ""
+    return "Filament status:\n" + "\n".join(lines) + tail
 
 
 async def _h_printers(m, mcp_server, db):
@@ -147,10 +155,22 @@ async def _h_printers(m, mcp_server, db):
     lines = []
     for p in printers:
         live = p.get("live_status") or {}
-        state = live.get("gcode_state", "unknown")
-        pct = live.get("percent")
-        lines.append(f"  - {p.get('name')}: {state}" + (f", {pct}%" if pct is not None else ""))
-    return "Printer status:\n" + "\n".join(lines)
+        if isinstance(live, str):  # stored double-encoded: a JSON string inside jsonb
+            try:
+                live = json.loads(live)
+            except Exception:
+                live = {}
+        state = "offline" if live.get("online") is False else (live.get("gcode_state") or "unknown")
+        pct = live.get("mc_percent")
+        job = live.get("subtask_name")
+        mins = live.get("mc_remaining_time")
+        line = f"  - {p.get('name')}: {state}"
+        if state == "RUNNING":
+            line += (f", {pct}%" if pct is not None else "") + (f", {mins} min left" if mins else "") + (f" ({job})" if job else "")
+        lines.append(line)
+    updated = max((p.get("live_status_updated_at") or "" for p in printers), default="")
+    tail = f"\n(last checked {updated[:16].replace('T', ' ')} UTC)" if updated else ""
+    return "Printer status:\n" + "\n".join(lines) + tail
 
 
 async def _h_queue(m, mcp_server, db):
@@ -169,23 +189,29 @@ async def _h_queue(m, mcp_server, db):
 
 async def _h_pnl(m, mcp_server, db):
     data = await _call_tool(mcp_server, "get_pnl", {})
+    rev = data.get("revenue") or {}
     return (
         f"P&L (last 30 days):\n"
-        f"  Revenue: {_money(data.get('revenue'))}\n"
-        f"  COGS: {_money(data.get('cogs'))}\n"
-        f"  Opex: {_money(data.get('opex'))}\n"
+        f"  Revenue: {_money(rev.get('total'))} (Shopify {_money(rev.get('shopify'))}, custom {_money(rev.get('custom_orders'))})\n"
+        f"  COGS: {_money((data.get('cogs') or {}).get('total'))}\n"
+        f"  Opex: {_money((data.get('opex') or {}).get('total'))}\n"
+        f"  Courier fees: {_money(data.get('courier_fees'))}\n"
+        f"  Labor: {_money(data.get('labor_cost'))}\n"
         f"  Net profit: {_money(data.get('net_profit'))} ({data.get('margin_pct','?')}% margin)"
     )
 
 
 async def _h_postex(m, mcp_server, db):
     data = await _call_tool(mcp_server, "get_postex_summary", {})
+    if data.get("error"):
+        return f"Couldn't load PostEx: {data['error']}"
     return (
-        f"PostEx (last 30 days):\n"
-        f"  Delivered: {data.get('delivered_count','?')}\n"
-        f"  Returned: {data.get('returned_count','?')}\n"
-        f"  In transit: {data.get('in_transit_count','?')}\n"
-        f"  Total COD value: {_money(data.get('total_cod_value'))}"
+        f"PostEx (last 30 days): {data.get('total_orders', 0)} orders\n"
+        f"  Delivered: {data.get('delivered', 0)} ({data.get('delivery_rate', 0)}%)\n"
+        f"  Returned: {data.get('returned', 0)} ({data.get('return_rate', 0)}%)\n"
+        f"  In transit: {data.get('in_transit', 0)}\n"
+        f"  Total COD value: {_money(data.get('total_cod_value'))}\n"
+        f"  Pending COD: {_money(data.get('pending_cod'))}"
     )
 
 
@@ -390,7 +416,7 @@ async def try_handle(mcp_server, db, conversation_id, user_text):
             try:
                 result = await handler(match, mcp_server, db)
             except Exception as e:
-                return f"Tried to handle that without AI but hit an error: {e}"
+                return redact(f"Tried to handle that without AI but hit an error: {e}")
             if result is not None:
                 return result
     for pattern, handler in _ACTION_PATTERNS:
@@ -399,7 +425,7 @@ async def try_handle(mcp_server, db, conversation_id, user_text):
             try:
                 result = await handler(match, mcp_server, db, conversation_id)
             except Exception as e:
-                return f"Tried to handle that without AI but hit an error: {e}"
+                return redact(f"Tried to handle that without AI but hit an error: {e}")
             if result is not None:
                 return result
     return None

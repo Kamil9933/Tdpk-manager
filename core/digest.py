@@ -5,22 +5,22 @@ HTML/markdown, so it renders cleanly in both a Telegram message and a plain
 email body with no extra formatting work.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from core.filament import compute_filament_status
+
+PKT = timezone(timedelta(hours=5))
 
 
 async def generate_digest(db, shopify, postex):
     lines = []
-    now = datetime.utcnow()
-    today = now.date().isoformat()
-    yesterday = (now - timedelta(days=1)).date().isoformat()
+    today = datetime.now(PKT).date().isoformat()
 
     lines.append(f"TDPK Manager -- digest for {today}")
     lines.append("")
 
     # Shopify orders in roughly the last 24h
     try:
-        orders = await shopify.get_all_orders_range(yesterday, today, status="any")
+        orders = await shopify.get_all_orders(status="any", days=1)
         revenue = sum(float(o.get("total_price", 0) or 0) for o in orders)
         lines.append(f"Shopify: {len(orders)} order(s) in the last 24h, ~PKR {revenue:,.0f} total.")
     except Exception as e:
