@@ -1,0 +1,46 @@
+name: TDPK SEO report
+
+# Twice a day, ~20 minutes after the cron tick (09:30 and 21:30 Pakistan
+# time): Search Console + PageSpeed + index checks for the pages in
+# seo/targets.json, stored in Supabase and sent to Telegram. Runs entirely
+# on GitHub's runners -- it never calls the Render app. Suggestions are
+# saved as drafts only; nothing on the store is changed.
+#
+# Setup (one-time), repo Settings -> Secrets and variables -> Actions:
+#   - GOOGLE_SA_JSON         service-account key JSON (whole file contents)
+#   - GSC_SITE_URL           optional: sc-domain:thirddimension.pk or
+#                            https://thirddimension.pk/ (auto-detected if unset)
+#   - PSI_API_KEY            Google API key with the PageSpeed Insights API
+#                            enabled (keyless calls fail on quota)
+#   - SUPABASE_URL           same values the Render app uses
+#   - SUPABASE_SERVICE_KEY
+#   - TELEGRAM_BOT_TOKEN     same bot/chat as the digest
+#   - TELEGRAM_CHAT_ID
+# Then add the service account's email as a user (Restricted) on the Search
+# Console property, and run seo_schema.sql on Supabase once.
+
+on:
+  schedule:
+    - cron: '30 4,16 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r seo/requirements.txt
+      - name: Run SEO report
+        env:
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          GSC_SITE_URL: ${{ secrets.GSC_SITE_URL }}
+          PSI_API_KEY: ${{ secrets.PSI_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python seo/seo_report.py

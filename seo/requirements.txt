@@ -1,0 +1,4 @@
+# Only for seo/seo_report.py on GitHub Actions -- not installed on Render.
+httpx>=0.27,<1.0
+google-auth>=2.30,<3.0
+requests>=2.31,<3.0

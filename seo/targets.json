@@ -1,0 +1,26 @@
+{
+  "_comment": "Edit freely. pages: what to track in Search Console, PageSpeed and the index check. queries: searches to track wherever they rank on the site (lowercase, exact match). The query list is a starter set, not research -- replace it with what you see in Search Console.",
+  "site": "https://thirddimension.pk",
+  "pages": [
+    {"key": "home", "name": "Home page", "url": "https://thirddimension.pk/"},
+    {"key": "batman-collection", "name": "Batman collection", "url": "https://thirddimension.pk/collections/batman"},
+    {"key": "lotr-collection", "name": "Lord of the Rings collection", "url": "https://thirddimension.pk/collections/lord-of-the-rings"},
+    {"key": "batman-signal-lamp", "name": "Batman Rooftop Signal Lamp", "url": "https://thirddimension.pk/products/batman-rooftop-signal-lamp"},
+    {"key": "one-ring-lamp", "name": "The One Ring LED Lamp", "url": "https://thirddimension.pk/products/the-one-ring-led-lamp-collector-edition"},
+    {"key": "custom-orders", "name": "Custom orders page", "url": "https://thirddimension.pk/pages/custom-orders"}
+  ],
+  "queries": [
+    "batman lamp",
+    "batman signal lamp",
+    "bat signal lamp",
+    "batman lamp pakistan",
+    "the one ring lamp",
+    "lord of the rings lamp",
+    "lord of the rings ring",
+    "3d printing pakistan",
+    "3d printing in pakistan",
+    "custom 3d printing pakistan",
+    "3d printed gifts pakistan",
+    "batman figurine pakistan"
+  ]
+}
