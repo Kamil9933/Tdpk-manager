@@ -173,7 +173,7 @@ class Database:
             if eq:
                 for k, v in eq.items():
                     q = q.eq(k, v)
-            return await _run(q).data
+            return (await _run(q)).data
         except Exception:
             return []
 
@@ -243,7 +243,7 @@ class Database:
                 q = q.in_("status", statuses if isinstance(statuses, list) else statuses.split(","))
             if printer:
                 q = q.eq("printer", printer)
-            return await _run(q).data
+            return (await _run(q)).data
         except Exception:
             return []
 
@@ -501,7 +501,7 @@ class Database:
             q = get_client().table("agent_reminders").select("*").order("due_at")
             if status:
                 q = q.eq("status", status)
-            return await _run(q).data
+            return (await _run(q)).data
         except Exception:
             return []
 
@@ -553,7 +553,7 @@ class Database:
             q = get_client().table("seo_suggestions").select("*").order("created_at", desc=True)
             if status:
                 q = q.eq("status", status)
-            return await _run(q).data
+            return (await _run(q)).data
         except Exception:
             return []
 
