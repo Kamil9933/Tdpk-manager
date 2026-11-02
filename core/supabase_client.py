@@ -1,14 +1,26 @@
-import os, json, asyncio
+import os, json, asyncio, threading
 from datetime import datetime, timedelta
 from supabase import create_client, Client
 
 _client: Client = None
 
 
+# supabase-py shares ONE synchronous HTTP/2 connection, which breaks when
+# several threads use it at once ("Resource temporarily unavailable", and
+# every request on it fails -- seen live on 2026-11-02 when the dashboard
+# loaded ~10 endpoints in parallel). So calls run one at a time, as they did
+# before, but in a worker thread: a slow query waits its turn without
+# freezing the event loop (Shopify/PostEx/Gemini calls keep going).
+_db_lock = threading.Lock()
+
+
+def _execute_locked(query):
+    with _db_lock:
+        return query.execute()
+
+
 async def _run(query):
-    """The supabase-py client is synchronous; running .execute() in a worker
-    thread keeps one slow database call from freezing every other request."""
-    return await asyncio.to_thread(query.execute)
+    return await asyncio.to_thread(_execute_locked, query)
 
 def get_client() -> Client:
     global _client

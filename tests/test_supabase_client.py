@@ -55,6 +55,46 @@ def test_list_reads_return_rows(call):
     assert asyncio.run(call(sbc.Database())) == ROWS
 
 
+def test_database_calls_never_overlap():
+    """supabase-py's shared HTTP/2 connection breaks under concurrent use, so
+    _run must serialise calls even when many requests arrive at once."""
+    import threading, time
+    state = {"active": 0, "max": 0}
+    lock = threading.Lock()
+
+    class SlowQuery:
+        def execute(self):
+            with lock:
+                state["active"] += 1
+                state["max"] = max(state["max"], state["active"])
+            time.sleep(0.02)
+            with lock:
+                state["active"] -= 1
+            return types.SimpleNamespace(data=[])
+
+    async def many():
+        await asyncio.gather(*(sbc._run(SlowQuery()) for _ in range(10)))
+    asyncio.run(many())
+    assert state["max"] == 1
+
+
+def test_event_loop_stays_free_while_db_waits():
+    import time
+    class SlowQuery:
+        def execute(self):
+            time.sleep(0.2)
+            return types.SimpleNamespace(data=[])
+
+    async def race():
+        ticks = 0
+        task = asyncio.create_task(sbc._run(SlowQuery()))
+        while not task.done():
+            ticks += 1
+            await asyncio.sleep(0.01)
+        return ticks
+    assert asyncio.run(race()) > 5  # the loop kept running other work
+
+
 def test_single_reads_and_counts():
     d = sbc.Database()
     assert asyncio.run(d.get_seo_suggestion(1)) == ROWS[0]

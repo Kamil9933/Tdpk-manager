@@ -807,8 +807,13 @@ document.addEventListener('keydown', e => {
 
 // ── Briefing ──────────────────────────────────────────────────────────────────
 async function loadBriefing() {
+  document.getElementById('briefing-wrap').innerHTML = '<div style="text-align:center;padding:3rem;color:var(--muted)">Loading briefing...</div>';
+  // A hung request used to leave "Loading briefing..." on screen forever:
+  // give up after 60s (a cold Render start plus Shopify/PostEx can take ~30s).
+  const ctrl = new AbortController(), timer = setTimeout(() => ctrl.abort(), 60000);
   try {
-    const r = await fetch('/api/briefing');
+    const r = await fetch('/api/briefing', {signal: ctrl.signal});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
     const sn=d.snapshot, fi=d.financials, or=d.orders, px=d.postex||{};
 
@@ -849,7 +854,10 @@ async function loadBriefing() {
       ${d.quick_actions?.length ? `<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">${d.quick_actions.map(a=>`<button class="btn primary" onclick="showView('products')">${a.label}</button>`).join('')}</div>` : ''}
     `;
   } catch(e) {
-    document.getElementById('briefing-wrap').innerHTML = '<div style="text-align:center;padding:3rem;color:var(--muted)">Could not load briefing</div>';
+    const why = e.name === 'AbortError' ? 'it took over 60 seconds' : e.message;
+    document.getElementById('briefing-wrap').innerHTML = `<div style="text-align:center;padding:3rem;color:var(--muted)">Could not load briefing (${String(why).replace(/</g,'&lt;')}).<br><br><button class="btn primary" onclick="loadBriefing()">Retry</button></div>`;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
