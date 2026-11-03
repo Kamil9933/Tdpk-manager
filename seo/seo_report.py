@@ -13,9 +13,9 @@ Each run:
   3. Runs PageSpeed Insights (mobile) on each live target page.
   4. Asks the URL Inspection API whether each live page is indexed.
   5. Turns problems into DRAFT suggestions in Supabase (seo_suggestions).
+     Nothing is ever changed on Shopify: you approve and apply them yourself.
   5b. Morning run only: checks each tracked query's real Google position in
      Pakistan (desktop + mobile) via DataForSEO -- see seo/rank_check.py.
-     Nothing is ever changed on Shopify: you approve and apply them yourself.
   6. Stores everything in Supabase (seo_schema.sql) and sends a Telegram
      report. Every section fails on its own -- a PageSpeed outage still
      gets you the Search Console part, with the error listed.
