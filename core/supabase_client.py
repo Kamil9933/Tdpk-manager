@@ -577,6 +577,30 @@ class Database:
     async def update_seo_suggestion(self, suggestion_id, data):
         await self._update("seo_suggestions", suggestion_id, data)
 
+    # ── SEO history for the Rankings tab (read-only) ──
+    SEO_HISTORY_MAX_ROWS = 20000
+
+    async def seo_history(self, table, columns, order_col, since=None, since_col=None):
+        """Every row (paged past PostgREST's 1,000-row cap), oldest first.
+        Returns None if the table doesn't exist yet (seo_rankings before its
+        SQL has been run); other errors propagate."""
+        rows, start, page = [], 0, 1000
+        while start < self.SEO_HISTORY_MAX_ROWS:
+            q = get_client().table(table).select(columns).order(order_col).range(start, start + page - 1)
+            if since and since_col:
+                q = q.gte(since_col, since)
+            try:
+                res = await _run(q)
+            except Exception as e:
+                if "PGRST205" in str(e) or "does not exist" in str(e) or "Could not find the table" in str(e):
+                    return None
+                raise
+            rows += res.data
+            if len(res.data) < page:
+                break
+            start += page
+        return rows
+
     # ── Social media files (bucket from social_media_schema.sql) ─────────────
     # Instagram and Facebook fetch media by public URL, so edited photos and
     # videos live in a public Supabase Storage bucket. Files sit at the bucket

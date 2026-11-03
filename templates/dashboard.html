@@ -294,6 +294,39 @@ textarea.field-input{min-height:80px;resize:vertical}
 .tgl-switch.on{background:var(--green-d);border-color:rgba(31,191,108,0.4)}
 .tgl-switch.on::after{left:21px;background:var(--green)}
 .mkt-sub{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+/* SEO Rankings */
+.sr-cards{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}
+.sr-cards .metric-card.green .m-value,.sr-cards .metric-card.red .m-value{color:var(--text)}
+.sr-cards .metric-card.green{border-color:rgba(31,191,108,0.35)}
+.sr-cards .metric-card.red{border-color:rgba(230,103,103,0.35)}
+.sr-chart{position:relative;height:300px}
+.sr-chart.sm{height:220px}
+.sr-picker{margin-bottom:10px;font-size:12px}
+.sr-picker summary{cursor:pointer;color:var(--muted)}
+.sr-picks{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:8px}
+.sr-picks label{display:flex;gap:5px;align-items:center;white-space:nowrap}
+.sr-two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.sr-two .chart-container{margin-bottom:14px}
+.sr-li{display:flex;justify-content:space-between;gap:10px;font-size:12px;padding:5px 0;border-top:1px solid var(--border)}
+.sr-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -4px}
+.sr-table{width:100%;border-collapse:collapse;font-size:12px;min-width:640px}
+.sr-table th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);padding:6px;border-bottom:1px solid var(--border2);white-space:nowrap;user-select:none}
+.sr-table th.sr-sortable{cursor:pointer}
+.sr-table a{color:var(--text);text-decoration:none;border-bottom:1px dotted var(--border3)}
+.sr-table a:hover{color:var(--accent)}
+.sr-table td{padding:7px 6px;border-bottom:1px solid var(--border);vertical-align:middle}
+.sr-table td:first-child{position:sticky;left:0;background:var(--surface2);max-width:180px}
+.sr-table tr.sr-almost td{background:rgba(242,172,46,0.08)}
+.sr-table tr.sr-almost td:first-child{background:#262219}
+.sr-tag{font-size:9.5px;color:var(--yellow);border:1px solid rgba(242,172,46,0.4);border-radius:10px;padding:0 5px;white-space:nowrap}
+.sr-almost-dot{display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(242,172,46,0.35);vertical-align:middle}
+.sr-add{margin-top:12px}
+.sr-legend{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:11px;margin-top:8px}
+.sr-legend span{display:inline-flex;align-items:center;gap:5px}
+.sr-legend i{width:10px;height:10px;border-radius:50%;display:inline-block}
+.sr-legend em{font-style:normal;color:var(--muted);font-size:10px}
+.sr-pre{background:var(--surface3);border-radius:6px;padding:6px 8px;margin:6px 0;color:var(--text);overflow-x:auto}
+@media(max-width:768px){.sr-two{grid-template-columns:1fr}.sr-chart{height:260px}.sr-chart.sm{height:200px}.sr-cards{grid-template-columns:repeat(2,1fr)}.sr-cards .m-value{font-size:19px}}
 .md-drop{border:2px dashed var(--border3);border-radius:var(--r-sm);padding:28px 16px;text-align:center;color:var(--muted);cursor:pointer;margin-bottom:14px;transition:border-color .15s,background .15s}
 .md-drop.over,.md-drop:hover{border-color:var(--accent);background:var(--accent-dim);color:var(--text)}
 .md-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
@@ -430,6 +463,7 @@ textarea.field-input{min-height:80px;resize:vertical}
     <div class="sb-sec">Marketing</div>
     <div class="sbi" onclick="showView('marketing')" id="nav-marketing"><span class="ic">📣</span>Ads &amp; Social</div>
     <div class="sbi" onclick="showView('seo')" id="nav-seo"><span class="ic">🔎</span>SEO Approvals</div>
+    <div class="sbi" onclick="showView('seorank')" id="nav-seorank"><span class="ic">📈</span>SEO Rankings</div>
     <div class="sb-sec">Colour Ops</div>
     <div class="sbi" onclick="openOp('remove_color')"><span class="ic">🗑</span>Remove colour</div>
     <div class="sbi" onclick="openOp('add_color')"><span class="ic">➕</span>Add colour</div>
@@ -589,6 +623,15 @@ textarea.field-input{min-height:80px;resize:vertical}
       <select id="seo-status" onchange="loadSeo()"><option value="draft" selected>Waiting for approval</option><option value="done">Done</option><option value="rejected">Rejected</option><option value="all">All</option></select>
     </div>
     <div class="scroll-wrap" id="seo-wrap"></div>
+  </div>
+
+  <!-- SEO RANKINGS (read-only) -->
+  <div class="view" id="view-seorank">
+    <div class="filters">
+      <select id="sr-days" onchange="loadSeoRank()"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option><option value="all">All time</option></select>
+      <button class="btn sm" onclick="loadSeoRank()">↻ Refresh</button>
+    </div>
+    <div class="scroll-wrap" id="seorank-wrap"></div>
   </div>
 
   <!-- POSTEX -->
@@ -1297,6 +1340,194 @@ async function seoDone(id){
 async function seoReject(id){
   if(!confirm('Reject this suggestion? It will not be suggested again.'))return;
   try{await seoFetch(`/api/seo/suggestions/${id}/reject`);loadSeo();}catch(e){alert(e.message);}
+}
+
+// ── SEO Rankings (read-only; GET /api/seo/overview) ──────────────────────────
+// Chart.js is only loaded when this tab opens (pinned version + SRI hash).
+// Lower position numbers are better everywhere on this tab.
+let SR=null, SR_SORT={col:'position',dir:1}, SR_SEL=null, SR_CHARTS={};
+const SR_COLORS=['#8f7ff5','#1fbf6c','#f2ac2e','#3987e5','#e66767','#4fd1c5','#f472b6','#a3e635','#fb923c','#c4bcfa','#60a5fa','#facc15'];
+function srLoadChartJs(){
+  if(window.Chart)return Promise.resolve();
+  if(window._srChartP)return window._srChartP;
+  window._srChartP=new Promise((res,rej)=>{
+    const s=document.createElement('script');
+    s.src='https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js';
+    s.integrity='sha384-bs/nf9FbdNouRbMiFcrcZfLXYPKiPaGVGplVbv7dLGECccEXDW+S3zjqSKR5ZEaD';
+    s.crossOrigin='anonymous';s.referrerPolicy='no-referrer';
+    s.onload=()=>{const c=getComputedStyle(document.documentElement);Chart.defaults.color=c.getPropertyValue('--muted').trim()||'#a3a1ad';Chart.defaults.borderColor='rgba(255,255,255,0.07)';Chart.defaults.font.family='Inter,sans-serif';Chart.defaults.font.size=11;res();};
+    s.onerror=()=>{window._srChartP=null;rej(new Error('Could not load the chart library'));};
+    document.head.appendChild(s);
+  });
+  return window._srChartP;
+}
+function srNum(v,d=0){return v===null||v===undefined?'–':Number(v).toLocaleString(undefined,{maximumFractionDigits:d,minimumFractionDigits:d});}
+function srPos(v){return v===null||v===undefined?'–':Number(v).toFixed(1).replace(/\.0$/,'');}
+function srDate(s){if(!s)return '';const d=new Date(String(s).slice(0,10)+'T00:00:00');return d.toLocaleDateString(undefined,{day:'numeric',month:'short'});}
+function srPath(u){try{const p=new URL(u).pathname;return p==='/'?'Home':p.replace(/^\/(products|collections|pages|blogs)\//,'').slice(0,40);}catch(e){return u||'';}}
+async function loadSeoRank(){
+  const wrap=document.getElementById('seorank-wrap');
+  const days=document.getElementById('sr-days').value;
+  wrap.innerHTML='<div style="text-align:center;padding:3rem;color:var(--muted)">Loading...</div>';
+  try{
+    const [r]=await Promise.all([fetch(`/api/seo/overview?days=${days}`),srLoadChartJs().catch(e=>e)]);
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(d.detail||`HTTP ${r.status}`);
+    SR=d;
+    if(!SR_SEL)SR_SEL=new Set(d.default_keywords||[]);
+    srRender();
+  }catch(e){wrap.innerHTML=`<div style="padding:2rem;color:var(--red)">Could not load SEO data: ${seoEsc(e.message)}</div>`;}
+}
+function srCard(label,c,fmt,sub){
+  const delta=c.value!==null&&c.previous!==null&&c.value!==c.previous;
+  const cls=c.better===true?'green':c.better===false?'red':'';
+  const arrow=!delta?'':(c.value>c.previous?'▲':'▼');
+  return `<div class="metric-card ${cls}" style="cursor:default"><div class="m-label">${label}</div><div class="m-value">${fmt(c.value)}</div>
+    <div class="m-sub">${delta?`<span style="color:var(--${c.better?'green':'red'})">${arrow} ${fmt(Math.abs(c.value-c.previous))}</span> vs ${fmt(c.previous)}`:(c.previous===null?(sub||'no earlier week yet'):'no change')}</div></div>`;
+}
+function srRender(){
+  const d=SR, wrap=document.getElementById('seorank-wrap');
+  Object.values(SR_CHARTS).forEach(c=>c.destroy());SR_CHARTS={};
+  const run=d.last_run;
+  const updated=run?`Last updated ${seoEsc(String(run.finished_at||run.started_at).slice(0,16).replace('T',' '))} UTC (${seoEsc(run.status)})`:'No SEO report has run yet.';
+  const win=d.windows.current?` · Search Console week ending ${srDate(d.windows.current)}${d.windows.previous?` vs week ending ${srDate(d.windows.previous)}`:''}`:'';
+  const empty=!d.has_search_data?`<div class="guard-box" style="margin-bottom:14px">No keyword data yet. Search Console only reports searches where the site got impressions, so a new site or new keyword can take weeks to appear. ${d.rankings_available?'':'Exact daily positions appear once the rank check runs (DataForSEO secrets + the seo_rankings table).'}</div>`:'';
+  const c=d.cards;
+  wrap.innerHTML=`
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">${updated}${win}</div>
+    ${empty}
+    <div class="metric-grid sr-cards">
+      ${srCard('Clicks',c.clicks,v=>srNum(v),'tracked pages, 7 days')}
+      ${srCard('Impressions',c.impressions,v=>srNum(v))}
+      ${srCard('Avg position',c.avg_position,v=>srPos(v))}
+      ${srCard('Top 3',c.top3,v=>srNum(v))}
+      ${srCard('Top 10',c.top10,v=>srNum(v))}
+      ${srCard('Top 20',c.top20,v=>srNum(v))}
+      ${srCard('Not ranking yet',c.not_ranking,v=>srNum(v))}
+    </div>
+    <div class="chart-container">
+      <div class="chart-title" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">Rankings <span style="font-weight:400;color:var(--muted);font-size:10.5px">1 is the top · solid = Search Console average, dashed = exact daily check</span></div>
+      <details class="sr-picker"><summary>Keywords (${SR_SEL.size} shown)</summary><div class="sr-picks">${d.keywords.map((k,i)=>`<label><input type="checkbox" data-q="${seoEsc(k.query)}" ${SR_SEL.has(k.query)?'checked':''} onchange="srPick(this.dataset.q,this.checked)"> ${seoEsc(k.query)}</label>`).join('')}</div></details>
+      <div class="sr-chart"><canvas id="sr-rank"></canvas></div>
+      <div class="sr-legend" id="sr-legend"></div>
+    </div>
+    <div class="sr-two">
+      <div class="chart-container"><div class="chart-title">Biggest movers this week</div>${srMovers()}</div>
+      <div class="chart-container"><div class="chart-title">New searches this week <span style="font-weight:400;color:var(--muted);font-size:10.5px">(not tracked yet)</span></div>${srNew()}</div>
+    </div>
+    <div class="chart-container">
+      <div class="chart-title" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">Tracked keywords <button class="btn sm" style="margin-left:auto" onclick="srCsv()">⬇ CSV</button></div>
+      <div class="sr-scroll"><table class="sr-table" id="sr-kw"></table></div>
+      <div style="font-size:10.5px;color:var(--muted);margin-top:6px"><span class="sr-almost-dot"></span> positions 11-20: almost page 1. Change compares with the previous data point.</div>
+      <div class="sr-add"><input class="field-input" id="sr-add-q" placeholder="Add a keyword to track, e.g. batman bookends" oninput="srAdd()"><div id="sr-add-out" style="font-size:11px;color:var(--muted);margin-top:6px"></div></div>
+    </div>
+    <div class="chart-container"><div class="chart-title">Clicks and impressions <span style="font-weight:400;color:var(--muted);font-size:10.5px">7-day totals for the tracked pages, by week end</span></div><div class="sr-chart sm"><canvas id="sr-traffic"></canvas></div></div>
+    <div class="chart-container"><div class="chart-title">Keywords by position</div><div class="sr-chart sm"><canvas id="sr-dist"></canvas></div></div>
+    <div class="chart-container"><div class="chart-title">Mobile speed score <span style="font-weight:400;color:var(--muted);font-size:10.5px">50 = poor line, 90 = good line</span></div><div class="sr-chart sm"><canvas id="sr-speed"></canvas></div></div>
+    <div class="chart-container"><div class="chart-title">Pages</div><div class="sr-scroll"><table class="sr-table">${srPages()}</table></div></div>`;
+  srTable();
+  if(window.Chart)srCharts();
+  else wrap.insertAdjacentHTML('afterbegin','<div class="guard-box" style="margin-bottom:10px">Charts could not load (no internet to the chart library). Tables still work.</div>');
+}
+function srPick(q,on){on?SR_SEL.add(q):SR_SEL.delete(q);srRender();}
+function srMovers(){
+  const m=SR.movers, row=(x,up)=>`<div class="sr-li"><span>${seoEsc(x.query)}${x.tracked?'':' <span style="color:var(--muted);font-size:10px">untracked</span>'}</span><span style="color:var(--${up?'green':'red'});white-space:nowrap">${up?'▲':'▼'} ${srPos(Math.abs(x.change))} → ${srPos(x.position)}</span></div>`;
+  if(!m.up.length&&!m.down.length)return '<div style="font-size:12px;color:var(--muted)">Needs two weeks of Search Console data.</div>';
+  return m.up.map(x=>row(x,true)).join('')+m.down.map(x=>row(x,false)).join('');
+}
+function srNew(){
+  if(!SR.new_keywords.length)return '<div style="font-size:12px;color:var(--muted)">None this week.</div>';
+  return SR.new_keywords.map(k=>`<div class="sr-li"><span>${seoEsc(k.query)}</span><span style="color:var(--muted);white-space:nowrap">#${srPos(k.position)} · ${srNum(k.impressions)} impr</span></div>`).join('');
+}
+const SR_COLS=[['query','Keyword'],['position','Position'],['change','Change'],['best','Best'],['impressions','Impr.'],['clicks','Clicks'],['ctr','CTR'],['page_url','Page'],['spark','30 days']];
+function srSort(col){if(col==='spark')return;SR_SORT={col,dir:SR_SORT.col===col?-SR_SORT.dir:(col==='query'||col==='page_url'||col==='position'||col==='best'?1:-1)};srTable();}
+function srSpark(vals){
+  const pts=vals.map((v,i)=>v===null?null:[i,v]), ys=pts.filter(Boolean).map(p=>p[1]);
+  if(!ys.length)return '';
+  const lo=Math.min(...ys), hi=Math.max(...ys), span=Math.max(hi-lo,1), W=90, H=22;
+  const segs=[];let cur=[];
+  pts.forEach(p=>{if(!p){if(cur.length)segs.push(cur);cur=[];return;}cur.push(`${(p[0]/(vals.length-1)*W).toFixed(1)},${(2+(p[1]-lo)/span*(H-4)).toFixed(1)}`);});
+  if(cur.length)segs.push(cur);
+  return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" aria-hidden="true">${segs.map(s=>s.length===1?`<circle cx="${s[0].split(',')[0]}" cy="${s[0].split(',')[1]}" r="1.8" fill="var(--accent)"/>`:`<polyline points="${s.join(' ')}" fill="none" stroke="var(--accent)" stroke-width="1.5"/>`).join('')}</svg>`;
+}
+function srTable(){
+  const {col,dir}=SR_SORT;
+  const rows=[...SR.keywords].sort((a,b)=>{
+    const x=a[col], y=b[col];
+    if(x===null||x===undefined)return (y===null||y===undefined)?0:1;
+    if(y===null||y===undefined)return -1;
+    return (typeof x==='string'?x.localeCompare(y):x-y)*dir;
+  });
+  const head=`<thead><tr>${SR_COLS.map(([k,l])=>`<th onclick="srSort('${k}')" class="${k==='spark'?'':'sr-sortable'}">${l}${col===k?(dir>0?' ↑':' ↓'):''}</th>`).join('')}</tr></thead>`;
+  const body=rows.map(k=>{
+    if(k.status==='not_showing_yet')return `<tr><td>${seoEsc(k.query)}</td><td colspan="8" style="color:var(--muted)">Not showing yet</td></tr>`;
+    const ch=k.change===null?'<span style="color:var(--muted)">–</span>':k.change>0?`<span style="color:var(--green)">▲ ${srPos(k.change)}</span>`:k.change<0?`<span style="color:var(--red)">▼ ${srPos(-k.change)}</span>`:'<span style="color:var(--muted)">=</span>';
+    const exact=Object.entries(k.exact||{}).map(([dv,p])=>`${dv[0]}:${p===null?'100+':p}`).join(' ');
+    const pos=k.position===null?`<span style="color:var(--muted)">not now (last ${srDate(k.last_seen)})</span>`:`<b>${srPos(k.position)}</b>${exact?` <span style="color:var(--muted);font-size:10px">${exact}</span>`:''}`;
+    return `<tr class="${k.almost_page_1?'sr-almost':''}"><td>${seoEsc(k.query)}${k.almost_page_1?' <span class="sr-tag">almost page 1</span>':''}</td><td>${pos}</td><td>${ch}</td><td>${srPos(k.best)}</td><td>${srNum(k.impressions)}</td><td>${srNum(k.clicks)}</td><td>${k.ctr===null?'–':(k.ctr*100).toFixed(1)+'%'}</td><td>${k.page_url?`<a href="${seoEsc(k.page_url)}" target="_blank" rel="noopener">${seoEsc(srPath(k.page_url))}</a>`:'–'}</td><td>${srSpark(k.spark)}</td></tr>`;
+  }).join('');
+  document.getElementById('sr-kw').innerHTML=head+`<tbody>${body}</tbody>`;
+}
+function srPages(){
+  const ix={'Indexed':'green','Not indexed':'red','Unknown to Google':'yellow'};
+  return `<thead><tr><th>Page</th><th>Google index</th><th>Mobile speed</th><th>LCP</th><th>Clicks</th><th>Impr.</th><th>Avg pos.</th></tr></thead><tbody>${SR.pages.map(p=>`<tr>
+    <td><a href="${seoEsc(p.url)}" target="_blank" rel="noopener">${seoEsc(p.name)}</a></td>
+    <td><span style="color:var(--${ix[p.index]})">${p.index}</span>${p.index_since?`<div style="font-size:10px;color:var(--muted)">since ${srDate(p.index_since)}</div>`:''}</td>
+    <td style="color:var(--${p.speed===null?'muted':p.speed>=90?'green':p.speed>=50?'yellow':'red'})">${p.speed===null?'–':p.speed}</td>
+    <td>${p.lcp_ms===null?'–':(p.lcp_ms/1000).toFixed(1)+'s'}</td><td>${srNum(p.clicks)}</td><td>${srNum(p.impressions)}</td><td>${srPos(p.position)}</td></tr>`).join('')}</tbody>`;
+}
+function srAdd(){
+  const v=document.getElementById('sr-add-q').value.trim().toLowerCase(), out=document.getElementById('sr-add-out');
+  if(!v){out.innerHTML='';return;}
+  const known=SR.keywords.some(k=>k.query===v);
+  out.innerHTML=known?'Already tracked.':`Paste this line into the <code>"queries"</code> list in <code>seo/targets.json</code> (nothing is saved from here):<pre class="sr-pre">${seoEsc(JSON.stringify(v))},</pre><button class="btn sm" onclick="navigator.clipboard.writeText(${seoEsc(JSON.stringify(JSON.stringify(v)+','))}).then(()=>this.textContent='Copied')">Copy</button>`;
+}
+function srCsv(){
+  const cols=['query','position','change','best','impressions','clicks','ctr','page_url','last_seen'];
+  const q=v=>v===null||v===undefined?'':/[",\n]/.test(String(v))?`"${String(v).replace(/"/g,'""')}"`:String(v);
+  const csv=[cols.join(',')].concat(SR.keywords.map(k=>cols.map(c=>q(k[c])).join(','))).join('\n');
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download=`tdpk-keywords-${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+}
+function srCharts(){
+  const d=SR, labels=d.chart.labels, short=labels.map(srDate);
+  const tip={mode:'nearest',intersect:false,axis:'x'};
+  // Rankings: one line per keyword, gaps where there's no data (null), y reversed so 1 is on top.
+  const ds=[];let i=0;
+  for(const q of SR_SEL){
+    const col=SR_COLORS[i++%SR_COLORS.length], sc=d.chart.search_console[q]||[];
+    ds.push({label:`${q} (Search Console avg)`,data:sc.map(p=>p?p.position:null),meta:sc,borderColor:col,backgroundColor:col,spanGaps:false,tension:0.25,pointRadius:3,pointHoverRadius:6});
+    for(const [dev,pts] of Object.entries(d.chart.tracker[q]||{}))
+      ds.push({label:`${q} (exact, ${dev})`,data:pts.map(p=>p?p.position:null),meta:pts,borderColor:col,backgroundColor:col,borderDash:[5,4],spanGaps:false,pointStyle:dev==='mobile'?'triangle':'rect',pointRadius:3,pointHoverRadius:6});
+  }
+  // Compact HTML key instead of Chart.js's legend, which ate most of the height on phones.
+  let k=0;
+  document.getElementById('sr-legend').innerHTML=[...SR_SEL].map(q=>{const col=SR_COLORS[k++%SR_COLORS.length], devs=Object.keys(d.chart.tracker[q]||{});
+    return `<span><i style="background:${col}"></i>${seoEsc(q)}${devs.length?` <em>+ exact ${devs.join('/')}</em>`:''}</span>`;}).join('')||'<span style="color:var(--muted)">Pick keywords above.</span>';
+  SR_CHARTS.rank=new Chart(document.getElementById('sr-rank'),{type:'line',data:{labels:short,datasets:ds},options:{
+    responsive:true,maintainAspectRatio:false,interaction:tip,
+    scales:{x:{ticks:{maxRotation:0,autoSkip:true,maxTicksLimit:6}},y:{reverse:true,min:1,suggestedMax:20,ticks:{precision:0},title:{display:true,text:'Position'}}},
+    plugins:{legend:{display:false},tooltip:{callbacks:{
+      title:items=>items.length?labels[items[0].dataIndex]:'',
+      label:it=>{const m=(it.dataset.meta||[])[it.dataIndex]||{};return `${it.dataset.label}: #${srPos(it.parsed.y)}`+(m.impressions!==undefined?` · ${srNum(m.impressions)} impr · ${srNum(m.clicks)} clicks`:'');}}}}}});
+  SR_CHARTS.traffic=new Chart(document.getElementById('sr-traffic'),{data:{labels:d.traffic.map(t=>srDate(t.date)),datasets:[
+    {type:'bar',label:'Impressions',data:d.traffic.map(t=>t.impressions),backgroundColor:'rgba(143,127,245,0.35)',yAxisID:'y'},
+    {type:'line',label:'Clicks',data:d.traffic.map(t=>t.clicks),borderColor:'#1fbf6c',backgroundColor:'#1fbf6c',yAxisID:'y1',tension:0.25}]},
+    options:{responsive:true,maintainAspectRatio:false,interaction:tip,scales:{x:{ticks:{maxRotation:0,autoSkip:true,maxTicksLimit:6}},y:{beginAtZero:true,title:{display:true,text:'Impressions'}},y1:{beginAtZero:true,position:'right',grid:{drawOnChartArea:false},title:{display:true,text:'Clicks'}}},plugins:{legend:{position:'bottom'}}}});
+  const buckets=['1-3','4-10','11-20','21-50','50+'], bcol=['#1fbf6c','#4fd1c5','#f2ac2e','#fb923c','#e66767'];
+  SR_CHARTS.dist=new Chart(document.getElementById('sr-dist'),{type:'bar',data:{labels:d.distribution.map(x=>srDate(x.date)),
+    datasets:buckets.map((b,j)=>({label:b,data:d.distribution.map(x=>x[b]),backgroundColor:bcol[j]}))},
+    options:{responsive:true,maintainAspectRatio:false,interaction:tip,scales:{x:{stacked:true,ticks:{maxRotation:0,autoSkip:true,maxTicksLimit:6}},y:{stacked:true,beginAtZero:true,ticks:{precision:0}}},plugins:{legend:{position:'bottom'}}}});
+  const days=[...new Set(Object.values(d.speed).flat().map(p=>p.date))].sort();
+  const sds=d.pages.map((p,j)=>{const by=Object.fromEntries((d.speed[p.key]||[]).map(x=>[x.date,x]));
+    return {label:p.name,data:days.map(x=>by[x]?by[x].performance:null),meta:days.map(x=>by[x]||null),borderColor:SR_COLORS[j%SR_COLORS.length],backgroundColor:SR_COLORS[j%SR_COLORS.length],spanGaps:false,tension:0.25};});
+  sds.push({label:'Good (90)',data:days.map(()=>90),borderColor:'rgba(31,191,108,0.6)',borderDash:[4,4],pointRadius:0,borderWidth:1});
+  sds.push({label:'Poor (50)',data:days.map(()=>50),borderColor:'rgba(230,103,103,0.6)',borderDash:[4,4],pointRadius:0,borderWidth:1});
+  SR_CHARTS.speed=new Chart(document.getElementById('sr-speed'),{type:'line',data:{labels:days.map(srDate),datasets:sds},options:{
+    responsive:true,maintainAspectRatio:false,interaction:tip,scales:{x:{ticks:{maxRotation:0,autoSkip:true,maxTicksLimit:6}},y:{min:0,max:100}},
+    plugins:{legend:{position:'bottom',labels:{boxWidth:10}},tooltip:{callbacks:{label:it=>{const m=(it.dataset.meta||[])[it.dataIndex];return `${it.dataset.label}: ${it.parsed.y}`+(m&&m.lcp_ms?` · LCP ${(m.lcp_ms/1000).toFixed(1)}s`:'');}}}}}});
 }
 
 // ── PostEx ────────────────────────────────────────────────────────────────────
@@ -3175,7 +3406,7 @@ function showView(v){
   document.querySelectorAll('.sbi').forEach(el=>el.classList.remove('active'));
   document.getElementById(`view-${v}`)?.classList.add('active');
   document.getElementById(`nav-${v}`)?.classList.add('active');
-  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',queue:'Print Queue',automation:'Automation',history:'Operation History',accounts:'Accounts',marketing:'Ads & Social',agent:'Manager Chat',seo:'SEO Approvals'};
+  const titles={briefing:'Morning Briefing',analytics:'Analytics',products:'Products',orders:'Orders',customers:'Customers',abandoned:'Abandoned Carts',postex:'PostEx COD Tracker',queue:'Print Queue',automation:'Automation',history:'Operation History',accounts:'Accounts',marketing:'Ads & Social',agent:'Manager Chat',seo:'SEO Approvals',seorank:'SEO Rankings'};
   document.getElementById('view-title').textContent=titles[v]||v;
   if(v==='orders')loadOrders();
   if(v==='analytics')loadAnalytics();
@@ -3189,6 +3420,7 @@ function showView(v){
   if(v==='marketing')showMktTab(MKT_TAB);
   if(v==='agent')loadAgentConversations();
   if(v==='seo')loadSeo();
+  if(v==='seorank')loadSeoRank();
   if(window.innerWidth<768)document.getElementById('sb').classList.remove('open');
 }
 

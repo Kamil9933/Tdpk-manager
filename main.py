@@ -27,7 +27,7 @@ from core.filament import deduct_filament_for_order, compute_filament_status, sy
 from core.returns import compute_product_return_breakdown
 from core import bambu_cloud
 from core.gemini_fallback import redact
-from core import risk, costing, seo_queue
+from core import risk, costing, seo_queue, seo_overview
 
 shopify = ShopifyClient(
     store=os.getenv("SHOPIFY_STORE", "1gdih3-zv.myshopify.com"),
@@ -764,6 +764,23 @@ async def seo_suggestions(status: str = "draft", session=Depends(verify_session)
         r["_page_url"] = res["url"] if res else None
         r["_can_apply"] = seo_queue.can_apply(r, res)
     return {"suggestions": rows, "last_run": await db.latest_seo_run()}
+
+@app.get("/api/seo/overview")
+async def seo_overview_route(days: str = "30", session=Depends(verify_session)):
+    """SEO Rankings tab. Read-only: only selects from the seo_* tables."""
+    if days not in seo_overview.PERIODS:
+        raise HTTPException(status_code=400, detail="days must be 7, 30, 90 or all")
+    try:
+        raw = {
+            "query_rows": await db.seo_history("seo_query_metrics", "query,page_url,window_end,tracked,clicks,impressions,ctr,position", "window_end"),
+            "page_rows": await db.seo_history("seo_page_metrics", "page_key,window_end,clicks,impressions,ctr,position", "window_end"),
+            "psi_rows": await db.seo_history("seo_pagespeed", "page_key,captured_at,strategy,performance,lcp_ms", "captured_at"),
+            "index_rows": await db.seo_history("seo_index_status", "page_key,captured_at,verdict,coverage_state", "captured_at"),
+            "ranking_rows": await db.seo_history("seo_rankings", "captured_at,query,device,position,ranking_url", "captured_at"),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not read SEO data: {redact(e)}")
+    return seo_overview.build_overview(seo_queue.load_targets(), await db.latest_seo_run(), days=days, **raw)
 
 async def _seo_open(suggestion_id):
     s = await db.get_seo_suggestion(suggestion_id)
