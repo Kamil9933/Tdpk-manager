@@ -16,6 +16,8 @@ name: TDPK SEO report
 #   - SUPABASE_SERVICE_KEY
 #   - TELEGRAM_BOT_TOKEN     same bot/chat as the digest
 #   - TELEGRAM_CHAT_ID
+#   - DATAFORSEO_LOGIN       optional: daily Google rank check (morning run
+#   - DATAFORSEO_PASSWORD    only, ~$0.14/day); skipped if unset
 # Then add the service account's email as a user (Restricted) on the Search
 # Console property, and run seo_schema.sql on Supabase once.
 
@@ -27,7 +29,7 @@ on:
 jobs:
   report:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30  # the morning rank check can wait up to 10 min for DataForSEO's queue
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -43,6 +45,8 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATAFORSEO_LOGIN: ${{ secrets.DATAFORSEO_LOGIN }}
+          DATAFORSEO_PASSWORD: ${{ secrets.DATAFORSEO_PASSWORD }}
         run: python seo/seo_report.py
 
       # Failures used to be silent (that's how 10 days of 503s went unnoticed).

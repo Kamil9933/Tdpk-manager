@@ -1,18 +1,22 @@
-"""SEO report script end-to-end against fake Google, PageSpeed, Supabase and Telegram."""
-import os, json, datetime as dt
+"""SEO report script end-to-end against fake Google, PageSpeed, DataForSEO, Supabase and Telegram."""
+import os, json, base64, datetime as dt
 from conftest import ROOT
 import httpx
 import pytest
 import seo_report as S
+import rank_check as R
 
 PSI_KEY = "AIzaPSIKEYsecret_1234567890abcdefgh"
 TG_TOKEN = "123456789:AAHtelegramsecretsecretsecret"
 TODAY = dt.date(2026, 11, 1)  # current window 23-29 Oct, previous 16-22 Oct
 
 class Fake:
-    def __init__(s, psi_fail=False, drafts=None, sites=("sc-domain:thirddimension.pk",)):
+    def __init__(s, psi_fail=False, drafts=None, sites=("sc-domain:thirddimension.pk",), rank_history=None,
+                 dfs_post_status=20000, dfs_always_queued=False):
         s.psi_fail, s.drafts, s.sites = psi_fail, drafts or [], sites
         s.inserts, s.patches, s.telegram, s.gsc_bodies = {}, [], [], []
+        s.rank_history, s.dfs_post_status, s.dfs_always_queued = rank_history or [], dfs_post_status, dfs_always_queued
+        s.dfs_tasks, s.dfs_gets, s.dfs_auth = {}, {}, set()
     def __call__(s, req):
         u, host = str(req.url), req.url.host
         if host == "thirddimension.pk":
@@ -48,9 +52,17 @@ class Fake:
             return httpx.Response(200, json={"inspectionResult": {"indexStatusResult": {
                 "verdict": verdict, "coverageState": "Discovered - currently not indexed" if verdict != "PASS" else "Submitted and indexed",
                 "lastCrawlTime": "2026-10-30T10:00:00Z", "googleCanonical": url}}})
+        if host == "api.dataforseo.com":
+            return s.dataforseo(req)
         if host == "sb.supabase.co":
             table = req.url.path.rsplit("/", 1)[-1]
             if req.method == "GET":
+                if table == "seo_rankings":
+                    rows = s.rank_history
+                    if req.url.params.get("captured_at"):  # "already checked today?" probe
+                        since = req.url.params["captured_at"].removeprefix("gte.")
+                        rows = [r for r in rows if r["captured_at"] >= since]
+                    return httpx.Response(200, json=rows)
                 return httpx.Response(200, json=s.drafts)
             if req.method == "PATCH":
                 s.patches.append(json.loads(req.content)); return httpx.Response(204)
@@ -62,13 +74,45 @@ class Fake:
             s.telegram.append(json.loads(req.content)["text"]); return httpx.Response(200, json={"ok": True})
         raise AssertionError(f"unexpected request {req.method} {host}")
 
+    def dataforseo(s, req):
+        s.dfs_auth.add(req.headers.get("authorization"))
+        if req.url.path.endswith("/task_post"):
+            if s.dfs_post_status != 20000:
+                return httpx.Response(401, json={"status_code": s.dfs_post_status, "status_message": "You are not authorized"})
+            tasks = []
+            for t in json.loads(req.content):
+                assert t["location_name"] == "Pakistan" and t["language_code"] == "en" and t["depth"] == 100
+                tid = f"t{len(s.dfs_tasks)}"
+                s.dfs_tasks[tid] = (t["keyword"], t["device"])
+                tasks.append({"id": tid, "status_code": 20100, "status_message": "Task Created."})
+            return httpx.Response(200, json={"status_code": 20000, "tasks": tasks})
+        tid = req.url.path.rsplit("/", 1)[-1]
+        s.dfs_gets[tid] = s.dfs_gets.get(tid, 0) + 1
+        if s.dfs_always_queued or s.dfs_gets[tid] == 1:
+            return httpx.Response(200, json={"status_code": 20000, "tasks": [{"status_code": 40602, "status_message": "Task In Queue."}]})
+        q, d = s.dfs_tasks[tid]
+        items = [{"type": "organic", "rank_group": 1, "domain": "www.daraz.pk", "url": "https://www.daraz.pk/x"},
+                 {"type": "paid", "rank_group": 1, "domain": "thirddimension.pk", "url": "https://thirddimension.pk/ad"}]
+        if q == "batman lamp":
+            items.append({"type": "organic", "rank_group": 7 if d == "desktop" else 9, "domain": "www.thirddimension.pk",
+                          "url": "https://thirddimension.pk/products/batman-rooftop-signal-lamp"})
+        return httpx.Response(200, json={"status_code": 20000, "tasks": [{"status_code": 20000, "result": [{"items": items}]}]})
+
+DFS_LOGIN, DFS_PASSWORD = "ops@thirddimension.pk", "dfs-password-secret"
+MORNING = dt.datetime(2026, 11, 1, 4, 35, tzinfo=dt.timezone.utc)   # 09:35 PKT
+EVENING = dt.datetime(2026, 11, 1, 16, 35, tzinfo=dt.timezone.utc)  # 21:35 PKT
+
 ENV = {"GOOGLE_SA_JSON": "{}", "PSI_API_KEY": PSI_KEY, "SUPABASE_URL": "https://sb.supabase.co",
        "SUPABASE_SERVICE_KEY": "service-secret", "TELEGRAM_BOT_TOKEN": TG_TOKEN, "TELEGRAM_CHAT_ID": "42"}
 
-def go(fake, env=ENV):
+def go(fake, env=ENV, now=EVENING, sleeps=None):
     client = httpx.Client(transport=httpx.MockTransport(fake))
     return S.run(env=dict(env), client=client, token_fn=lambda _: "tok", today=TODAY,
-                 targets_path=os.path.join(ROOT, "seo", "targets.json"))
+                 targets_path=os.path.join(ROOT, "seo", "targets.json"), now=now,
+                 rank_sleep=(sleeps.append if sleeps is not None else (lambda _: None)))
+
+RANK_ENV = {**ENV, "DATAFORSEO_LOGIN": DFS_LOGIN, "DATAFORSEO_PASSWORD": DFS_PASSWORD}
+YESTERDAY = "2026-10-31T04:40:00+00:00"
 
 
 def test_full_run():
@@ -122,3 +166,63 @@ def test_property_detection():
     assert S.pick_site(httpx.Client(transport=httpx.MockTransport(Fake(sites=("https://thirddimension.pk/",)))), "t", "https://thirddimension.pk") == "https://thirddimension.pk/"
     with pytest.raises(S.StepError, match="add its email as a user"):
         S.pick_site(httpx.Client(transport=httpx.MockTransport(Fake(sites=()))), "t", "https://thirddimension.pk")
+
+
+# ── Rankings (DataForSEO) ──
+
+def test_rankings_morning_run():
+    history = [{"query": "batman lamp", "device": "desktop", "position": 10, "captured_at": YESTERDAY},
+               {"query": "batman lamp", "device": "mobile", "position": None, "captured_at": YESTERDAY},
+               {"query": "bat signal lamp", "device": "mobile", "position": 40, "captured_at": YESTERDAY}]
+    f, sleeps = Fake(rank_history=history), []
+    status = go(f, RANK_ENV, now=MORNING, sleeps=sleeps)
+    rep = f.telegram[0]
+    assert status == "ok", rep
+    assert len(f.dfs_tasks) == 24 and sleeps, "12 queries x 2 devices, polled until ready"
+    assert f.dfs_auth == {"Basic " + base64.b64encode(f"{DFS_LOGIN}:{DFS_PASSWORD}".encode()).decode()}
+    assert "Rankings (Google Pakistan, top 100" in rep
+    assert "- batman lamp: desktop 7 (up 3), mobile 9 (new in top 100)" in rep, rep
+    assert "- bat signal lamp: desktop not in top 100, mobile not in top 100 (dropped out, was 40)" in rep
+    rows = f.inserts["seo_rankings"][0]["rows"]
+    lamp = next(r for r in rows if r["query"] == "batman lamp" and r["device"] == "desktop")
+    assert len(rows) == 24 and lamp["position"] == 7 and lamp["run_id"] == "run-1"
+    assert lamp["ranking_url"].endswith("/batman-rooftop-signal-lamp")
+    blob = rep + json.dumps(f.patches) + json.dumps(f.inserts)
+    assert DFS_PASSWORD not in blob and DFS_LOGIN not in blob
+
+
+def test_rankings_only_once_a_day_and_only_mornings():
+    today_row = [{"query": "batman lamp", "device": "desktop", "position": 7, "captured_at": "2026-11-01T04:20:00+00:00"}]
+    for env, now, history in [(ENV, MORNING, []),             # no credentials
+                              (RANK_ENV, EVENING, []),        # 21:30 run
+                              (RANK_ENV, MORNING, today_row)]:  # already checked today
+        f = Fake(rank_history=history)
+        assert go(f, env, now=now) == "ok"
+        assert not f.dfs_auth and "seo_rankings" not in f.inserts and "Rankings" not in f.telegram[0]
+
+
+def test_rankings_failure_is_isolated():
+    f = Fake(dfs_post_status=40100)
+    status = go(f, RANK_ENV, now=MORNING)
+    rep = f.telegram[0]
+    assert status == "partial" and "Rankings: DataForSEO task_post: 40100 You are not authorized" in rep
+    assert "Home page: 30 clicks" in rep and "seo_pagespeed" in f.inserts
+    assert DFS_PASSWORD not in rep
+
+
+def test_rankings_queue_timeout():
+    f = Fake(dfs_always_queued=True)
+    client = httpx.Client(transport=httpx.MockTransport(f))
+    creds = (DFS_LOGIN, DFS_PASSWORD)
+    tasks = R.post_tasks(client, creds, ["batman lamp"])
+    results, errors = R.collect(client, creds, tasks, wait_seconds=0, sleep=lambda _: None)
+    assert results == {} and "still queued" in errors[0]
+
+
+def test_find_position():
+    items = [{"type": "paid", "rank_group": 1, "domain": "thirddimension.pk", "url": "ad"},
+             {"type": "organic", "rank_group": 4, "domain": "shop.thirddimension.pk", "url": "u4"},
+             {"type": "organic", "rank_group": 2, "domain": "notthirddimension.pk", "url": "x"}]
+    assert R.find_position(items) == (4, "u4")
+    assert R.find_position([{"type": "organic", "rank_group": 101, "domain": "thirddimension.pk"}]) == (None, None)
+    assert R.find_position([]) == (None, None)

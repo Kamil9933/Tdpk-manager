@@ -13,6 +13,8 @@ Each run:
   3. Runs PageSpeed Insights (mobile) on each live target page.
   4. Asks the URL Inspection API whether each live page is indexed.
   5. Turns problems into DRAFT suggestions in Supabase (seo_suggestions).
+  5b. Morning run only: checks each tracked query's real Google position in
+     Pakistan (desktop + mobile) via DataForSEO -- see seo/rank_check.py.
      Nothing is ever changed on Shopify: you approve and apply them yourself.
   6. Stores everything in Supabase (seo_schema.sql) and sends a Telegram
      report. Every section fails on its own -- a PageSpeed outage still
@@ -30,16 +32,20 @@ Environment (GitHub Actions secrets):
                         that was already exhausted when this was tested.
   SUPABASE_URL, SUPABASE_SERVICE_KEY      optional: storage; skipped if unset.
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID    optional: report; printed if unset.
+  DATAFORSEO_LOGIN, DATAFORSEO_PASSWORD   optional: daily rank check; skipped if unset.
 
 Error text never includes request URLs, since those can carry API keys.
 """
 import os
 import sys
 import json
+import time
 import datetime as dt
 from urllib.parse import quote, urlparse
 
 import httpx
+
+import rank_check
 
 WEBMASTERS_API = "https://www.googleapis.com/webmasters/v3"
 INSPECTION_API = "https://searchconsole.googleapis.com/v1/urlInspection/index:inspect"
@@ -281,7 +287,7 @@ def _change(cur, prev, fmt="{:+,}"):
     return f" ({fmt.format(cur - prev)})" if prev is not None and cur != prev else ""
 
 
-def format_report(targets, site_url, live, search, speed, index, new_suggestions, errors):
+def format_report(targets, site_url, live, search, speed, index, new_suggestions, errors, rankings=None):
     lines = ["TDPK SEO report -- thirddimension.pk"]
     if search:
         (cs, ce), _ = search["windows"]["current"], search["windows"]["previous"]
@@ -330,6 +336,8 @@ def format_report(targets, site_url, live, search, speed, index, new_suggestions
             was = f" (was {pv['position']})" if pv and pv["position"] != c["position"] else ""
             lines.append(f"- {query}: {c['position']}{was}, {c['impressions']} impr, {c['clicks']} clicks")
 
+    if rankings:
+        lines += rankings
     if new_suggestions:
         lines += ["", f"New draft suggestions ({len(new_suggestions)}) -- nothing changed on the site:"]
         lines += [f"- {s['suggestion']}" for s in new_suggestions]
@@ -355,7 +363,7 @@ def send_telegram(client, token, chat_id, text):
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
-def run(env=None, client=None, token_fn=google_token, today=None, targets_path=None):
+def run(env=None, client=None, token_fn=google_token, today=None, targets_path=None, now=None, rank_sleep=time.sleep):
     env = env if env is not None else os.environ
     targets_path = targets_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "targets.json")
     targets = json.load(open(targets_path, encoding="utf-8"))
@@ -373,6 +381,21 @@ def run(env=None, client=None, token_fn=google_token, today=None, targets_path=N
             run_id = store.insert("seo_runs", [{"status": "running"}])[0]["id"]
         except StepError as e:
             errors.append(str(e)); store = None
+
+    # Rankings: post the DataForSEO tasks now and collect them at the end,
+    # so their queue time overlaps with the steps below. Morning run only,
+    # and never twice in one day (each check costs money).
+    now = now or dt.datetime.now(dt.timezone.utc)
+    rank_creds, rank_tasks, rankings = rank_check.credentials(env), None, None
+    if rank_creds and rank_check.is_morning_run(now):
+        try:
+            day_start = dt.datetime.combine(now.astimezone(rank_check.PKT).date(), dt.time(), rank_check.PKT)
+            if store and store.select("seo_rankings", {"select": "id", "captured_at": f"gte.{day_start.isoformat()}", "limit": "1"}):
+                print("Rankings already checked today; skipping.")
+            else:
+                rank_tasks = rank_check.post_tasks(client, rank_creds, targets.get("queries", []))
+        except (StepError, rank_check.RankError) as e:
+            errors.append(f"Rankings: {e}")
 
     for p in targets["pages"]:
         live[p["key"]] = is_live(client, p["url"])
@@ -446,7 +469,26 @@ def run(env=None, client=None, token_fn=google_token, today=None, targets_path=N
         except StepError as e:
             errors.append(str(e))
 
-    report = format_report(targets, site_url, live, search, speed, index, new_suggestions, errors)
+    if rank_tasks:
+        results, rank_errors = rank_check.collect(client, rank_creds, rank_tasks, sleep=rank_sleep)
+        errors += [f"Rankings: {e}" for e in rank_errors]
+        previous = {}
+        if store:
+            try:
+                history = store.select("seo_rankings", {"select": "query,device,position,captured_at",
+                                                        "order": "captured_at.desc", "limit": "1000"})
+                previous = rank_check.latest_before(history, now.astimezone(rank_check.PKT).date())
+            except StepError as e:
+                errors.append(f"Rankings history: {e}")
+            try:
+                store.insert("seo_rankings", [{"run_id": run_id, "captured_at": now.isoformat(), "query": q, "device": d,
+                                               "position": r["position"], "ranking_url": r["url"]}
+                                              for (q, d), r in results.items()])
+            except StepError as e:
+                errors.append(str(e))
+        rankings = rank_check.format_section(targets.get("queries", []), results, previous)
+
+    report = format_report(targets, site_url, live, search, speed, index, new_suggestions, errors, rankings)
     if env.get("TELEGRAM_BOT_TOKEN") and env.get("TELEGRAM_CHAT_ID"):
         try:
             send_telegram(client, env["TELEGRAM_BOT_TOKEN"], env["TELEGRAM_CHAT_ID"], report)

@@ -101,6 +101,20 @@ alter table seo_suggestions
   add column if not exists decided_at timestamptz,
   add column if not exists applied_at timestamptz;
 
+-- Daily Google positions for each tracked query (seo/rank_check.py, via
+-- DataForSEO, morning run only). position is the organic position of the
+-- first thirddimension.pk result, null when it isn't in the top 100.
+create table if not exists seo_rankings (
+  id uuid primary key default gen_random_uuid(),
+  captured_at timestamptz not null default now(),
+  query text not null,
+  device text not null check (device in ('desktop','mobile')),
+  position integer,
+  ranking_url text,
+  run_id uuid references seo_runs(id) on delete set null
+);
+
+create index if not exists seo_rankings_query_idx on seo_rankings(query, device, captured_at desc);
 create index if not exists seo_page_metrics_page_idx on seo_page_metrics(page_key, window_end);
 create index if not exists seo_query_metrics_query_idx on seo_query_metrics(query, window_end);
 create index if not exists seo_pagespeed_page_idx on seo_pagespeed(page_key, captured_at);
@@ -113,3 +127,4 @@ alter table seo_query_metrics enable row level security;
 alter table seo_pagespeed     enable row level security;
 alter table seo_index_status  enable row level security;
 alter table seo_suggestions   enable row level security;
+alter table seo_rankings      enable row level security;
