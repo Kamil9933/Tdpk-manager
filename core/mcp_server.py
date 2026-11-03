@@ -52,7 +52,7 @@ from core.operations import run_operation, REMOVE_COLOR_WARNING
 from core.filament import deduct_filament_for_order, compute_filament_status
 from core.returns import compute_product_return_breakdown
 from core.notify import notify_all
-from core import risk, costing
+from core import risk, costing, media
 
 PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time -- fixed UTC+5 offset, no DST
 
@@ -706,10 +706,28 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
             return {"error": str(e)}
 
     @mcp.tool()
-    async def post_to_facebook(message: str, image_url: Optional[str] = None, link: Optional[str] = None, schedule_at: Optional[int] = None, confirm: bool = False) -> dict:
+    async def post_to_facebook(message: str, image_url: Optional[str] = None, link: Optional[str] = None, schedule_at: Optional[int] = None,
+                               media_id: Optional[str] = None, confirm: bool = False) -> dict:
         """Publish or schedule a Facebook Page post. schedule_at is a unix
         timestamp in seconds (10 min to 30 days ahead) to schedule instead of
-        posting now. Requires confirm=true to execute."""
+        posting now. media_id (from list_media) posts an uploaded photo, or an
+        uploaded video as a Page video (videos can't be scheduled here).
+        Requires confirm=true to execute."""
+        try:
+            item = await media.resolve(db, media_id=media_id)
+        except LookupError as e:
+            return {"error": str(e)}
+        if item and item["kind"] == "video":
+            if schedule_at:
+                return {"error": "Scheduling isn't supported for uploaded videos; post now or schedule in Meta Business Suite."}
+            if not confirm:
+                return _meta_preview(media.action_label(item, "facebook"), {"message": message, "video_url": item["public_url"]})
+            try:
+                return {"ok": True, "result": await media.publish(meta, item, "facebook", message)}
+            except MetaError as e:
+                return {"error": str(e)}
+        if item:
+            image_url = item["public_url"]
         if not confirm:
             return _meta_preview(
                 "Schedule Facebook post" if schedule_at else "Publish Facebook post NOW",
@@ -754,27 +772,68 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
         except MetaError as e:
             return {"error": str(e)}
 
-    @mcp.tool()
-    async def publish_instagram_image(image_url: str, caption: str, confirm: bool = False) -> dict:
-        """Publish an image to Instagram now. image_url must be a public JPEG
-        URL. Instagram has no native scheduling. Requires confirm=true to execute."""
-        if not confirm:
-            return _meta_preview("Publish Instagram image NOW", {"image_url": image_url, "caption": caption})
+    async def _ig_source(media_id, url, kind):
+        """Returns (public_url, error). Accepts a media_id from list_media or
+        any public URL (an uploaded file's URL is checked against the bucket)."""
         try:
-            return {"ok": True, "result": await meta.publish_ig_image(image_url, caption)}
+            item = await media.resolve(db, media_id=media_id, url=url)
+        except LookupError as e:
+            return None, str(e)
+        if item:
+            if item["kind"] != kind:
+                tool = "publish_instagram_reel" if item["kind"] == "video" else "publish_instagram_image"
+                return None, f"'{item['path']}' is a {item['kind']}; use {tool}."
+            return item["public_url"], None
+        if not url:
+            return None, "Give a media_id (from list_media) or a public URL."
+        return url, None
+
+    @mcp.tool()
+    async def publish_instagram_image(caption: str, image_url: Optional[str] = None, media_id: Optional[str] = None, confirm: bool = False) -> dict:
+        """Publish an image to Instagram now. Pass media_id (from list_media)
+        for an uploaded file, or image_url for any public JPEG URL. Instagram
+        has no native scheduling. Requires confirm=true to execute."""
+        url, err = await _ig_source(media_id, image_url, "image")
+        if err:
+            return {"error": err}
+        if not confirm:
+            return _meta_preview("Publish Instagram image NOW", {"image_url": url, "caption": caption})
+        try:
+            return {"ok": True, "result": await meta.publish_ig_image(url, caption)}
         except MetaError as e:
             return {"error": str(e)}
 
     @mcp.tool()
-    async def publish_instagram_reel(video_url: str, caption: str, confirm: bool = False) -> dict:
-        """Publish a Reel to Instagram now. video_url must be a public MP4 URL.
-        Can take up to ~2.5 minutes to process. Requires confirm=true to execute."""
+    async def publish_instagram_reel(caption: str, video_url: Optional[str] = None, media_id: Optional[str] = None, confirm: bool = False) -> dict:
+        """Publish a Reel to Instagram now. Pass media_id (from list_media)
+        for an uploaded video, or video_url for any public MP4 URL. Waits for
+        Instagram to finish processing (up to 5 minutes) and errors instead
+        of publishing if it doesn't. Requires confirm=true to execute."""
+        url, err = await _ig_source(media_id, video_url, "video")
+        if err:
+            return {"error": err}
         if not confirm:
-            return _meta_preview("Publish Instagram Reel NOW", {"video_url": video_url, "caption": caption})
+            return _meta_preview("Publish Instagram Reel NOW", {"video_url": url, "caption": caption})
         try:
-            return {"ok": True, "result": await meta.publish_ig_reel(video_url, caption)}
+            return {"ok": True, "result": await meta.publish_ig_reel(url, caption)}
         except MetaError as e:
             return {"error": str(e)}
+
+    @mcp.tool()
+    async def list_media() -> dict:
+        """Photos and videos uploaded on the dashboard's Media tab, newest
+        first: path (use it as media_id), public_url, kind (image/video),
+        size and upload time. Files are deleted after MEDIA_RETENTION_DAYS."""
+        try:
+            return {"media": await db.list_media()}
+        except Exception as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def get_media_url(media_id: str) -> dict:
+        """Public URL and details of one uploaded file, by its media_id (path)."""
+        item = await db.get_media(media_id)
+        return item or {"error": f"No uploaded file called '{media_id}'. Use list_media to see what's there."}
 
     # ── Automation autonomy toggles ──────────────────────────────────────────
     @mcp.tool()

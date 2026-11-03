@@ -1,5 +1,5 @@
 import os, json, asyncio, threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from supabase import create_client, Client
 
 _client: Client = None
@@ -575,5 +575,143 @@ class Database:
 
     async def update_seo_suggestion(self, suggestion_id, data):
         await self._update("seo_suggestions", suggestion_id, data)
+
+    # ── Social media files (bucket from social_media_schema.sql) ─────────────
+    # Instagram and Facebook fetch media by public URL, so edited photos and
+    # videos live in a public Supabase Storage bucket. Files sit at the bucket
+    # root; the object name (path) doubles as the media_id the agent tools use.
+    async def upload_media(self, file_bytes, filename, content_type):
+        body, content_type, ext = prepare_media(file_bytes, content_type)
+        path = media_path(filename, ext)
+        await _storage(lambda b: b.upload(path, body, {"content-type": content_type, "upsert": "false"}))
+        return {"path": path, "public_url": media_public_url(path),
+                "size": len(body), "content_type": content_type}
+
+    async def list_media(self):
+        rows = await _storage(lambda b: b.list("", {"limit": 1000, "offset": 0,
+                                                    "sortBy": {"column": "created_at", "order": "desc"}}))
+        return [_media_item(r) for r in rows if r.get("id")]  # folders have no id
+
+    async def get_media(self, path):
+        return next((m for m in await self.list_media() if m["path"] == path), None)
+
+    async def delete_media(self, path):
+        await _storage(lambda b: b.remove([path]))
+
+    async def purge_old_media(self, days):
+        """Deletes files older than `days`. Idempotent: a second run finds
+        nothing old enough left to delete."""
+        old = media_older_than(await self.list_media(), datetime.now(timezone.utc) - timedelta(days=days))
+        if old:
+            await _storage(lambda b: b.remove([m["path"] for m in old]))
+        return [m["path"] for m in old]
+
+
+MEDIA_BUCKET = "social-media"
+MEDIA_MAX_BYTES = 50 * 1024 * 1024
+# Upload type -> extension. PNG is accepted but stored as JPEG (Instagram's
+# feed only takes JPEG); videos are stored exactly as uploaded.
+MEDIA_TYPES = {"image/jpeg": "jpg", "image/png": "png", "video/mp4": "mp4", "video/quicktime": "mov"}
+_EXT_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "mp4": "video/mp4", "mov": "video/quicktime"}
+
+
+class MediaError(ValueError):
+    """A file that can't be stored, with a message fit to show the user."""
+
+
+async def _storage(fn):
+    """Storage calls also go through supabase-py's sync client, so they take
+    the same lock as table queries (see _db_lock)."""
+    bucket = get_client().storage.from_(MEDIA_BUCKET)
+    return await asyncio.to_thread(lambda: _with_lock(fn, bucket))
+
+
+def _with_lock(fn, bucket):
+    with _db_lock:
+        return fn(bucket)
+
+
+def media_content_type(content_type, filename=""):
+    """Browsers sometimes send a blank or generic type (application/octet-stream);
+    fall back to the file extension then."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct == "image/jpg":
+        ct = "image/jpeg"
+    if ct not in MEDIA_TYPES:
+        ct = _EXT_TYPES.get(filename.rsplit(".", 1)[-1].lower(), ct) if "." in filename else ct
+    return ct
+
+
+def prepare_media(file_bytes, content_type):
+    """Validates a file and returns (bytes, content_type, extension) ready to
+    store. PNG becomes JPEG; nothing else is re-encoded."""
+    if content_type not in MEDIA_TYPES:
+        raise MediaError(f"Unsupported file type '{content_type or 'unknown'}'. "
+                         "Upload a JPEG or PNG image, or an MP4 or MOV video.")
+    if not file_bytes:
+        raise MediaError("The file is empty.")
+    if len(file_bytes) > MEDIA_MAX_BYTES:
+        raise MediaError(f"File is {len(file_bytes) / 1048576:.1f} MB; the limit is 50 MB.")
+    if content_type == "image/png":
+        return png_to_jpeg(file_bytes), "image/jpeg", "jpg"
+    return file_bytes, content_type, MEDIA_TYPES[content_type]
+
+
+def png_to_jpeg(png_bytes, quality=92):
+    from io import BytesIO
+    from PIL import Image
+    try:
+        img = Image.open(BytesIO(png_bytes))
+        img.load()
+    except Exception:
+        raise MediaError("That PNG could not be read. Is the file damaged?")
+    if img.mode in ("RGBA", "LA", "P"):
+        # JPEG has no transparency: flatten onto white, not the default black.
+        img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        img = bg
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+    out = BytesIO()
+    img.save(out, "JPEG", quality=quality)
+    return out.getvalue()
+
+
+def media_path(filename, ext, now=None):
+    """Unique object name: UTC timestamp + random suffix + a safe version of
+    the original name, e.g. 20261103-141502-a1b2c3-batman-lamp.jpg."""
+    import re, secrets
+    now = now or datetime.now(timezone.utc)
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    stem = re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")[:60].strip("-") or "media"
+    return f"{now:%Y%m%d-%H%M%S}-{secrets.token_hex(3)}-{stem}.{ext}"
+
+
+def media_public_url(path):
+    return f"{os.getenv('SUPABASE_URL', '').rstrip('/')}/storage/v1/object/public/{MEDIA_BUCKET}/{path}"
+
+
+def _media_item(row):
+    meta = row.get("metadata") or {}
+    path = row["name"]
+    ct = meta.get("mimetype") or _EXT_TYPES.get(path.rsplit(".", 1)[-1].lower(), "")
+    return {"path": path, "public_url": media_public_url(path), "size": meta.get("size"),
+            "content_type": ct, "kind": "video" if ct.startswith("video/") else "image",
+            "created_at": row.get("created_at")}
+
+
+def media_older_than(items, cutoff):
+    old = []
+    for m in items:
+        try:
+            created = datetime.fromisoformat((m.get("created_at") or "").replace("Z", "+00:00"))
+        except ValueError:
+            continue  # unknown age: keep it
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if created < cutoff:
+            old.append(m)
+    return old
 
 db = Database()

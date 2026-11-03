@@ -1,7 +1,7 @@
 import os, json, asyncio, hashlib, csv, io
 from contextlib import asynccontextmanager, AsyncExitStack
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -11,7 +11,8 @@ load_dotenv()
 
 from core.auth import verify_session, create_session, delete_session
 from core.shopify import ShopifyClient
-from core.supabase_client import db
+from core.supabase_client import db, MediaError, MEDIA_MAX_BYTES, media_content_type
+from core import media
 from core.operations import run_operation, REMOVE_COLOR_WARNING
 from core.intelligence import generate_briefing
 from core.postex import PostexClient, sync_real_fees
@@ -493,6 +494,71 @@ async def meta_ig_publish_reel(request: Request, session=Depends(verify_session)
         return {"ok": True, "result": result}
     except MetaError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+# ── Social media files (Supabase Storage bucket `social-media`) ──────────────
+# Instagram/Facebook fetch media by public URL, so edited photos and videos are
+# uploaded here first. Publishing uses the same preview-then-confirm gate as
+# every other Meta write above; the social_publish toggle never skips it.
+@app.post("/api/media/upload")
+async def media_upload(file: UploadFile = File(...), session=Depends(verify_session)):
+    data = await file.read(MEDIA_MAX_BYTES + 1)
+    try:
+        return await db.upload_media(data, file.filename or "media", media_content_type(file.content_type, file.filename or ""))
+    except MediaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Upload to storage failed: {redact(e)}")
+
+@app.get("/api/media")
+async def media_list(session=Depends(verify_session)):
+    try:
+        return {"media": await db.list_media()}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not list media: {redact(e)}")
+
+@app.delete("/api/media/{path:path}")
+async def media_delete(path: str, session=Depends(verify_session)):
+    await db.delete_media(path)
+    return {"ok": True}
+
+@app.post("/api/media/publish")
+async def media_publish(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    path, target = data.get("path"), data.get("target")
+    caption, delete_after, confirm = data.get("caption", ""), bool(data.get("delete_after")), bool(data.get("confirm"))
+    if target not in media.TARGETS:
+        raise HTTPException(status_code=400, detail="target must be instagram or facebook")
+    try:
+        item = await media.resolve(db, media_id=path)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if not item:
+        raise HTTPException(status_code=400, detail="path is required")
+    if not confirm:
+        try:
+            account = (await meta.account_labels()).get("instagram" if target == "instagram" else "facebook_page")
+        except MetaError:
+            account = None
+        settings = await db.get_automation_settings()
+        return _meta_preview(media.action_label(item, target), {
+            "media_url": item["public_url"], "kind": item["kind"], "caption": caption,
+            "account": (("@" + account) if target == "instagram" and account else account) or "(could not read account name)",
+            "delete_after_posting": delete_after,
+            "auto_social_publishing": "on" if settings.get("social_publish", {}).get("enabled") else "off",
+        })
+    try:
+        result = await media.publish(meta, item, target, caption)
+    except MetaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    deleted = False
+    if delete_after:
+        try:
+            await db.delete_media(item["path"])
+            deleted = True
+        except Exception:
+            pass  # posted fine; the 7-day cleanup will get the file
+    await db.add_notification("meta", f"{media.action_label(item, target).replace(' NOW', '')}: done")
+    return {"ok": True, "result": result, "deleted": deleted}
 
 # ── New ad campaigns (Phase 2) ───────────────────────────────────────────────
 @app.post("/api/meta/campaigns/create")
@@ -1745,6 +1811,7 @@ def _digest_slots():
 # GitHub Actions cron routinely starts runs 10-60+ min late, so the digest
 # accepts a ping up to this many hours after its slot.
 DIGEST_WINDOW_HOURS = int(os.getenv("DIGEST_WINDOW_HOURS", "3") or 3)
+MEDIA_RETENTION_DAYS = int(os.getenv("MEDIA_RETENTION_DAYS", "7") or 7)
 
 def _reached(now_pkt, hh, mm):
     return (now_pkt.hour, now_pkt.minute) >= (hh, mm)
@@ -1875,6 +1942,14 @@ async def cron_tick(request: Request):
         fired["filament_synced"] = await sync_fulfilled_orders(db, shopify)
     except Exception as e:
         fired["filament_sync_error"] = redact(e)
+
+    # Uploaded social media files are only needed until they're posted:
+    # delete anything older than MEDIA_RETENTION_DAYS (default 7). Idempotent,
+    # a repeat tick finds nothing old enough left.
+    try:
+        fired["media_deleted"] = len(await db.purge_old_media(MEDIA_RETENTION_DAYS))
+    except Exception as e:
+        fired["media_cleanup_error"] = redact(e)
 
     fired["printers_polled"] = await _poll_bambu_printers()
     fired["queue_synced"] = await _sync_queue_with_printers()

@@ -11,3 +11,4 @@ python-dotenv==1.0.1
 mcp==1.27.0
 anthropic==1.13.0
 aiomqtt==2.3.0
+Pillow==12.3.0

@@ -397,6 +397,11 @@ class MetaClient:
             return await self._call("POST", f"{self.page_id}/photos", {"url": image_url, "caption": message, **scheduled}, token=token)
         return await self._call("POST", f"{self.page_id}/feed", {"message": message, "link": link, **scheduled}, token=token)
 
+    async def post_video_to_page(self, video_url, description):
+        """video_url must be public; Facebook downloads it itself."""
+        return await self._call("POST", f"{self.page_id}/videos", {"file_url": video_url, "description": description},
+                                token=await self._page_token())
+
     # ---------- instagram ----------
 
     async def list_ig_media(self, limit=12):
@@ -409,20 +414,37 @@ class MetaClient:
         container = await self._call("POST", f"{self.ig_user_id}/media", {"image_url": image_url, "caption": caption})
         return await self._call("POST", f"{self.ig_user_id}/media_publish", {"creation_id": container["id"]})
 
+    REEL_POLL_SECONDS = 5
+    REEL_TIMEOUT_SECONDS = 300
+
     async def publish_ig_reel(self, video_url, caption):
-        """video_url must be a public MP4. Video containers need processing time
-        -- polls up to 150s (30 * 5s) before giving up, matching the original tool."""
+        """video_url must be a public MP4/MOV. Instagram processes the video
+        before it can be published, so this polls the container until
+        FINISHED. It never publishes an unfinished container: on ERROR or
+        timeout it raises with the container id instead."""
         container = await self._call("POST", f"{self.ig_user_id}/media", {"media_type": "REELS", "video_url": video_url, "caption": caption})
         container_id = container["id"]
-        for _ in range(30):
-            status = await self._call("GET", container_id, {"fields": "status_code"})
+        await self.wait_for_container(container_id)
+        return await self._call("POST", f"{self.ig_user_id}/media_publish", {"creation_id": container_id})
+
+    async def wait_for_container(self, container_id):
+        code = None
+        for _ in range(self.REEL_TIMEOUT_SECONDS // self.REEL_POLL_SECONDS):
+            status = await self._call("GET", container_id, {"fields": "status_code,status"})
             code = status.get("status_code")
             if code == "FINISHED":
-                break
-            if code == "ERROR":
-                raise MetaError("Instagram could not process the video.")
-            await asyncio.sleep(5)
-        return await self._call("POST", f"{self.ig_user_id}/media_publish", {"creation_id": container_id})
+                return
+            if code in ("ERROR", "EXPIRED"):
+                raise MetaError(f"Instagram could not process the video ({code}: {status.get('status') or 'no details'}). "
+                                "Check it is an MP4/MOV under 15 minutes, H.264 video with AAC audio.")
+            await asyncio.sleep(self.REEL_POLL_SECONDS)
+        raise MetaError(f"Instagram was still processing the video after {self.REEL_TIMEOUT_SECONDS // 60} minutes "
+                        f"(last status: {code or 'unknown'}), so nothing was published. Container {container_id}; try again later.")
+
+    async def account_labels(self):
+        """Page name and Instagram username, for publish previews."""
+        r = await self._call("GET", self._require(self.page_id, "META_PAGE_ID"), {"fields": "name,instagram_business_account{username}"})
+        return {"facebook_page": r.get("name"), "instagram": (r.get("instagram_business_account") or {}).get("username")}
 
     async def list_comments(self, media_id, limit=25):
         return await self._call("GET", f"{media_id}/comments", {"fields": "id,text,username,timestamp,like_count", "limit": limit})

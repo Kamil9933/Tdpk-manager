@@ -294,6 +294,19 @@ textarea.field-input{min-height:80px;resize:vertical}
 .tgl-switch.on{background:var(--green-d);border-color:rgba(31,191,108,0.4)}
 .tgl-switch.on::after{left:21px;background:var(--green)}
 .mkt-sub{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.md-drop{border:2px dashed var(--border3);border-radius:var(--r-sm);padding:28px 16px;text-align:center;color:var(--muted);cursor:pointer;margin-bottom:14px;transition:border-color .15s,background .15s}
+.md-drop.over,.md-drop:hover{border-color:var(--accent);background:var(--accent-dim);color:var(--text)}
+.md-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
+.md-card{background:var(--surface2);border:1px solid var(--border);border-radius:var(--r-sm);overflow:hidden;display:flex;flex-direction:column}
+.md-thumb{width:100%;aspect-ratio:1;object-fit:cover;background:#000;display:block}
+.md-body{padding:8px;display:flex;flex-direction:column;gap:6px;font-size:11px}
+.md-name{color:var(--muted);word-break:break-all}
+.md-actions{display:flex;gap:5px;flex-wrap:wrap}
+.md-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.8);display:none;align-items:center;justify-content:center;z-index:350;padding:16px}
+.md-overlay.show{display:flex}
+.md-modal{background:var(--surface);border:1px solid var(--border2);border-radius:var(--r-sm);width:min(520px,100%);max-height:92vh;overflow:auto;padding:16px}
+.md-modal .md-thumb{max-height:300px;aspect-ratio:auto;object-fit:contain;border-radius:6px}
+.md-preview{background:var(--surface2);border:1px solid var(--accent-b);border-radius:6px;padding:10px;font-size:12px;margin-top:10px;white-space:pre-wrap}
 .media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px}
 .media-item{position:relative;border-radius:var(--r-sm);overflow:hidden;cursor:pointer;background:var(--surface2);border:1px solid var(--border);aspect-ratio:1;display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--muted);text-align:center;padding:4px}
 .media-item:hover{border-color:var(--accent-b)}
@@ -665,6 +678,7 @@ textarea.field-input{min-height:80px;resize:vertical}
         <button class="btn sm" data-tab="ads" onclick="showMktTab('ads')">Ads</button>
         <button class="btn sm" data-tab="facebook" onclick="showMktTab('facebook')">Facebook</button>
         <button class="btn sm" data-tab="instagram" onclick="showMktTab('instagram')">Instagram</button>
+        <button class="btn sm" data-tab="media" onclick="showMktTab('media')">Media</button>
         <button class="btn sm" data-tab="automation" onclick="showMktTab('automation')">Automation</button>
       </div>
       <div id="mkt-content"></div>
@@ -2007,7 +2021,7 @@ let MKT_TAB='connection';
 function showMktTab(tab){
   MKT_TAB=tab;
   document.querySelectorAll('#mkt-tabs .btn').forEach(b=>b.classList.toggle('primary',b.dataset.tab===tab));
-  const map={connection:loadMktConnection,ads:loadMktAds,facebook:loadMktFacebook,instagram:loadMktInstagram,automation:loadMktAutomation};
+  const map={connection:loadMktConnection,ads:loadMktAds,facebook:loadMktFacebook,instagram:loadMktInstagram,media:loadMktMedia,automation:loadMktAutomation};
   (map[tab]||loadMktConnection)();
 }
 
@@ -2301,6 +2315,146 @@ async function mktReplyComment(mediaId,commentId){
   const message=document.getElementById(`reply-${commentId}`).value.trim();
   if(!message){alert('Write a reply first');return;}
   await mktConfirmPost(`/api/meta/ig/media/${mediaId}/comments/reply`,{comment_id:commentId,message},'Reply posted',()=>loadMktComments(mediaId));
+}
+
+// ── Media: files for Instagram/Facebook (Supabase Storage) ──────────────────
+// Publishing always goes through the preview modal: the first request returns
+// a preview (media, caption, account), and only the "Confirm & post" click
+// sends confirm:true. The Auto social publishing toggle never skips this.
+let MD_ITEMS=[], MD_PUB=null;
+function mdSize(b){return b?(b/1048576).toFixed(1)+' MB':'';}
+function mdThumb(m,cls){
+  return m.kind==='video'
+    ?`<video class="${cls}" src="${m.public_url}" preload="metadata" muted controls playsinline></video>`
+    :`<img class="${cls}" src="${m.public_url}" loading="lazy" alt="">`;
+}
+async function loadMktMedia(){
+  const c=document.getElementById('mkt-content');
+  c.innerHTML=`
+    <div class="md-drop" id="md-drop" onclick="document.getElementById('md-file').click()">
+      <div style="font-size:22px">⬆</div>
+      <div style="font-weight:600;margin:4px 0">Drop photos or videos here, or click to choose</div>
+      <div style="font-size:11px">JPEG, PNG (saved as JPEG for Instagram), MP4 or MOV, up to 50 MB. Files are deleted automatically after 7 days.</div>
+      <input type="file" id="md-file" accept="image/jpeg,image/png,video/mp4,video/quicktime" multiple style="display:none" onchange="mdUpload(this.files);this.value=''">
+    </div>
+    <div id="md-status" style="font-size:12px;color:var(--muted);margin-bottom:10px"></div>
+    <div class="md-grid" id="md-grid"><div style="color:var(--muted);font-size:12px">Loading…</div></div>
+    <div class="md-overlay" id="md-overlay" onclick="if(event.target===this)mdClose()"><div class="md-modal" id="md-modal"></div></div>`;
+  const drop=document.getElementById('md-drop');
+  ['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over');}));
+  ['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('over');}));
+  drop.addEventListener('drop',e=>mdUpload(e.dataTransfer.files));
+  await mdRefresh();
+}
+async function mdRefresh(){
+  const g=document.getElementById('md-grid');
+  if(!g)return;
+  try{
+    const r=await fetch('/api/media');
+    const d=await r.json();
+    if(!r.ok){g.innerHTML=`<div class="guard-box">Could not load media: ${d.detail||'error'}</div>`;return;}
+    MD_ITEMS=d.media||[];
+    g.innerHTML=!MD_ITEMS.length?'<div style="color:var(--muted);font-size:12px">Nothing uploaded yet.</div>':MD_ITEMS.map((m,i)=>`
+      <div class="md-card">
+        ${mdThumb(m,'md-thumb')}
+        <div class="md-body">
+          <div class="md-name">${m.path}<br>${m.kind} · ${mdSize(m.size)}</div>
+          <div class="md-actions">
+            <button class="btn sm primary" onclick="mdOpenPublish(${i},'instagram')">Publish to Instagram</button>
+            <button class="btn sm" onclick="mdOpenPublish(${i},'facebook')">Post to Facebook</button>
+          </div>
+          <div class="md-actions">
+            <button class="btn sm" onclick="mdCopy(${i},this)">Copy URL</button>
+            <button class="btn sm" onclick="mdDelete(${i})">Delete</button>
+          </div>
+        </div>
+      </div>`).join('');
+  }catch(e){g.innerHTML=`<div class="guard-box">Could not load media: ${e.message}</div>`;}
+}
+async function mdUpload(files){
+  const st=document.getElementById('md-status');
+  const list=[...files];
+  for(let i=0;i<list.length;i++){
+    const f=list[i];
+    st.textContent=`Uploading ${f.name} (${i+1}/${list.length}, ${mdSize(f.size)})…`;
+    if(f.size>50*1048576){alert(`${f.name} is over 50 MB.`);continue;}
+    const fd=new FormData(); fd.append('file',f);
+    try{
+      const r=await fetch('/api/media/upload',{method:'POST',body:fd});
+      const d=await r.json();
+      if(!r.ok){alert(`${f.name}: ${d.detail||'upload failed'}`);continue;}
+    }catch(e){alert(`${f.name}: ${e.message}`);}
+  }
+  st.textContent='';
+  mdRefresh();
+}
+async function mdCopy(i,btn){
+  try{await navigator.clipboard.writeText(MD_ITEMS[i].public_url);btn.textContent='Copied';setTimeout(()=>btn.textContent='Copy URL',1500);}
+  catch(e){prompt('Copy this URL:',MD_ITEMS[i].public_url);}
+}
+async function mdDelete(i){
+  const m=MD_ITEMS[i];
+  if(!confirm(`Delete ${m.path}? Its public URL will stop working.`))return;
+  const r=await fetch('/api/media/'+encodeURIComponent(m.path),{method:'DELETE'});
+  if(!r.ok){alert('Delete failed');return;}
+  mdRefresh();
+}
+function mdOpenPublish(i,target){
+  const m=MD_ITEMS[i];
+  MD_PUB={path:m.path,target,preview:null};
+  const what=target==='instagram'?(m.kind==='video'?'Instagram Reel':'Instagram post'):(m.kind==='video'?'Facebook video':'Facebook photo post');
+  document.getElementById('md-modal').innerHTML=`
+    <h4 style="margin:0 0 10px">${what}</h4>
+    ${mdThumb(m,'md-thumb')}
+    <div class="op-field" style="margin-top:10px"><label>Caption</label><textarea class="field-input" id="md-caption" rows="5" oninput="mdResetPreview()"></textarea></div>
+    <label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:6px 0"><input type="checkbox" id="md-delete-after" onchange="mdResetPreview()"> Delete the file after posting</label>
+    <div id="md-preview-box"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+      <button class="btn" onclick="mdClose()">Cancel</button>
+      <button class="btn" id="md-preview-btn" onclick="mdPreview()">Preview</button>
+      <button class="btn primary" id="md-confirm-btn" onclick="mdConfirm()" disabled>Confirm &amp; post</button>
+    </div>`;
+  document.getElementById('md-overlay').classList.add('show');
+}
+function mdClose(){document.getElementById('md-overlay')?.classList.remove('show');MD_PUB=null;}
+function mdResetPreview(){
+  if(!MD_PUB)return;
+  MD_PUB.preview=null;
+  document.getElementById('md-preview-box').innerHTML='';
+  document.getElementById('md-confirm-btn').disabled=true;
+}
+function mdBody(confirm){
+  return JSON.stringify({path:MD_PUB.path,target:MD_PUB.target,caption:document.getElementById('md-caption').value,
+    delete_after:document.getElementById('md-delete-after').checked,confirm});
+}
+async function mdPreview(){
+  const box=document.getElementById('md-preview-box');
+  box.innerHTML='<div style="font-size:12px;color:var(--muted);margin-top:10px">Loading preview…</div>';
+  try{
+    const r=await fetch('/api/media/publish',{method:'POST',headers:{'Content-Type':'application/json'},body:mdBody(false)});
+    const d=await r.json();
+    if(!r.ok||!d.preview){box.innerHTML=`<div class="guard-box" style="margin-top:10px">${d.detail||'Preview failed'}</div>`;return;}
+    MD_PUB.preview=d;
+    const x=d.details||{};
+    const div=document.createElement('div');
+    div.className='md-preview';
+    div.textContent=`${d.action}\nAccount: ${x.account}\nType: ${x.kind}\nDelete after posting: ${x.delete_after_posting?'yes':'no'}\nAuto social publishing: ${x.auto_social_publishing} (this preview is always shown)\n\nCaption:\n${x.caption||'(none)'}`;
+    box.innerHTML='';box.appendChild(div);
+    document.getElementById('md-confirm-btn').disabled=false;
+  }catch(e){box.innerHTML=`<div class="guard-box" style="margin-top:10px">${e.message}</div>`;}
+}
+async function mdConfirm(){
+  if(!MD_PUB||!MD_PUB.preview)return;
+  const btn=document.getElementById('md-confirm-btn');
+  btn.disabled=true;document.getElementById('md-preview-btn').disabled=true;
+  btn.textContent=MD_PUB.preview.details?.kind==='video'?'Posting… (videos can take a few minutes)':'Posting…';
+  try{
+    const r=await fetch('/api/media/publish',{method:'POST',headers:{'Content-Type':'application/json'},body:mdBody(true)});
+    const d=await r.json();
+    if(!r.ok){alert('Error: '+(d.detail||JSON.stringify(d)));btn.textContent='Confirm & post';btn.disabled=false;document.getElementById('md-preview-btn').disabled=false;return;}
+    alert('Posted'+(d.deleted?' and the file was deleted.':'.'));
+    mdClose();mdRefresh();
+  }catch(e){alert('Error: '+e.message);btn.textContent='Confirm & post';btn.disabled=false;}
 }
 
 const MKT_AUTOMATION_META={
