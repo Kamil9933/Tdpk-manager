@@ -1,7 +1,7 @@
 import os, json, asyncio, hashlib, csv, io
 from contextlib import asynccontextmanager, AsyncExitStack
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks, UploadFile, File
+from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -11,8 +11,9 @@ load_dotenv()
 
 from core.auth import verify_session, create_session, delete_session
 from core.shopify import ShopifyClient
-from core.supabase_client import db, MediaError, MEDIA_MAX_BYTES, media_content_type
-from core import media
+from core.supabase_client import db, MediaError, MEDIA_MAX_BYTES, ASSET_MAX_BYTES, media_content_type
+from core import media, media_jobs, media_edit
+from core.media_edit import EditError
 from core.operations import run_operation, REMOVE_COLOR_WARNING
 from core.intelligence import generate_briefing
 from core.postex import PostexClient, sync_real_fees
@@ -52,6 +53,10 @@ mcp_asgi_app = mcp_server.streamable_http_app()
 async def lifespan(app: FastAPI):
     async with AsyncExitStack() as stack:
         await stack.enter_async_context(mcp_server.session_manager.run())
+        try:
+            await db.fail_stale_media_jobs()  # edits cut off by a restart/redeploy
+        except Exception:
+            pass
         yield
 
 app = FastAPI(title="TD Shopify Manager v3", lifespan=lifespan)
@@ -63,7 +68,7 @@ COST_CONFIG = costing.COST_CONFIG
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.0"}
+    return {"status": "ok", "version": "3.0", "ffmpeg": media_edit.ffmpeg_source()}
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
@@ -512,9 +517,67 @@ async def media_upload(file: UploadFile = File(...), session=Depends(verify_sess
 @app.get("/api/media")
 async def media_list(session=Depends(verify_session)):
     try:
-        return {"media": await db.list_media()}
+        items = await db.list_media()
+        jobs = await db.list_media_jobs(limit=100)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Could not list media: {redact(e)}")
+    edited_from = {r: j["source_paths"] for j in jobs if j.get("status") == "done" for r in (j.get("result_paths") or [])}
+    for m in items:
+        m["edited_from"] = edited_from.get(m["path"])
+    return {"media": items}
+
+# ── Editing (Phase 4 add-on): jobs run in the background, results are NEW files ──
+async def _start_media_job(kind, preset, paths, options):
+    try:
+        return await media_jobs.start(db, kind, preset, paths, options or {})
+    except (EditError, MediaError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/media/carousel")
+async def media_carousel(request: Request, session=Depends(verify_session)):
+    data = await request.json()
+    return await _start_media_job("carousel", data.get("preset") or "carousel", data.get("paths") or [], data.get("options"))
+
+@app.get("/api/media/jobs")
+async def media_jobs_list(session=Depends(verify_session)):
+    return {"jobs": await db.list_media_jobs(limit=20)}
+
+@app.get("/api/media/jobs/{job_id}")
+async def media_job_status(job_id: str, session=Depends(verify_session)):
+    job = await db.get_media_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No such job")
+    job["results"] = [m for m in [await db.get_media(p) for p in job.get("result_paths") or []] if m]
+    return job
+
+@app.get("/api/media/assets")
+async def media_assets_list(session=Depends(verify_session)):
+    return {"assets": await db.list_media_assets()}
+
+@app.post("/api/media/assets")
+async def media_assets_upload(kind: str = Form(...), file: UploadFile = File(...), session=Depends(verify_session)):
+    data = await file.read(ASSET_MAX_BYTES + 1)
+    try:
+        return await db.upload_media_asset(kind, data, file.filename or "")
+    except MediaError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/api/media/assets/{path:path}")
+async def media_assets_delete(path: str, session=Depends(verify_session)):
+    await db.delete_media_asset(path)
+    return {"ok": True}
+
+@app.post("/api/media/{path}/edit")
+async def media_edit_route(path: str, request: Request, session=Depends(verify_session)):
+    """Body: {preset, options}. Videos may add options.join = [more clip paths]
+    to join clips in order. Returns the job; poll /api/media/jobs/{id}."""
+    data = await request.json()
+    options = dict(data.get("options") or {})
+    item = await db.get_media(path)
+    if not item:
+        raise HTTPException(status_code=404, detail=f"No uploaded file called '{path}'")
+    paths = [path] + list(options.pop("join", None) or [])
+    return await _start_media_job(item["kind"], data.get("preset") or ("reel" if item["kind"] == "video" else "feed"), paths, options)
 
 @app.delete("/api/media/{path:path}")
 async def media_delete(path: str, session=Depends(verify_session)):
@@ -523,17 +586,22 @@ async def media_delete(path: str, session=Depends(verify_session)):
 
 @app.post("/api/media/publish")
 async def media_publish(request: Request, session=Depends(verify_session)):
+    """One file (path) or a carousel (paths: 2-10 photos)."""
     data = await request.json()
-    path, target = data.get("path"), data.get("target")
+    target = data.get("target")
     caption, delete_after, confirm = data.get("caption", ""), bool(data.get("delete_after")), bool(data.get("confirm"))
     if target not in media.TARGETS:
         raise HTTPException(status_code=400, detail="target must be instagram or facebook")
+    paths = data.get("paths") or ([data["path"]] if data.get("path") else [])
+    if not paths:
+        raise HTTPException(status_code=400, detail="path is required")
     try:
-        item = await media.resolve(db, media_id=path)
+        items = [await media.resolve(db, media_id=p) for p in paths]
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    if not item:
-        raise HTTPException(status_code=400, detail="path is required")
+    item = items if len(items) > 1 else items[0]
+    if len(items) > 1 and (any(i["kind"] != "image" for i in items) or len(items) > 10):
+        raise HTTPException(status_code=400, detail="A carousel is 2 to 10 photos.")
     if not confirm:
         try:
             account = (await meta.account_labels()).get("instagram" if target == "instagram" else "facebook_page")
@@ -541,22 +609,24 @@ async def media_publish(request: Request, session=Depends(verify_session)):
             account = None
         settings = await db.get_automation_settings()
         return _meta_preview(media.action_label(item, target), {
-            "media_url": item["public_url"], "kind": item["kind"], "caption": caption,
+            "media_url": items[0]["public_url"] if len(items) == 1 else [i["public_url"] for i in items],
+            "kind": items[0]["kind"] if len(items) == 1 else "carousel", "caption": caption,
             "account": (("@" + account) if target == "instagram" and account else account) or "(could not read account name)",
             "delete_after_posting": delete_after,
             "auto_social_publishing": "on" if settings.get("social_publish", {}).get("enabled") else "off",
         })
     try:
         result = await media.publish(meta, item, target, caption)
-    except MetaError as e:
+    except (MetaError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     deleted = False
     if delete_after:
         try:
-            await db.delete_media(item["path"])
+            for i in items:
+                await db.delete_media(i["path"])
             deleted = True
         except Exception:
-            pass  # posted fine; the 7-day cleanup will get the file
+            pass  # posted fine; the 7-day cleanup will get the files
     await db.add_notification("meta", f"{media.action_label(item, target).replace(' NOW', '')}: done")
     return {"ok": True, "result": result, "deleted": deleted}
 

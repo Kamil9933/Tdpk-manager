@@ -66,6 +66,15 @@ def _clean_env(name):
     return v
 
 
+def _strip_paging_urls(body):
+    """Graph API list responses carry paging.next/previous URLs with the
+    access token embedded in them. Those flowed into chat, Telegram and
+    Gemini via the tools. Keep the cursors, drop the URLs."""
+    if isinstance(body, dict) and isinstance(body.get("paging"), dict):
+        body["paging"] = {k: v for k, v in body["paging"].items() if k not in ("next", "previous")}
+    return body
+
+
 class MetaClient:
     def __init__(self):
         self.token = _clean_env("META_ACCESS_TOKEN")
@@ -129,7 +138,7 @@ class MetaClient:
                 "Meta API error: " + " -- ".join(parts),
                 status=r.status_code, body=body, user_msg=user_msg, subcode=subcode, field=field,
             )
-        return body
+        return _strip_paging_urls(body)
 
     # ---------- discovery / connection check ----------
 
@@ -397,6 +406,18 @@ class MetaClient:
             return await self._call("POST", f"{self.page_id}/photos", {"url": image_url, "caption": message, **scheduled}, token=token)
         return await self._call("POST", f"{self.page_id}/feed", {"message": message, "link": link, **scheduled}, token=token)
 
+    async def post_photos_to_page(self, image_urls, message):
+        """Multi-photo Page post: upload each photo unpublished, then one
+        feed post that attaches them all."""
+        token = await self._page_token()
+        ids = []
+        for url in image_urls:
+            r = await self._call("POST", f"{self.page_id}/photos", {"url": url, "published": "false"}, token=token)
+            ids.append(r["id"])
+        return await self._call("POST", f"{self.page_id}/feed", {
+            "message": message, "attached_media": json.dumps([{"media_fbid": i} for i in ids]),
+        }, token=token)
+
     async def post_video_to_page(self, video_url, description):
         """video_url must be public; Facebook downloads it itself."""
         return await self._call("POST", f"{self.page_id}/videos", {"file_url": video_url, "description": description},
@@ -412,6 +433,21 @@ class MetaClient:
     async def publish_ig_image(self, image_url, caption):
         """Two steps: create a container, then publish it. image_url must be public."""
         container = await self._call("POST", f"{self.ig_user_id}/media", {"image_url": image_url, "caption": caption})
+        return await self._call("POST", f"{self.ig_user_id}/media_publish", {"creation_id": container["id"]})
+
+    async def publish_ig_carousel(self, image_urls, caption):
+        """2-10 public JPEG URLs -> one carousel post: a child container per
+        image, a CAROUSEL container, then publish."""
+        if not 2 <= len(image_urls) <= 10:
+            raise MetaError("An Instagram carousel needs 2 to 10 images.")
+        children = []
+        for url in image_urls:
+            c = await self._call("POST", f"{self.ig_user_id}/media", {"image_url": url, "is_carousel_item": "true"})
+            children.append(c["id"])
+        container = await self._call("POST", f"{self.ig_user_id}/media", {
+            "media_type": "CAROUSEL", "children": ",".join(children), "caption": caption,
+        })
+        await self.wait_for_container(container["id"])
         return await self._call("POST", f"{self.ig_user_id}/media_publish", {"creation_id": container["id"]})
 
     REEL_POLL_SECONDS = 5

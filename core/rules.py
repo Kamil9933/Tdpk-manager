@@ -47,7 +47,8 @@ HELP_TEXT = (
     "  abandoned checkouts -- abandoned carts\n"
     "  expenses  /  vendors  /  employees  /  cash -- ledger reads\n"
     "  ad insights -- ad performance\n"
-    "  media -- photos/videos uploaded for social posts\n\n"
+    "  media -- photos/videos uploaded for social posts\n"
+    "  edit status -- recent photo/video edit jobs\n\n"
     "Do things (still previews first, just like the dashboard):\n"
     "  fulfill order 1234  /  ship order 1234 tracking TRK123\n"
     "  cancel order 1234\n"
@@ -298,6 +299,18 @@ async def _h_media(m, mcp_server, db):
     return f"{len(rows)} uploaded file(s), newest first:\n" + "\n".join(lines) + more
 
 
+async def _h_edit_status(m, mcp_server, db):
+    data = await _call_tool(mcp_server, "list_media_jobs", {"limit": 8})
+    jobs = data.get("jobs", [])
+    if not jobs:
+        return "No edit jobs yet. Use Edit on the Media tab, or ask me to edit an upload."
+    lines = []
+    for j in jobs:
+        state = {"running": f"running {j.get('progress') or 0}%", "failed": f"failed: {j.get('error')}"}.get(j["status"], j["status"])
+        lines.append(f"  - {j['preset']} {j['kind']} from {', '.join(j.get('source_paths') or [])}: {state}")
+    return "Recent edits, newest first:\n" + "\n".join(lines)
+
+
 # ───────────────────────── write actions ─────────────────────────
 # Each opens the SAME kind of preview-then-confirm the dashboard/Claude/
 # Gemini already use; a plain "yes"/"no" afterwards is caught by
@@ -408,6 +421,7 @@ _READ_PATTERNS = [
     (re.compile(r"^\s*cash(?:\s+accounts)?\s*$", re.I), _h_cash),
     (re.compile(r"^\s*(?:ad\s+insights|ads?\s+performance)\s*$", re.I), _h_ad_insights),
     (re.compile(r"^\s*(?:media|uploads|uploaded\s+(?:media|files))\s*$", re.I), _h_media),
+    (re.compile(r"^\s*(?:edit(?:ing)?\s+(?:status|jobs?)|media\s+jobs?|edits)\s*\??\s*$", re.I), _h_edit_status),
 ]
 
 _ACTION_PATTERNS = [

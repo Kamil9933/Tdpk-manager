@@ -52,7 +52,7 @@ from core.operations import run_operation, REMOVE_COLOR_WARNING
 from core.filament import deduct_filament_for_order, compute_filament_status
 from core.returns import compute_product_return_breakdown
 from core.notify import notify_all
-from core import risk, costing, media
+from core import risk, costing, media, media_jobs, media_edit, captions
 
 PKT = timezone(timedelta(hours=5))  # Pakistan Standard Time -- fixed UTC+5 offset, no DST
 
@@ -834,6 +834,169 @@ def build_mcp_server(shopify, postex, db, meta, resolve_scope) -> FastMCP:
         """Public URL and details of one uploaded file, by its media_id (path)."""
         item = await db.get_media(media_id)
         return item or {"error": f"No uploaded file called '{media_id}'. Use list_media to see what's there."}
+
+    # ── Media editing (Phase 4 add-on) ──────────────────────────────────────
+    # Edits are routine and non-destructive: each makes a NEW file and never
+    # touches the source, so they need no confirm. Publishing the result
+    # still goes through the publish tools' preview + confirm.
+    async def _media_ids(ids):
+        """Accepts paths, plus "latest", "latest_image", "latest_video"."""
+        out, items = [], None
+        for i in ids:
+            if i in ("latest", "latest_image", "latest_video"):
+                items = items if items is not None else await db.list_media()
+                kind = {"latest": None, "latest_image": "image", "latest_video": "video"}[i]
+                match = next((m for m in items if kind is None or m["kind"] == kind), None)
+                if not match:
+                    raise media_edit.EditError("Nothing matching is uploaded. Use list_media.")
+                out.append(match["path"])
+            else:
+                out.append(i)
+        return out
+
+    def _job_summary(job, results=None):
+        return {"job_id": job["id"], "kind": job["kind"], "preset": job["preset"], "status": job["status"],
+                "progress": job.get("progress"), "error": job.get("error"), "warnings": job.get("warnings") or [],
+                "source_paths": job.get("source_paths"),
+                "results": [{"media_id": m["path"], "public_url": m["public_url"], "kind": m["kind"]} for m in (results or [])]}
+
+    async def _job_with_results(job_id):
+        job = await db.get_media_job(job_id)
+        results = [m for m in [await db.get_media(p) for p in job.get("result_paths") or []] if m]
+        return _job_summary(job, results)
+
+    async def _start_and_wait(kind, preset, ids, options, wait_seconds):
+        try:
+            job = await media_jobs.start(db, kind, preset, await _media_ids(ids), options)
+        except Exception as e:
+            return {"error": str(e)}
+        import asyncio
+        for _ in range(wait_seconds):
+            await asyncio.sleep(1)
+            j = await db.get_media_job(job["id"])
+            if j["status"] in ("done", "failed"):
+                return await _job_with_results(job["id"])
+        out = _job_summary(await db.get_media_job(job["id"]))
+        out["note"] = "Still running. Check it with get_media_job."
+        return out
+
+    def _edit_options(**kw):
+        opts = {k: v for k, v in kw.items() if v is not None}
+        if "focus_x" in opts or "focus_y" in opts:
+            opts["focus"] = [opts.pop("focus_x", 0.5), opts.pop("focus_y", 0.5)]
+        return opts
+
+    @mcp.tool()
+    async def edit_image(media_id: str, preset: str = "feed", fit: Optional[str] = None,
+                         focus_x: Optional[float] = None, focus_y: Optional[float] = None,
+                         enhance: Optional[bool] = None, logo: Optional[bool] = None, footer: Optional[bool] = None,
+                         headline: Optional[str] = None, headline_position: Optional[str] = None,
+                         subtext: Optional[str] = None) -> dict:
+        """Make a post-ready JPEG from an uploaded photo; saved as a NEW media
+        file (the original is untouched). media_id: a path from list_media,
+        or "latest"/"latest_image". preset: feed (4:5, default), square,
+        story (9:16), facebook, landscape. fit: crop (default), blur or solid
+        (pad instead of cutting). focus_x/focus_y (0-1) move the crop. Brand
+        defaults: small TD logo, site footer, mild enhance. headline: up to 3
+        lines separated by newlines (line 1 white, line 2 purple). subtext: a
+        small line like "Rs 2,500 | Made in Lahore". No confirm needed; to
+        post the result use publish_instagram_image / post_to_facebook, which
+        preview first."""
+        return await _start_and_wait("image", preset, [media_id], _edit_options(
+            fit=fit, focus_x=focus_x, focus_y=focus_y, enhance=enhance, logo=logo, footer=footer,
+            headline=headline, headline_position=headline_position, subtext=subtext), 30)
+
+    @mcp.tool()
+    async def edit_video(media_ids: list[str], preset: str = "reel", trims: Optional[list[list[float]]] = None,
+                         speed: Optional[float] = None, fit: Optional[str] = None,
+                         focus_x: Optional[float] = None, focus_y: Optional[float] = None,
+                         logo: Optional[bool] = None, footer: Optional[bool] = None,
+                         headline: Optional[str] = None, headline_position: Optional[str] = None,
+                         subtext: Optional[str] = None, fade: Optional[bool] = None,
+                         music: Optional[str] = None, keep_audio: Optional[bool] = None) -> dict:
+        """Make a Reel-ready MP4 (H.264/AAC, 30fps, under 50 MB) from one or
+        more uploaded clips, joined in order; saved as a NEW media file. Runs
+        in the background: returns a job_id, check it with get_media_job
+        (usually 1-3 minutes). media_ids: paths, or ["latest_video"]. preset:
+        reel (9:16, default), timelapse (9:16 at 4x, no original sound),
+        story, facebook (4:5), square, landscape. trims: one [start, end] in
+        seconds per clip (end 0 = to the end). speed: 0.25-16. music: a file from
+        list_media_assets. Same logo/footer/headline options as edit_image.
+        Result must be 3-90 seconds. No confirm needed to edit; publishing
+        goes through publish_instagram_reel's preview."""
+        return await _start_and_wait("video", preset, media_ids, _edit_options(
+            trims=trims, speed=speed, fit=fit, focus_x=focus_x, focus_y=focus_y, logo=logo, footer=footer,
+            headline=headline, headline_position=headline_position, subtext=subtext, fade=fade,
+            music=music, keep_audio=keep_audio), 3)
+
+    @mcp.tool()
+    async def make_carousel(media_ids: list[str], preset: str = "carousel", fit: Optional[str] = None,
+                            enhance: Optional[bool] = None, logo: Optional[bool] = None,
+                            footer: Optional[bool] = None) -> dict:
+        """Normalise 2-10 uploaded photos to the same ratio and look for one
+        carousel post. preset: carousel (1:1, default) or feed (4:5). Each
+        slide is saved as a NEW file; publish them together with
+        publish_instagram_carousel (preview first)."""
+        return await _start_and_wait("carousel", preset, media_ids, _edit_options(
+            fit=fit, enhance=enhance, logo=logo, footer=footer), 60)
+
+    @mcp.tool()
+    async def get_media_job(job_id: str) -> dict:
+        """Status of an edit job: queued, running (with progress %), done
+        (with the new files' media_ids and URLs) or failed (with the reason)."""
+        if not await db.get_media_job(job_id):
+            return {"error": "No such job."}
+        return await _job_with_results(job_id)
+
+    @mcp.tool()
+    async def list_media_jobs(limit: int = 10) -> dict:
+        """Recent edit jobs, newest first."""
+        return {"jobs": [_job_summary(j) for j in await db.list_media_jobs(limit=limit)]}
+
+    @mcp.tool()
+    async def list_media_assets() -> dict:
+        """Brand assets used by edits: logo.png, the headline font, and
+        music files (use the music file name in edit_video's music)."""
+        return {"assets": await db.list_media_assets()}
+
+    @mcp.tool()
+    async def publish_instagram_carousel(caption: str, media_ids: list[str], confirm: bool = False) -> dict:
+        """Publish 2-10 uploaded photos as one Instagram carousel, in the
+        given order. Requires confirm=true to execute."""
+        try:
+            items = [await media.resolve(db, media_id=i) for i in await _media_ids(media_ids)]
+        except Exception as e:
+            return {"error": str(e)}
+        if not 2 <= len(items) <= 10 or any(i["kind"] != "image" for i in items):
+            return {"error": "A carousel is 2 to 10 photos."}
+        if not confirm:
+            return _meta_preview(media.action_label(items, "instagram"),
+                                 {"image_urls": [i["public_url"] for i in items], "caption": caption})
+        try:
+            return {"ok": True, "result": await media.publish(meta, items, "instagram", caption)}
+        except MetaError as e:
+            return {"error": str(e)}
+
+    @mcp.tool()
+    async def draft_caption(product: Optional[str] = None, hook: Optional[str] = None,
+                            question: Optional[str] = None, extra_hashtags: Optional[list[str]] = None) -> dict:
+        """Draft an Instagram/Facebook caption in the account's own style:
+        short hook + emoji, product name and price, "Shop at
+        thirddimension.pk", then hashtags. product: a product name to look up
+        in Shopify (title and price). question: optional line asking
+        followers something (the account's best-reaching Reels did this).
+        Returns a draft only; it is never posted by this tool."""
+        title, price = product, None
+        if product and shopify is not None:
+            try:
+                p = product.lower()
+                matches = [x for x in await shopify.get_all_products() if p in (x.get("title") or "").lower()]
+                if len(matches) == 1:
+                    title = matches[0]["title"]
+                    price = (matches[0].get("variants") or [{}])[0].get("price")
+            except Exception:
+                pass
+        return captions.draft_caption(title, price, hook=hook, question=question, extra_hashtags=extra_hashtags)
 
     # ── Automation autonomy toggles ──────────────────────────────────────────
     @mcp.tool()

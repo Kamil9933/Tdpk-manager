@@ -2321,8 +2321,14 @@ async function mktReplyComment(mediaId,commentId){
 // Publishing always goes through the preview modal: the first request returns
 // a preview (media, caption, account), and only the "Confirm & post" click
 // sends confirm:true. The Auto social publishing toggle never skips this.
-let MD_ITEMS=[], MD_PUB=null;
+// Edits never overwrite: each one makes a NEW file, shown before/after.
+let MD_ITEMS=[], MD_PUB=null, MD_SEL=new Set(), MD_ASSETS=[], MD_EDIT=null, MD_POLL=null;
+const MD_PRESETS={
+  image:[['feed','Instagram feed post (4:5)'],['square','Square (1:1)'],['story','Story (9:16)'],['facebook','Facebook post (4:5)'],['landscape','Landscape (16:9)']],
+  video:[['reel','Reel (9:16)'],['timelapse','Timelapse Reel (9:16, 4x)'],['story','Story (9:16)'],['facebook','Facebook video (4:5)'],['square','Square (1:1)']],
+};
 function mdSize(b){return b?(b/1048576).toFixed(1)+' MB':'';}
+function mdEsc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function mdThumb(m,cls){
   return m.kind==='video'
     ?`<video class="${cls}" src="${m.public_url}" preload="metadata" muted controls playsinline></video>`
@@ -2338,13 +2344,28 @@ async function loadMktMedia(){
       <input type="file" id="md-file" accept="image/jpeg,image/png,video/mp4,video/quicktime" multiple style="display:none" onchange="mdUpload(this.files);this.value=''">
     </div>
     <div id="md-status" style="font-size:12px;color:var(--muted);margin-bottom:10px"></div>
+    <details class="chart-container" id="md-assets-box" style="margin-bottom:12px">
+      <summary style="cursor:pointer;font-weight:600;font-size:13px">Brand assets (logo, font, music)</summary>
+      <div style="font-size:11px;color:var(--muted);margin:8px 0">Used by Edit. Logo: transparent PNG. Font: your headline font (.ttf/.otf). Music: .mp3/.m4a/.wav for Reels. Until a logo/font is uploaded, a plain "TD" mark and a built-in font are used.</div>
+      <div class="md-actions" style="margin-bottom:8px">
+        <label class="btn sm">Upload logo<input type="file" accept="image/png" style="display:none" onchange="mdAssetUpload('logo',this)"></label>
+        <label class="btn sm">Upload font<input type="file" accept=".ttf,.otf" style="display:none" onchange="mdAssetUpload('font',this)"></label>
+        <label class="btn sm">Upload music<input type="file" accept=".mp3,.m4a,.aac,.wav,audio/*" style="display:none" onchange="mdAssetUpload('music',this)"></label>
+      </div>
+      <div id="md-assets"></div>
+    </details>
+    <div class="md-actions" style="margin-bottom:10px;align-items:center">
+      <button class="btn sm" id="md-carousel-btn" onclick="mdOpenCarousel()" disabled>Carousel from selected (0)</button>
+      <span style="font-size:11px;color:var(--muted)">Tick 2 to 10 photos to make one carousel post.</span>
+    </div>
     <div class="md-grid" id="md-grid"><div style="color:var(--muted);font-size:12px">Loading…</div></div>
     <div class="md-overlay" id="md-overlay" onclick="if(event.target===this)mdClose()"><div class="md-modal" id="md-modal"></div></div>`;
   const drop=document.getElementById('md-drop');
   ['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over');}));
   ['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('over');}));
   drop.addEventListener('drop',e=>mdUpload(e.dataTransfer.files));
-  await mdRefresh();
+  MD_SEL=new Set();
+  await Promise.all([mdRefresh(),mdLoadAssets()]);
 }
 async function mdRefresh(){
   const g=document.getElementById('md-grid');
@@ -2352,24 +2373,34 @@ async function mdRefresh(){
   try{
     const r=await fetch('/api/media');
     const d=await r.json();
-    if(!r.ok){g.innerHTML=`<div class="guard-box">Could not load media: ${d.detail||'error'}</div>`;return;}
+    if(!r.ok){g.innerHTML=`<div class="guard-box">Could not load media: ${mdEsc(d.detail||'error')}</div>`;return;}
     MD_ITEMS=d.media||[];
+    MD_SEL=new Set([...MD_SEL].filter(p=>MD_ITEMS.some(m=>m.path===p)));
     g.innerHTML=!MD_ITEMS.length?'<div style="color:var(--muted);font-size:12px">Nothing uploaded yet.</div>':MD_ITEMS.map((m,i)=>`
       <div class="md-card">
         ${mdThumb(m,'md-thumb')}
         <div class="md-body">
-          <div class="md-name">${m.path}<br>${m.kind} · ${mdSize(m.size)}</div>
+          <div class="md-name">${m.kind==='image'?`<label style="display:inline-flex;gap:4px;align-items:center"><input type="checkbox" ${MD_SEL.has(m.path)?'checked':''} onchange="mdToggleSel('${m.path}',this.checked)">`:''}${m.path}${m.kind==='image'?'</label>':''}<br>${m.kind} · ${mdSize(m.size)}${m.edited_from?`<br>✎ edited from ${m.edited_from.join(', ')}`:''}</div>
           <div class="md-actions">
-            <button class="btn sm primary" onclick="mdOpenPublish(${i},'instagram')">Publish to Instagram</button>
-            <button class="btn sm" onclick="mdOpenPublish(${i},'facebook')">Post to Facebook</button>
+            <button class="btn sm primary" onclick="mdOpenPublish([${i}],'instagram')">Publish to Instagram</button>
+            <button class="btn sm" onclick="mdOpenPublish([${i}],'facebook')">Post to Facebook</button>
           </div>
           <div class="md-actions">
+            <button class="btn sm" onclick="mdOpenEdit(${i})">✎ Edit</button>
             <button class="btn sm" onclick="mdCopy(${i},this)">Copy URL</button>
             <button class="btn sm" onclick="mdDelete(${i})">Delete</button>
           </div>
         </div>
       </div>`).join('');
-  }catch(e){g.innerHTML=`<div class="guard-box">Could not load media: ${e.message}</div>`;}
+    mdSelUpdate();
+  }catch(e){g.innerHTML=`<div class="guard-box">Could not load media: ${mdEsc(e.message)}</div>`;}
+}
+function mdToggleSel(path,on){on?MD_SEL.add(path):MD_SEL.delete(path);mdSelUpdate();}
+function mdSelUpdate(){
+  const b=document.getElementById('md-carousel-btn');
+  if(!b)return;
+  b.textContent=`Carousel from selected (${MD_SEL.size})`;
+  b.disabled=MD_SEL.size<2||MD_SEL.size>10;
 }
 async function mdUpload(files){
   const st=document.getElementById('md-status');
@@ -2399,15 +2430,195 @@ async function mdDelete(i){
   if(!r.ok){alert('Delete failed');return;}
   mdRefresh();
 }
-function mdOpenPublish(i,target){
+
+// ── Brand assets ──
+async function mdLoadAssets(){
+  const box=document.getElementById('md-assets');
+  if(!box)return;
+  try{
+    const r=await fetch('/api/media/assets');
+    const d=await r.json();
+    MD_ASSETS=d.assets||[];
+    box.innerHTML=!MD_ASSETS.length?'<div style="font-size:12px;color:var(--muted)">No assets uploaded yet.</div>':MD_ASSETS.map(a=>`
+      <div style="display:flex;gap:8px;align-items:center;font-size:12px;padding:3px 0">
+        <span style="min-width:44px;color:var(--muted)">${a.kind}</span><span>${mdEsc(a.path)}</span><span style="color:var(--muted)">${mdSize(a.size)}</span>
+        <button class="btn sm" onclick="mdAssetDelete('${mdEsc(a.path)}')">Remove</button>
+      </div>`).join('');
+  }catch(e){box.innerHTML=`<div style="font-size:12px;color:var(--red)">${mdEsc(e.message)}</div>`;}
+}
+async function mdAssetUpload(kind,input){
+  const f=input.files[0]; input.value='';
+  if(!f)return;
+  const fd=new FormData(); fd.append('kind',kind); fd.append('file',f);
+  const r=await fetch('/api/media/assets',{method:'POST',body:fd});
+  const d=await r.json();
+  if(!r.ok){alert(d.detail||'Upload failed');return;}
+  mdLoadAssets();
+}
+async function mdAssetDelete(path){
+  if(!confirm(`Remove ${path}?`))return;
+  await fetch('/api/media/assets/'+path.split('/').map(encodeURIComponent).join('/'),{method:'DELETE'});
+  mdLoadAssets();
+}
+
+// ── Edit (single file, or several clips joined) ──
+function mdOpenEdit(i){
   const m=MD_ITEMS[i];
-  MD_PUB={path:m.path,target,preview:null};
-  const what=target==='instagram'?(m.kind==='video'?'Instagram Reel':'Instagram post'):(m.kind==='video'?'Facebook video':'Facebook photo post');
+  MD_EDIT={mode:'single',item:m,focus:[0.5,0.5],job:null};
+  const presets=MD_PRESETS[m.kind];
+  const music=MD_ASSETS.filter(a=>a.kind==='music');
+  const otherClips=MD_ITEMS.filter(x=>x.kind==='video'&&x.path!==m.path);
+  document.getElementById('md-modal').innerHTML=`
+    <h4 style="margin:0 0 10px">✎ Edit ${m.kind}</h4>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:6px">${m.kind==='image'?'Click the photo to set the crop focus point.':'The original is never changed; the result is a new file.'}</div>
+    <div style="position:relative">${m.kind==='image'?`<img class="md-thumb" id="md-edit-src" src="${m.public_url}" style="cursor:crosshair" onclick="mdSetFocus(event)"><div id="md-focus-dot" style="position:absolute;width:14px;height:14px;border-radius:50%;border:2px solid #fff;background:var(--accent);transform:translate(-50%,-50%);left:50%;top:50%;pointer-events:none"></div>`:mdThumb(m,'md-thumb')}</div>
+    <div class="form-row" style="margin-top:10px">
+      <div class="op-field"><label>Preset</label><select id="md-e-preset">${presets.map(([v,l])=>`<option value="${v}">${l}</option>`).join('')}</select></div>
+      <div class="op-field"><label>Fit</label><select id="md-e-fit"><option value="crop">Crop to fill</option><option value="blur">Blurred background</option><option value="solid">Dark background</option></select></div>
+    </div>
+    <div class="md-actions" style="font-size:12px;margin:6px 0">
+      <label><input type="checkbox" id="md-e-logo" checked> Logo</label>
+      <label><input type="checkbox" id="md-e-footer" checked> Site footer</label>
+      ${m.kind==='image'?'<label><input type="checkbox" id="md-e-enhance" checked> Mild enhance</label>':'<label><input type="checkbox" id="md-e-fade" checked> Fade in/out</label><label><input type="checkbox" id="md-e-audio" checked> Keep original sound</label>'}
+    </div>
+    <div class="op-field"><label>Headline (optional, one line per row: line 1 white, line 2 purple)</label><textarea class="field-input" id="md-e-headline" rows="2" placeholder="TAKE F1&#10;EVERYWHERE"></textarea></div>
+    <div class="form-row">
+      <div class="op-field"><label>Headline position</label><select id="md-e-hpos"><option value="top">Top</option><option value="bottom">Bottom</option></select></div>
+      <div class="op-field"><label>Small text (optional)</label><input type="text" class="field-input" id="md-e-subtext" placeholder="Rs 2,500 | Made in Lahore"></div>
+    </div>
+    ${m.kind==='video'?`
+    <div class="form-row">
+      <div class="op-field"><label>Trim start (s)</label><input type="number" class="field-input" id="md-e-start" min="0" step="0.1" placeholder="0"></div>
+      <div class="op-field"><label>Trim end (s)</label><input type="number" class="field-input" id="md-e-end" min="0" step="0.1" placeholder="end"></div>
+      <div class="op-field"><label>Speed</label><select id="md-e-speed"><option value="">Preset default</option><option value="1">1x</option><option value="2">2x</option><option value="4">4x</option><option value="8">8x</option></select></div>
+    </div>
+    <div class="form-row">
+      <div class="op-field"><label>Music</label><select id="md-e-music"><option value="">None</option>${music.map(a=>`<option value="${mdEsc(a.path)}">${mdEsc(a.path.replace('music/',''))}</option>`).join('')}</select></div>
+      <div class="op-field"><label>Join more clips after this one</label><select id="md-e-join" multiple size="${Math.min(4,Math.max(2,otherClips.length))}">${otherClips.map(x=>`<option value="${x.path}">${x.path}</option>`).join('')}</select></div>
+    </div>`:''}
+    <div id="md-edit-result"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+      <button class="btn" onclick="mdClose()">Close</button>
+      <button class="btn primary" id="md-edit-go" onclick="mdRunEdit()">Make edit</button>
+    </div>`;
+  document.getElementById('md-overlay').classList.add('show');
+}
+function mdSetFocus(ev){
+  const img=ev.currentTarget, r=img.getBoundingClientRect();
+  const x=(ev.clientX-r.left)/r.width, y=(ev.clientY-r.top)/r.height;
+  MD_EDIT.focus=[Math.max(0,Math.min(1,x)),Math.max(0,Math.min(1,y))];
+  const dot=document.getElementById('md-focus-dot');
+  dot.style.left=(img.offsetLeft+x*img.offsetWidth)+'px';dot.style.top=(img.offsetTop+y*img.offsetHeight)+'px';
+}
+function mdVal(id){const el=document.getElementById(id);return el?el.value:'';}
+function mdChk(id){const el=document.getElementById(id);return el?el.checked:undefined;}
+function mdCommonOptions(){
+  const o={fit:mdVal('md-e-fit'),logo:mdChk('md-e-logo'),footer:mdChk('md-e-footer')};
+  const h=mdVal('md-e-headline').trim(); if(h){o.headline=h;o.headline_position=mdVal('md-e-hpos');}
+  const s=mdVal('md-e-subtext').trim(); if(s)o.subtext=s;
+  if(mdChk('md-e-enhance')!==undefined)o.enhance=mdChk('md-e-enhance');
+  return o;
+}
+async function mdRunEdit(){
+  const m=MD_EDIT.item, o=mdCommonOptions();
+  if(m.kind==='image')o.focus=MD_EDIT.focus;
+  if(m.kind==='video'){
+    o.fade=mdChk('md-e-fade'); o.keep_audio=mdChk('md-e-audio');
+    const sp=mdVal('md-e-speed'); if(sp)o.speed=parseFloat(sp);
+    const mu=mdVal('md-e-music'); if(mu)o.music=mu;
+    const join=[...(document.getElementById('md-e-join')?.selectedOptions||[])].map(x=>x.value);
+    const st=parseFloat(mdVal('md-e-start')||'0'), en=parseFloat(mdVal('md-e-end')||'0');
+    if(st||en)o.trims=[[st,en],...join.map(()=>[0,0])];
+    if(join.length)o.join=join;
+  }
+  await mdStartJob(`/api/media/${encodeURIComponent(m.path)}/edit`,{preset:mdVal('md-e-preset'),options:o},[m]);
+}
+async function mdStartJob(url,body,sources){
+  const btn=document.getElementById('md-edit-go'), box=document.getElementById('md-edit-result');
+  btn.disabled=true;
+  box.innerHTML='<div class="md-preview">Starting…</div>';
+  try{
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(!r.ok){box.innerHTML=`<div class="guard-box" style="margin-top:10px">${mdEsc(d.detail||'Edit failed')}</div>`;btn.disabled=false;return;}
+    MD_EDIT.job=d.id; MD_EDIT.sources=sources;
+    mdPollJob(d.id);
+  }catch(e){box.innerHTML=`<div class="guard-box" style="margin-top:10px">${mdEsc(e.message)}</div>`;btn.disabled=false;}
+}
+// Polls every 2s while the modal is open. Polling also keeps Render's free
+// instance awake while a video renders.
+async function mdPollJob(id){
+  clearTimeout(MD_POLL);
+  if(!MD_EDIT||MD_EDIT.job!==id)return;
+  const box=document.getElementById('md-edit-result');
+  try{
+    const r=await fetch('/api/media/jobs/'+id);
+    const j=await r.json();
+    if(!r.ok)throw new Error(j.detail||'status failed');
+    if(j.status==='failed'){box.innerHTML=`<div class="guard-box" style="margin-top:10px">${mdEsc(j.error)}</div>`;document.getElementById('md-edit-go').disabled=false;mdRefresh();return;}
+    if(j.status!=='done'){
+      box.innerHTML=`<div class="md-preview">${j.status==='queued'?'Waiting for the previous edit to finish…':'Rendering… '+(j.progress||0)+'%'}<div class="prog-bar" style="height:6px;background:var(--surface3);border-radius:4px;margin-top:6px"><div style="height:100%;width:${j.progress||0}%;background:var(--accent);border-radius:4px"></div></div></div>`;
+      MD_POLL=setTimeout(()=>mdPollJob(id),2000);return;
+    }
+    await mdRefresh();
+    const results=j.results||[];
+    const before=MD_EDIT.sources, warn=(j.warnings||[]).map(w=>`<div style="font-size:11px;color:var(--amber,#e0a030)">⚠ ${mdEsc(w)}</div>`).join('');
+    const idx=results.map(res=>MD_ITEMS.findIndex(x=>x.path===res.path)).filter(k=>k>=0);
+    box.innerHTML=`
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px">
+        <div><div style="font-size:11px;color:var(--muted);margin-bottom:4px">Before</div>${before.map(s=>mdThumb(s,'md-thumb')).join('')}</div>
+        <div><div style="font-size:11px;color:var(--muted);margin-bottom:4px">After (new file)</div>${results.map(s=>mdThumb(s,'md-thumb')).join('')}</div>
+      </div>${warn}
+      <div class="md-actions" style="margin-top:10px">
+        <button class="btn sm primary" onclick="mdOpenPublish([${idx}],'instagram')">${results.length>1?'Publish carousel to Instagram':'Publish to Instagram'}</button>
+        <button class="btn sm" onclick="mdOpenPublish([${idx}],'facebook')">Post to Facebook</button>
+      </div>`;
+    document.getElementById('md-edit-go').disabled=false;
+  }catch(e){box.innerHTML=`<div class="guard-box" style="margin-top:10px">${mdEsc(e.message)}</div>`;MD_POLL=setTimeout(()=>mdPollJob(id),4000);}
+}
+
+// ── Carousel from selected photos ──
+function mdOpenCarousel(){
+  const items=[...MD_SEL].map(p=>MD_ITEMS.find(m=>m.path===p)).filter(Boolean);
+  MD_EDIT={mode:'carousel',items,job:null};
+  document.getElementById('md-modal').innerHTML=`
+    <h4 style="margin:0 0 10px">Carousel from ${items.length} photos</h4>
+    <div class="md-grid" style="grid-template-columns:repeat(auto-fill,minmax(80px,1fr))">${items.map(m=>mdThumb(m,'md-thumb')).join('')}</div>
+    <div class="form-row" style="margin-top:10px">
+      <div class="op-field"><label>Shape</label><select id="md-e-preset"><option value="carousel">Square (1:1)</option><option value="feed">Portrait (4:5)</option></select></div>
+      <div class="op-field"><label>Fit</label><select id="md-e-fit"><option value="crop">Crop to fill</option><option value="blur">Blurred background</option><option value="solid">Dark background</option></select></div>
+    </div>
+    <div class="md-actions" style="font-size:12px;margin:6px 0">
+      <label><input type="checkbox" id="md-e-logo" checked> Logo</label>
+      <label><input type="checkbox" id="md-e-footer" checked> Site footer</label>
+      <label><input type="checkbox" id="md-e-enhance" checked> Mild enhance</label>
+    </div>
+    <div id="md-edit-result"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+      <button class="btn" onclick="mdClose()">Close</button>
+      <button class="btn primary" id="md-edit-go" onclick="mdRunCarousel()">Make carousel</button>
+    </div>`;
+  document.getElementById('md-overlay').classList.add('show');
+}
+async function mdRunCarousel(){
+  const o={fit:mdVal('md-e-fit'),logo:mdChk('md-e-logo'),footer:mdChk('md-e-footer'),enhance:mdChk('md-e-enhance')};
+  await mdStartJob('/api/media/carousel',{paths:MD_EDIT.items.map(m=>m.path),preset:mdVal('md-e-preset'),options:o},MD_EDIT.items);
+}
+
+// ── Publish (one file, or 2-10 photos as a carousel) ──
+function mdOpenPublish(indexes,target){
+  clearTimeout(MD_POLL); MD_EDIT=null;
+  const items=indexes.map(i=>MD_ITEMS[i]).filter(Boolean);
+  if(!items.length){alert('That file is no longer in the list.');return;}
+  const m=items[0], multi=items.length>1;
+  MD_PUB={paths:items.map(x=>x.path),target,preview:null};
+  const what=multi?(target==='instagram'?`Instagram carousel (${items.length} photos)`:`Facebook post (${items.length} photos)`)
+    :target==='instagram'?(m.kind==='video'?'Instagram Reel':'Instagram post'):(m.kind==='video'?'Facebook video':'Facebook photo post');
   document.getElementById('md-modal').innerHTML=`
     <h4 style="margin:0 0 10px">${what}</h4>
-    ${mdThumb(m,'md-thumb')}
+    ${multi?`<div class="md-grid" style="grid-template-columns:repeat(auto-fill,minmax(80px,1fr))">${items.map(x=>mdThumb(x,'md-thumb')).join('')}</div>`:mdThumb(m,'md-thumb')}
     <div class="op-field" style="margin-top:10px"><label>Caption</label><textarea class="field-input" id="md-caption" rows="5" oninput="mdResetPreview()"></textarea></div>
-    <label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:6px 0"><input type="checkbox" id="md-delete-after" onchange="mdResetPreview()"> Delete the file after posting</label>
+    <label style="display:flex;gap:6px;align-items:center;font-size:12px;margin:6px 0"><input type="checkbox" id="md-delete-after" onchange="mdResetPreview()"> Delete the file${multi?'s':''} after posting</label>
     <div id="md-preview-box"></div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
       <button class="btn" onclick="mdClose()">Cancel</button>
@@ -2416,7 +2627,7 @@ function mdOpenPublish(i,target){
     </div>`;
   document.getElementById('md-overlay').classList.add('show');
 }
-function mdClose(){document.getElementById('md-overlay')?.classList.remove('show');MD_PUB=null;}
+function mdClose(){clearTimeout(MD_POLL);document.getElementById('md-overlay')?.classList.remove('show');MD_PUB=null;MD_EDIT=null;}
 function mdResetPreview(){
   if(!MD_PUB)return;
   MD_PUB.preview=null;
@@ -2424,7 +2635,7 @@ function mdResetPreview(){
   document.getElementById('md-confirm-btn').disabled=true;
 }
 function mdBody(confirm){
-  return JSON.stringify({path:MD_PUB.path,target:MD_PUB.target,caption:document.getElementById('md-caption').value,
+  return JSON.stringify({paths:MD_PUB.paths,target:MD_PUB.target,caption:document.getElementById('md-caption').value,
     delete_after:document.getElementById('md-delete-after').checked,confirm});
 }
 async function mdPreview(){
@@ -2433,7 +2644,7 @@ async function mdPreview(){
   try{
     const r=await fetch('/api/media/publish',{method:'POST',headers:{'Content-Type':'application/json'},body:mdBody(false)});
     const d=await r.json();
-    if(!r.ok||!d.preview){box.innerHTML=`<div class="guard-box" style="margin-top:10px">${d.detail||'Preview failed'}</div>`;return;}
+    if(!r.ok||!d.preview){box.innerHTML=`<div class="guard-box" style="margin-top:10px">${mdEsc(d.detail||'Preview failed')}</div>`;return;}
     MD_PUB.preview=d;
     const x=d.details||{};
     const div=document.createElement('div');
@@ -2441,7 +2652,7 @@ async function mdPreview(){
     div.textContent=`${d.action}\nAccount: ${x.account}\nType: ${x.kind}\nDelete after posting: ${x.delete_after_posting?'yes':'no'}\nAuto social publishing: ${x.auto_social_publishing} (this preview is always shown)\n\nCaption:\n${x.caption||'(none)'}`;
     box.innerHTML='';box.appendChild(div);
     document.getElementById('md-confirm-btn').disabled=false;
-  }catch(e){box.innerHTML=`<div class="guard-box" style="margin-top:10px">${e.message}</div>`;}
+  }catch(e){box.innerHTML=`<div class="guard-box" style="margin-top:10px">${mdEsc(e.message)}</div>`;}
 }
 async function mdConfirm(){
   if(!MD_PUB||!MD_PUB.preview)return;

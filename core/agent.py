@@ -294,6 +294,17 @@ the reminder message as if it's being read standalone, with enough context to ma
 - A daily digest (orders, PostEx deliveries/returns, low stock, filament reorder needs) already goes out \
 automatically on its own schedule -- don't create a reminder to replicate that, only for something \
 specific to this conversation.
+- MEDIA FOR SOCIAL POSTS: photos/videos uploaded on the dashboard's Media tab are listed by list_media \
+(media_id = its path; "latest", "latest_image" and "latest_video" also work in the edit tools). \
+edit_image, edit_video and make_carousel turn them into post-ready files in the store's own Instagram \
+style (small TD logo, site footer, mild enhance; a headline only if asked). Edits are Tier 3: they \
+always create NEW files and never touch the original, so just run them. edit_video runs in the \
+background: tell the human it's rendering and check get_media_job (don't promise to watch it later \
+without create_reminder). draft_caption writes a caption + hashtags in the account's style; refine it if \
+useful, but it is only a draft. PUBLISHING an edited file is still Tier 2 (social publishing): call \
+publish_instagram_image / publish_instagram_reel / publish_instagram_carousel / post_to_facebook \
+without confirm first, show the preview (the file's URL and the exact caption), and follow the toggle \
+rules above. Never publish an edit the human hasn't seen in a preview.
 - Filament tracking is best-effort: orders that couldn't be auto-matched to a filament colour sit in \
 list_filament_needs_review until manually resolved. If asked about filament stock, mention if there are \
 needs-review items pending so the numbers aren't silently incomplete.

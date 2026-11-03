@@ -1,0 +1,39 @@
+{
+  "_status": "Studied from @thirddimension.pk's last 30 posts and confirmed by the owner, 3 Nov 2026. Logo and headline font come from the private media-assets bucket (logo.png, font.ttf/.otf) once uploaded.",
+  "_findings": "Branded 4:5 posts and Reels (Jun-Jul 2026) reached 205-591 accounts each; raw phone Reels with a question or real-life hook (Oct 2025-May 2026) reached 756-2,057, the wall art Reel got 63 saves. Defaults are therefore light: small logo + site footer, mild enhancement, headline only when given.",
+  "account": "thirddimension.pk",
+  "colors": {
+    "brand_purple": "#8E57DE",
+    "text_primary": "#FFFFFF",
+    "background_dark": "#0B0B10"
+  },
+  "formats": {
+    "feed": {"ratio": "4:5", "size": [1080, 1350]},
+    "carousel": {"ratio": "1:1", "size": [1080, 1080]},
+    "reel": {"ratio": "9:16", "size": [1080, 1920]},
+    "story": {"ratio": "9:16", "size": [1080, 1920]}
+  },
+  "look": {
+    "background": "dark, moody: purple backlight stripes or black hex pegboard",
+    "product_framing": "product centred, lower-middle of frame, on a dark wood desk or black base",
+    "enhance": "mild: slight contrast and saturation, never heavy"
+  },
+  "overlays": {
+    "logo": {"mark": "TD", "position": "top-center", "width_pct": 9, "margin_pct": 4, "color_on_dark": "#FFFFFF", "file": null},
+    "headline": {"position": "upper-third or lower-third", "style": "brush/graffiti display font, line 1 white, line 2 brand purple, all caps", "font_file": null},
+    "footer": {"text": "www.thirddimension.pk", "position": "bottom-center", "style": "small, white, wide letter spacing"}
+  },
+  "captions": {
+    "tone": "short punchy hook + emoji, 1-3 short lines, product name, then the site",
+    "examples": [
+      "Gotham called. Your desk answered. 🦇",
+      "Your keys finally have a personality. 🏁",
+      "Should I start these projection lamps ?"
+    ],
+    "cta": "Shop at thirddimension.pk",
+    "hashtags_separator": ".\n.",
+    "hashtags_core": ["#3dprinted", "#thirddimensionpk", "#3dprintpakistan", "#desksetup", "#collectibles"],
+    "hashtags_max": 12
+  },
+  "reels": {"target_seconds": [12, 20], "max_seconds": 90, "fps": 30}
+}

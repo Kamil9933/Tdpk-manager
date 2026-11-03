@@ -1,4 +1,5 @@
 import os, json, asyncio, threading
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from supabase import create_client, Client
 
@@ -598,6 +599,65 @@ class Database:
     async def delete_media(self, path):
         await _storage(lambda b: b.remove([path]))
 
+    # ── Media edit jobs (media_jobs_schema.sql) ──
+    async def create_media_job(self, data):
+        return await self._insert("media_jobs", data)
+
+    async def get_media_job(self, job_id):
+        res = await _run(get_client().table("media_jobs").select("*").eq("id", job_id))
+        return res.data[0] if res.data else None
+
+    async def update_media_job(self, job_id, data):
+        await self._update("media_jobs", job_id, {**data, "updated_at": datetime.now(timezone.utc).isoformat()})
+
+    async def list_media_jobs(self, limit=20):
+        res = await _run(get_client().table("media_jobs").select("*").order("created_at", desc=True).limit(limit))
+        return res.data
+
+    async def fail_stale_media_jobs(self):
+        """At startup: any job still queued/running was cut off by a restart."""
+        await _run(get_client().table("media_jobs").update({"status": "failed", "error": "The server restarted during this edit. Run it again."})
+                   .in_("status", ["queued", "running"]))
+
+    # ── Brand assets (private media-assets bucket): logo, font, music ──
+    async def upload_media_asset(self, kind, file_bytes, filename):
+        path, content_type = media_asset_path(kind, filename, file_bytes)
+        if kind == "font":  # one font at a time: drop the other format
+            await _assets(lambda b: b.remove(["font.ttf", "font.otf"]))
+        await _assets(lambda b: b.upload(path, file_bytes, {"content-type": content_type, "upsert": "true"}))
+        return {"path": path, "kind": kind, "size": len(file_bytes)}
+
+    async def list_media_assets(self):
+        root = await _assets(lambda b: b.list("", {"limit": 100}))
+        music = await _assets(lambda b: b.list("music", {"limit": 100}))
+        out = [{"path": r["name"], "kind": "logo" if r["name"] == "logo.png" else "font",
+                "size": (r.get("metadata") or {}).get("size")} for r in root if r.get("id")]
+        out += [{"path": f"music/{r['name']}", "kind": "music", "size": (r.get("metadata") or {}).get("size")}
+                for r in music if r.get("id")]
+        return out
+
+    async def delete_media_asset(self, path):
+        await _assets(lambda b: b.remove([path]))
+
+    async def fetch_media_assets(self, folder, music=None):
+        """Downloads the logo, font and (if asked for) one music file into
+        `folder`; returns {"logo": path, "font": path, "music": path}, leaving
+        out anything not uploaded. A missing music file is an error, a missing
+        logo/font just means the built-in fallbacks are used."""
+        names = {a["path"] for a in await self.list_media_assets()}
+        out = {}
+        for key, candidates in (("logo", ["logo.png"]), ("font", ["font.ttf", "font.otf"])):
+            for name in candidates:
+                if name in names:
+                    out[key] = _write(folder, name, await _assets(lambda b, n=name: b.download(n)))
+                    break
+        if music:
+            name = music if music.startswith("music/") else f"music/{music}"
+            if name not in names:
+                raise MediaError(f"No music file called '{music}'. Upload it under Media > Brand assets first.")
+            out["music"] = _write(folder, name.replace("/", "_"), await _assets(lambda b: b.download(name)))
+        return out
+
     async def purge_old_media(self, days):
         """Deletes files older than `days`. Idempotent: a second run finds
         nothing old enough left to delete."""
@@ -629,6 +689,56 @@ async def _storage(fn):
 def _with_lock(fn, bucket):
     with _db_lock:
         return fn(bucket)
+
+
+ASSETS_BUCKET = "media-assets"
+ASSET_TYPES = {
+    "logo": {"png": "image/png"},
+    "font": {"ttf": "font/ttf", "otf": "font/otf"},
+    "music": {"mp3": "audio/mpeg", "m4a": "audio/mp4", "aac": "audio/aac", "wav": "audio/wav"},
+}
+ASSET_MAX_BYTES = 20 * 1024 * 1024
+
+
+async def _assets(fn):
+    bucket = get_client().storage.from_(ASSETS_BUCKET)
+    return await asyncio.to_thread(lambda: _with_lock(fn, bucket))
+
+
+def _write(folder, name, data):
+    path = os.path.join(folder, name)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def media_asset_path(kind, filename, file_bytes):
+    """Fixed names for the logo and font (one of each), music under music/."""
+    import re
+    if kind not in ASSET_TYPES:
+        raise MediaError("Asset kind must be logo, font or music.")
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    allowed = ASSET_TYPES[kind]
+    if ext not in allowed:
+        raise MediaError(f"A {kind} must be a {' or '.join('.' + e for e in allowed)} file.")
+    if not file_bytes:
+        raise MediaError("The file is empty.")
+    if len(file_bytes) > ASSET_MAX_BYTES:
+        raise MediaError("Asset files are limited to 20 MB.")
+    if kind == "logo":
+        from PIL import Image
+        try:
+            if Image.open(BytesIO(file_bytes)).mode not in ("RGBA", "LA", "P"):
+                raise MediaError("The logo PNG has no transparency, so it would show as a box. Export it with a transparent background.")
+        except MediaError:
+            raise
+        except Exception:
+            raise MediaError("That PNG could not be read.")
+        return "logo.png", allowed[ext]
+    if kind == "font":
+        return f"font.{ext}", allowed[ext]
+    stem = re.sub(r"[^a-z0-9]+", "-", filename.rsplit(".", 1)[0].lower()).strip("-")[:50] or "track"
+    return f"music/{stem}.{ext}", allowed[ext]
 
 
 def media_content_type(content_type, filename=""):

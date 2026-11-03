@@ -28,6 +28,8 @@ async def resolve(db, media_id=None, url=None):
 
 
 def action_label(item, target):
+    if isinstance(item, list):
+        return f"Publish {len(item)}-photo {'Instagram carousel' if target == 'instagram' else 'Facebook post'} NOW"
     if target == "instagram":
         return "Publish Instagram Reel NOW" if item["kind"] == "video" else "Publish Instagram image NOW"
     return "Publish Facebook video NOW" if item["kind"] == "video" else "Publish Facebook photo post NOW"
@@ -35,7 +37,16 @@ def action_label(item, target):
 
 async def publish(meta, item, target, caption):
     """Images go to the feed, videos go out as Reels (Instagram) or Page
-    videos (Facebook)."""
+    videos (Facebook). A list of photos is a carousel / multi-photo post."""
+    if isinstance(item, list):
+        if any(i["kind"] != "image" for i in item) or not 2 <= len(item) <= 10:
+            raise ValueError("A carousel is 2 to 10 photos.")
+        urls = [i["public_url"] for i in item]
+        if target == "instagram":
+            return await meta.publish_ig_carousel(urls, caption)
+        if target == "facebook":
+            return await meta.post_photos_to_page(urls, caption)
+        raise ValueError(f"target must be one of {', '.join(TARGETS)}")
     url, video = item["public_url"], item["kind"] == "video"
     if target == "instagram":
         return await (meta.publish_ig_reel(url, caption) if video else meta.publish_ig_image(url, caption))
